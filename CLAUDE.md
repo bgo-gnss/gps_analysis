@@ -28,6 +28,12 @@ Consolidates `~/work/projects/gps_data_analyses` (`svartsengi-model`,
 — planned surfaces are in each module's docstring; fill them in place, don't
 rename modules without updating plan §10.2.
 
+> **Data-first re-scope (2026-07-08, plan §2b/§9b):** `deformation` and
+> `transient` are BACKBURNERED scaffolds — don't fill them until the plan
+> revives that lane. `velocity` ships WLS only (colored-noise MLE is
+> backburnered too). Active for Phase 1–2: `models`, `fitting`, `baseline`,
+> `velocity` (WLS).
+
 ## Commands
 
 ```bash
