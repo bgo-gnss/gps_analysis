@@ -15,3 +15,8 @@ htmlcov/
 
 # Knowledge graph (local redirect to the ecosystem root graph)
 graphify-out/
+
+# GBIS4TS vendored reference: keep code+Verification, drop heavy PDFs
+reference/gbis4ts/*.pdf
+reference/gbis4ts/**/*.rtf
+reference/gbis4ts/**/*.html

@@ -22,17 +22,27 @@ Consolidates `~/work/projects/gps_data_analyses` (`svartsengi-model`,
 - **Consolidate, don't reinvent:** harvest from `gps_data_analyses`; golden
   behaviour is defined by the existing scripts until tests say otherwise.
 
-## Module map (stable since Phase 0)
+## Module map
 
 `models` · `fitting` · `velocity` · `baseline` · `deformation` · `transient`
-— planned surfaces are in each module's docstring; fill them in place, don't
-rename modules without updating plan §10.2.
+— fill surfaces in place; don't rename modules without updating plan §10.2.
+All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDARDS.md) (binding).
 
-> **Data-first re-scope (2026-07-08, plan §2b/§9b):** `deformation` and
-> `transient` are BACKBURNERED scaffolds — don't fill them until the plan
-> revives that lane. `velocity` ships WLS only (colored-noise MLE is
-> backburnered too). Active for Phase 1–2: `models`, `fitting`, `baseline`,
-> `velocity` (WLS).
+| Module | Status | Contents |
+|---|---|---|
+| `models` | ✅ implemented | `linear`/`periodic`/`lineperiodic`, `exp_linear`(+rate), `poly2`(+rate/peak), `TrajectoryParams` |
+| `fitting` | ✅ implemented | `fit_components`, `detrend_fit`, `remove_trend`, `reject_outliers` (robust) |
+| `baseline` | ✅ implemented | `slice_window`, `estimate_offset`/`remove_offset`, `estimate_step_offset` |
+| `velocity` | ✅ implemented (WLS) | `estimate_velocity` (WLS + formal σ, `method="wls"`), `sliding_velocity`, magnitude/azimuth (+σ); `detectability_floor` stub |
+| `transient` | ✅ ported (GBIS4TS), CI-parity green | `bpd1/bpd2_forward`, `noise_covariance` (Williams 2003), `log_likelihood`, `run_inversion` (MCMC+annealing), `detect_breakpoints`. BPD1+BPD2 recover; **TS14 windowed parity matches MATLAB** (dv/tb). Full-fidelity `test_ts14_full_reference` (~2.5 h) still **opt-in/unrun**. Vendored MATLAB + map: `reference/gbis4ts/` |
+| `deformation` | ⏳ backburnered scaffold | Mogi→Okada→joint — parked (plan §9b); don't fill until revived |
+
+> **Analysis-lane re-scope (2026-07-10, [`../PLAN-analysis-lane.md`](../PLAN-analysis-lane.md)):**
+> `transient` (GBIS4TS) is **un-backburnered and ported** (H1). `velocity` ships **WLS**;
+> the colored-noise/honest-σ upgrade is GBIS itself (`method="gbis"`, later slice).
+> Base functions H4 + velocity H5 landed 2026-07-10. **Only `deformation` stays parked.**
+> H1's full-fidelity `Verification/TS14` numerical parity gate is opt-in
+> (`GPS_ANALYSIS_RUN_VERIFICATION=1`, ~2 h) — confirm before relying on `transient`.
 
 ## Commands
 
@@ -46,4 +56,4 @@ uv run mypy src tests && uv run pytest
 - Home: **GitHub** (libs); CI: `.github/workflows/ci.yml`.
 
 ---
-*Last reviewed: 2026-07-08*
+*Last reviewed: 2026-07-10 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; 131 fast tests green).*

@@ -91,6 +91,9 @@ minversion = "8.0"
 testpaths = ["tests"]
 addopts = ["--strict-markers", "--strict-config", "-ra"]
 filterwarnings = ["error"]
+markers = [
+    "slow: reduced-length MCMC runs (~10-60 s each); deselect with -m 'not slow'",
+]
 
 [tool.coverage.run]
 source = ["src"]
