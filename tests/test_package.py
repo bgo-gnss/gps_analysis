@@ -9,6 +9,7 @@ EXPECTED_MODULES = [
     "deformation",
     "fitting",
     "models",
+    "preprocess",
     "transient",
     "velocity",
 ]

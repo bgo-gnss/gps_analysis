@@ -33,6 +33,7 @@
 | `fitting.reject_outliers` (Ph2) | `RunningMedian` (median pre-filter) + new robust-loss work | `least_squares(loss=…)` is net-new |
 | `baseline.estimate_offset/remove_offset` | `find_exp_offsets`/`find_line_offsets` (`detrend_rnes.py`) | fit adjacent periods, difference at midpoint |
 | `baseline.slice_window` | `dPeriod`/`vshift` usage patterns (gtimes) | pure-array replacement |
+| `preprocess.screen_uncertainty`, `prep_plot_series`/`prep_neu_series` | `iprep`/`vshift` (`geo_dataread.gps_read`, refactor-B slice 2) | formal-σ screen + reference-shift; **two explicit consumer profiles kept per D1** (plot/getData vs .NEU/gamittoNEU) — bit-parity on live paths, pinned by geo_dataread goldens; mm conversion + refdate→yearf stay in geo_dataread shims |
 | `deformation.rate_to_m3s/rate_from_m3s/time_for_rate`, `halflife_days` | `svartsengi_model.fitting` | trivial ports |
 | `deformation.mogi_forward/invert` | **nothing** — workspace only rsyncs Vincent's `inv_volume_mogi.dat` output (`volume_curve.py`) | net-new; reconcile against Vincent (plan §11) |
 | `deformation`/`physics` (Ph2) | `svartsengi_model.physics` (Segall + viscoelastic MC importance sampling) | pure numpy, **leaf-compatible as-is**; best-documented module in the workspace |
