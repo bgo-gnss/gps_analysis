@@ -179,11 +179,20 @@ def estimate_offset(
     if yy.ndim not in (1, 2):
         raise ValueError(f"y must be 1-D or 2-D (C, N), got shape {yy.shape}")
 
-    mask = slice_window(tt, start, end, tol=tol)
-    if not bool(np.any(mask)):
-        raise ValueError(f"reference window [{start}, {end}] contains no samples")
-
-    ywin = yy[..., mask]
+    if start is None and end is None:
+        # Open window: skip the all-True boolean-mask copy. Not only a fast
+        # path — a masked copy can shift ``np.average``'s pairwise/SIMD
+        # reduction grouping by 1 ULP, and the legacy count-mode callers
+        # (``vshift`` Period slicing) averaged the arrays directly; operating
+        # on the inputs as-is keeps bit-parity with them.
+        if tt.size == 0:
+            raise ValueError(f"reference window [{start}, {end}] contains no samples")
+        ywin = yy
+    else:
+        mask = slice_window(tt, start, end, tol=tol)
+        if not bool(np.any(mask)):
+            raise ValueError(f"reference window [{start}, {end}] contains no samples")
+        ywin = yy[..., mask]
     if sigma is None:
         weights = None
     else:
@@ -192,7 +201,7 @@ def estimate_offset(
             raise ValueError(
                 f"sigma shape {ss.shape} does not match y shape {yy.shape}"
             )
-        swin = ss[..., mask]
+        swin = ss if (start is None and end is None) else ss[..., mask]
         if weighting == "inverse_sigma":
             weights = 1.0 / swin
         elif weighting == "inverse_variance":

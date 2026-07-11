@@ -43,6 +43,11 @@ from gps_analysis.models import (
     poly2_peak_value,
     poly2_rate,
 )
+from gps_analysis.preprocess import (
+    prep_neu_series,
+    prep_plot_series,
+    screen_uncertainty,
+)
 from gps_analysis.transient import (
     BPD1Params,
     BPD2Params,
@@ -95,6 +100,10 @@ __all__ = [
     "estimate_offset",
     "remove_offset",
     "estimate_step_offset",
+    # preprocess
+    "screen_uncertainty",
+    "prep_plot_series",
+    "prep_neu_series",
     # velocity
     "VelocityEstimate",
     "SlidingVelocity",

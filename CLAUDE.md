@@ -24,8 +24,9 @@ Consolidates `~/work/projects/gps_data_analyses` (`svartsengi-model`,
 
 ## Module map
 
-`models` · `fitting` · `velocity` · `baseline` · `deformation` · `transient`
-— fill surfaces in place; don't rename modules without updating plan §10.2.
+`models` · `fitting` · `velocity` · `baseline` · `preprocess` · `deformation` · `transient`
+— fill surfaces in place; don't rename modules without updating plan §10.2
+(`preprocess` added by refactor-B slice 2 — flag to plan §10.2 at next plan edit).
 All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDARDS.md) (binding).
 
 | Module | Status | Contents |
@@ -33,6 +34,7 @@ All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDAR
 | `models` | ✅ implemented | `linear`/`periodic`/`lineperiodic`, `exp_linear`(+rate), `poly2`(+rate/peak), `TrajectoryParams` |
 | `fitting` | ✅ implemented | `fit_components`, `detrend_fit`, `remove_trend`, `reject_outliers` (robust) |
 | `baseline` | ✅ implemented | `slice_window`, `estimate_offset`/`remove_offset`, `estimate_step_offset` |
+| `preprocess` | ✅ implemented (refactor-B slice 2) | `screen_uncertainty` (formal-σ epoch screen), `prep_plot_series`/`prep_neu_series` — the two explicit legacy profiles (D1: plot/getData `iprep` vs .NEU/gamittoNEU `vshift`), bit-parity on live paths, geo_dataread goldens pin them end-to-end |
 | `velocity` | ✅ implemented (WLS) | `estimate_velocity` (WLS + formal σ, `method="wls"`), `sliding_velocity`, magnitude/azimuth (+σ); `detectability_floor` stub |
 | `transient` | ✅ ported (GBIS4TS), CI-parity green, **H3-optimized** | `bpd1/bpd2_forward`, `noise_covariance` (Williams 2003), `log_likelihood`, `run_inversion` (MCMC+annealing), `detect_breakpoints`. BPD1+BPD2 recover; **TS14 windowed parity matches MATLAB** (dv/tb; raw window — the leaf auto-conditions the ±5 mm-prior zero-reference contract, `y_ref` provenance). **H3 (2026-07-11):** hot loop uses exact O(N²) generalized-Schur likelihood (`_schur_logdet_quad`; C is NOT Toeplitz — Hosking 1981); 27.9× @ N=1825 (248.8→8.9 ms/sample; 1e6-run chain 2.9 d→2.5 h); parity ≤4e-12 in lnP; C/Rust settled: stay NumPy (PLAN-analysis-lane §3). **Full-fidelity `test_ts14_full_reference` PASSED 2026-07-11** (125 s on the Schur path; posterior optimum + 95% intervals inside SI Table S4 for v/dv/tb/κ/amp). Vendored MATLAB + map: `reference/gbis4ts/` |
 | `deformation` | ⏳ backburnered scaffold | Mogi→Okada→joint — parked (plan §9b); don't fill until revived |
@@ -72,4 +74,4 @@ uv run mypy src tests && uv run pytest
 - Home: **GitHub** (libs); CI: `.github/workflows/ci.yml`.
 
 ---
-*Last reviewed: 2026-07-11 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; H3 generalized-Schur O(N²) likelihood; zero-reference auto-conditioning + saturation guard; seasonal-aware BPD1S/BPD2S variant (joint annual+semiannual) landed in `transient`).*
+*Last reviewed: 2026-07-11 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; H3 generalized-Schur O(N²) likelihood; zero-reference auto-conditioning + saturation guard; seasonal-aware BPD1S/BPD2S variant (joint annual+semiannual) landed in `transient`; `preprocess` module (refactor-B slice 2: `iprep`/`vshift` profiles) added).*
