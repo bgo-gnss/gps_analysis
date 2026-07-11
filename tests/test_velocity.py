@@ -328,6 +328,51 @@ class TestSlidingVelocity:
         np.testing.assert_array_equal(t, t0)
         np.testing.assert_array_equal(y, y0)
 
+    def test_precomputed_design_matches_iterative_reference(self) -> None:
+        # Perf finding #5 equivalence: the named lineperiodic model now
+        # solves each window from a row slice of one precomputed design
+        # (absolute-t trig basis, per-window re-centered trend column);
+        # a wrapper callable with identical math is NOT in the linear
+        # registry, so it takes the old per-window curve_fit route in
+        # window-local time. Rates and formal sigmas must agree - the
+        # two bases span the same column space, so v and sigma_v are
+        # mathematically identical; the tolerance budget is entirely
+        # LM's relative ftol/xtol stopping error on the huge-|y|
+        # absolute-yearf series (measured ~2e-5 sigma_v on rates and
+        # ~1.4e-6 relative on the chi-square-rescaled sigmas), hence the
+        # sigma-scaled rate metric (|dv| <= 1e-4 sigma_v) and sigma
+        # rtol 1e-5 - matching the fit_components absolute-t gates.
+        rng = np.random.default_rng(17)
+        t, y = _synthetic_lineperiodic(n=1500, noise=2.0, seed=17)
+        sigma = np.abs(rng.normal(2.0, 0.3, size=t.size)) + 0.5
+
+        def lineperiodic_wrapper(
+            tt: np.ndarray,
+            offset: float,
+            rate: float,
+            cos_annual: float,
+            sin_annual: float,
+            cos_semiannual: float,
+            sin_semiannual: float,
+        ) -> np.ndarray:
+            return lineperiodic(
+                tt, offset, rate, cos_annual, sin_annual, cos_semiannual, sin_semiannual
+            )
+
+        kwargs = dict(sigma=sigma, window_years=2.0, step_years=0.25, p0=np.zeros(6))
+        fast = sliding_velocity(t, y, model="lineperiodic", **kwargs)
+        slow = sliding_velocity(t, y, model=lineperiodic_wrapper, **kwargs)
+        np.testing.assert_array_equal(fast.centers, slow.centers)
+        np.testing.assert_array_equal(fast.counts, slow.counts)
+        np.testing.assert_array_equal(np.isnan(fast.rates), np.isnan(slow.rates))
+        finite = np.isfinite(slow.rates)
+        assert finite.any()
+        np.testing.assert_array_less(
+            np.abs(fast.rates[finite] - slow.rates[finite]),
+            1e-4 * slow.sigmas[finite],
+        )
+        np.testing.assert_allclose(fast.sigmas, slow.sigmas, rtol=1e-5)
+
 
 class TestDetectabilityFloor:
     def test_is_a_documented_stub(self) -> None:
