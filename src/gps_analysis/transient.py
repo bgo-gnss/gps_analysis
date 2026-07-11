@@ -55,6 +55,21 @@ Conventions and caveats (binding, see ``docs/MATH_STANDARDS.md``)
 - Working dtype float64 throughout (upstream stores the chain in single —
   deliberate deviation, documented in :class:`InversionResult`).
 - Pure leaf: numpy/scipy only, no I/O, inputs never mutated.
+- **Zero-reference input conditioning** (this port): the intercept prior is
+  hard-coded to ±5 mm (``prepareModel_ts.m`` l.51–52 — SI Table S3), i.e.
+  GBIS4TS presumes series referenced near zero; ``GBISrun_ts.m`` l.110 even
+  carries a commented-out force-zero line
+  ``timeseries(:,2) - timeseries(1,2)``. Real ``.NEU`` series can start tens
+  of mm from zero, saturating the intercept and leaking the offset into the
+  trend. :func:`run_inversion` therefore fits ``y − r`` with the start
+  baseline ``r`` = :func:`_start_baseline` (median of the first
+  ``baseline_epochs`` samples) and reports intercepts back in the input
+  frame; ``r`` is surfaced as :attr:`InversionResult.y_ref`. This is
+  **numerical conditioning, not a physics change** — a constant offset
+  carries no deformation information and ``v, dv, tb, κ, β`` are invariant
+  to it (the same precedent as ``velocity.estimate_velocity`` re-referencing
+  ``t`` to ``t_ref``). A post-fit guard raises if the conditioned intercept
+  optimum still saturates its prior (pathological input).
 - Runtime (task H3, closed): each MCMC pass costs one exact O(N²)
   generalized-Schur factorization+solve (:func:`_schur_logdet_quad`) — ≈ 6 ms
   at N = 1825 vs ≈ 160–600 ms for the pre-H3 dense build+Cholesky (≈ 27–70×);
@@ -122,6 +137,11 @@ _T_SCHEDULE: NDArray[np.float64] = 10.0 ** np.linspace(3.0, 0.0, 16)
 
 #: Safety cap on the BPD2 trial-regeneration loop (upstream can spin forever).
 _MAX_TRIAL_REGEN = 100_000
+
+#: Saturation-guard margin as a fraction of the intercept prior range: an
+#: intercept optimum within 5 % of either bound (0.5 mm for the fixed ±5 mm
+#: prior of prepareModel_ts.m) is treated as wedged against the prior.
+_INTERCEPT_GUARD_FRAC = 0.05
 
 
 @dataclass(frozen=True)
@@ -269,12 +289,19 @@ class InversionResult:
             (BPD1) or 8 (BPD2), without the hyperparameter slot — MATLAB
             ``results.optimalmodel``.
         model: ``"BPD1"`` | ``"BPD2"``.
+        y_ref: Start baseline r [mm] subtracted internally before fitting
+            (:func:`_start_baseline`) and added back to the reported
+            intercepts (``optimal[0]`` and ``m_keep[0, :]``), so the chain
+            and optimum are in the **input frame**. 0.0 when conditioning was
+            disabled (``baseline_epochs=0``). Provenance field — the analogue
+            of ``VelocityEstimate.t_ref`` (MATH_STANDARDS §6).
     """
 
     m_keep: NDArray[np.float64]  # (n_params, n_kept) accepted parameter chain
     p_keep: NDArray[np.float64]  # (n_kept,) log-probability per kept sample
     optimal: NDArray[np.float64]  # best-probability parameter vector
     model: str  # "BPD1" | "BPD2"
+    y_ref: float = 0.0  # start baseline subtracted before the fit [mm]
 
 
 def _as_time_array(t: NDArray[np.float64]) -> NDArray[np.float64]:
@@ -787,6 +814,48 @@ def _sensitivity_schedule(n_runs: int) -> frozenset[int]:
     return frozenset(int(v) for arr in parts for v in arr)
 
 
+def _start_baseline(y: NDArray[np.float64], n_baseline: int) -> float:
+    """Start-of-series displacement baseline ``r = median(y₀ … y_{k−1})``.
+
+    Equation:
+        ``r = median({y_i : 0 ≤ i < k})``, ``k = min(n_baseline, n)`` —
+        the robust location of the series over its leading ``n_baseline``
+        samples (≈ days for daily GNSS series).
+
+    Symbols → args:
+        - ``y`` → ``y``: displacement series [mm], 1-D, array order = time order
+        - ``n_baseline`` → ``n_baseline``: number of leading samples, ≥ 1
+
+    Returns:
+        r [mm] — the zero-reference baseline that :func:`run_inversion`
+        subtracts before fitting and adds back to the reported intercepts
+        (surfaced as :attr:`InversionResult.y_ref`).
+
+    Reference:
+        GBIS4TS input contract: ``prepareModel_ts.m`` l.51–52 hard-codes the
+        intercept prior to ±5 mm (Yang et al. 2023 SI Table S3), and
+        ``GBISrun_ts.m`` l.110 carries the commented-out force-zero line
+        ``timeseries(:,2) - timeseries(1,2)`` — referencing the series to ≈0
+        near its start is the intended usage. The median over a short leading
+        window generalizes the single first sample robustly.
+
+    Numerical notes:
+        The median (50 % breakdown point) is immune to a leading outlier or
+        gap-fill artifact that would bias ``y[0]`` or a mean; averaging over
+        k samples suppresses the σ_w-level daily scatter (∝ 1/√k for the
+        mean-like central region). The window is kept *short* because the
+        intercept is defined AT the first epoch (``y(t₀) = a``): the
+        secular-drift bias of the baseline is ≈ ``|v|·(k/2)/365`` yr-scaled —
+        ~2 mm at 50 mm/yr for the default k = 30 — well inside the ±5 mm
+        prior. Exact NumPy median (mean of the two central order statistics
+        for even k); series shorter than ``n_baseline`` use all samples.
+    """
+    if n_baseline < 1:
+        raise ValueError(f"n_baseline must be >= 1, got {n_baseline}")
+    k = min(int(n_baseline), y.size)
+    return float(np.median(y[:k]))
+
+
 def run_inversion(
     t: NDArray[np.float64],
     y: NDArray[np.float64],
@@ -794,6 +863,8 @@ def run_inversion(
     config: InversionConfig,
     bounds: PriorBounds,
     model: str = "BPD1",
+    *,
+    baseline_epochs: int = 30,
 ) -> InversionResult:
     """Metropolis-Hastings MCMC + simulated annealing (``runInversion_ts.m``).
 
@@ -820,6 +891,22 @@ def run_inversion(
       ``trial[3]``/``trial[5]`` are untouched — likely an index slip, see the
       module fidelity flags) and regenerates while
       ``|trial[4] − trial[2]| < 20 × breakpoint_step_floor``.
+    - **Zero-reference conditioning** (this port; module conventions): the
+      fixed ±5 mm intercept prior (``prepareModel_ts.m`` l.51–52) presumes a
+      series referenced near zero (``GBISrun_ts.m`` l.110 commented-out
+      force-zero line). The sampler therefore fits ``y − r`` with
+      ``r`` = :func:`_start_baseline` ``(y, baseline_epochs)`` and reports
+      the intercept back in the **input frame** — ``optimal[0]`` and the
+      chain row ``m_keep[0, :]`` get ``+r``; all other parameters
+      (``v, dv, tb, κ, β``) are shift-invariant and untouched. This is
+      numerical conditioning, not a physics change (precedent:
+      ``velocity.estimate_velocity``'s ``t_ref``). The intercept entries of
+      ``bounds`` (start and the ±5 range) refer to the **conditioned** frame.
+    - **Saturation guard**: if the conditioned-frame intercept optimum lies
+      within ``0.05 × range`` of either prior bound (0.5 mm for ±5), the fit
+      is rejected with :class:`ValueError` — the data is pathological even
+      after referencing (e.g. a step or steep drift inside the baseline
+      window) and the offset would silently leak into the trend.
 
     Symbols → args:
         - ``t``: epochs [yr], ``y``: displacements [mm], 1-D, same length
@@ -828,13 +915,22 @@ def run_inversion(
         - ``bounds``: :class:`PriorBounds`, length ``n_func`` (hyper slot
           appended automatically) or ``n_func + 1``
         - ``model``: ``"BPD1"`` | ``"BPD2"``
+        - ``baseline_epochs``: leading samples for the start-baseline median
+          ``r`` (≈ days for daily series). Default 30: robust to a leading
+          outlier, scatter-suppressing, yet short enough that secular drift
+          stays well inside the ±5 mm prior (see :func:`_start_baseline`).
+          ``0`` disables conditioning (``y_ref = 0``) — the exact upstream
+          input contract, for callers who reference explicitly.
 
     Returns:
-        :class:`InversionResult` — kept chain, kept log-posteriors, optimum.
+        :class:`InversionResult` — kept chain, kept log-posteriors, optimum
+        (intercepts in the input frame), and the baseline ``y_ref = r``.
 
     Raises:
-        ValueError: on shape mismatches, ``wn_amp ≤ 0``, unknown model, or a
-            start vector outside the bounds (upstream errors identically).
+        ValueError: on shape mismatches, ``wn_amp ≤ 0``, unknown model,
+            ``baseline_epochs < 0``, a start vector outside the bounds
+            (upstream errors identically), or a saturated intercept optimum
+            (the guard above — never silently returned).
         RuntimeError: if the BPD2 regeneration loop exceeds a safety cap
             (upstream would spin forever — deliberate guarded deviation).
 
@@ -862,8 +958,15 @@ def run_inversion(
         raise ValueError(f"wn_amp must be > 0, got {wn_amp}")
     if model not in _N_FUNC:
         raise ValueError(f"model must be one of {sorted(_N_FUNC)}, got {model!r}")
+    if baseline_epochs < 0:
+        raise ValueError(f"baseline_epochs must be >= 0, got {baseline_epochs}")
     n_func = _N_FUNC[model]
     n_breaks = 1 if model == "BPD1" else 2
+
+    # --- Zero-reference conditioning (module conventions; input untouched) ---
+    y_ref = _start_baseline(yy, baseline_epochs) if baseline_epochs else 0.0
+    if y_ref != 0.0:
+        yy = yy - y_ref  # new array — the caller's y is never mutated
 
     # --- Parameter vectors (hyper slot appended if absent) -------------------
     if bounds.start.size == n_func:
@@ -1032,7 +1135,30 @@ def run_inversion(
                 f"minimum separation {bp_floor * 20.0}"
             )
 
-    return InversionResult(m_keep=m_keep, p_keep=p_keep, optimal=func_opt, model=model)
+    # --- Saturation guard (conditioned frame) --------------------------------
+    a_lo, a_hi = float(lower[0]), float(upper[0])
+    if a_hi > a_lo:  # a zero-width intercept prior means "deliberately pinned"
+        margin = _INTERCEPT_GUARD_FRAC * (a_hi - a_lo)
+        a_opt = float(func_opt[0])
+        if a_opt <= a_lo + margin or a_opt >= a_hi - margin:
+            raise ValueError(
+                f"intercept optimum {a_opt:.3f} mm saturates its prior "
+                f"[{a_lo:g}, {a_hi:g}] mm (margin {margin:.3f}) even after "
+                f"zero-reference conditioning (y_ref = {y_ref:.3f} mm, "
+                f"baseline_epochs = {baseline_epochs}): the residual offset "
+                "would leak into the trend. Inspect the series start "
+                "(step/outliers/steep drift inside the baseline window?) or "
+                "reference it explicitly before calling."
+            )
+
+    # --- Intercept frame round-trip: report in the input frame ---------------
+    if y_ref != 0.0:
+        func_opt[0] += y_ref
+        m_keep[0, :] += y_ref
+
+    return InversionResult(
+        m_keep=m_keep, p_keep=p_keep, optimal=func_opt, model=model, y_ref=y_ref
+    )
 
 
 def _preliminary_start(
@@ -1131,6 +1257,7 @@ def detect_breakpoints(
     seed: int | None = None,
     start: NDArray[np.float64] | None = None,
     t_runs: int = 1000,
+    baseline_epochs: int = 30,
 ) -> InversionResult:
     """High-level one-call entry: build bounds + config, run the inversion.
 
@@ -1141,8 +1268,12 @@ def detect_breakpoints(
 
     Symbols → args:
         - ``t``: epochs [yr, fractional year, sorted ascending, uniform daily]
-        - ``y``: displacements [mm] (typically detrended/zero-referenced so the
-          intercept fits the fixed ±5 mm prior)
+        - ``y``: displacements [mm] — raw ``.NEU``-frame series are fine: the
+          leaf auto-references to the start baseline
+          (:func:`_start_baseline`) so the fixed ±5 mm intercept prior of
+          ``prepareModel_ts.m`` is honored; intercepts are reported back in
+          the input frame (see :func:`run_inversion` and
+          :attr:`InversionResult.y_ref`)
         - ``σ_w`` → ``wn_amp``: fixed white-noise amplitude [mm] (upstream
           ``WNlist``, from pre-processing noise estimation)
         - ``n_breaks``: 1 (BPD1) or 2 (BPD2)
@@ -1156,6 +1287,14 @@ def detect_breakpoints(
         - ``t_runs``: kept iterations per annealing temperature (default 1000
           = upstream; reduce for short exploratory chains so the 16-step
           cooling still completes within ``n_runs``).
+        - ``baseline_epochs``: leading samples for the zero-reference
+          baseline (default 30, 0 disables — see :func:`run_inversion`).
+          Also conditions the auto-seed: :func:`_preliminary_start` is run on
+          ``y − r`` so its intercept estimate lives in the conditioned frame
+          where the ±5 mm prior applies (``r`` is deterministic, so the value
+          recomputed inside :func:`run_inversion` is identical). An explicit
+          ``start`` intercept must likewise be given in the conditioned
+          frame (near zero — as upstream ``startPara``).
 
     Returns:
         :class:`InversionResult` for the requested model.
@@ -1174,11 +1313,20 @@ def detect_breakpoints(
         raise ValueError(f"y shape {yy.shape} does not match t shape {tt.shape}")
     if n_breaks not in (1, 2):
         raise ValueError(f"n_breaks must be 1 or 2, got {n_breaks}")
+    if baseline_epochs < 0:
+        raise ValueError(f"baseline_epochs must be >= 0, got {baseline_epochs}")
     model = "BPD1" if n_breaks == 1 else "BPD2"
     if start is None:
-        seed_params = _preliminary_start(tt, yy, wn_amp, n_breaks)
+        # Seed on the conditioned series: run_inversion recomputes the same
+        # deterministic baseline, so seed frame == sampling frame.
+        y_seed = yy
+        if baseline_epochs:
+            y_seed = yy - _start_baseline(yy, baseline_epochs)
+        seed_params = _preliminary_start(tt, y_seed, wn_amp, n_breaks)
     else:
         seed_params = np.asarray(start, dtype=np.float64)
     bounds = prepare_bounds(seed_params, model)
     config = InversionConfig(n_runs=n_runs, t_runs=t_runs, seed=seed)
-    return run_inversion(tt, yy, wn_amp, config, bounds, model)
+    return run_inversion(
+        tt, yy, wn_amp, config, bounds, model, baseline_epochs=baseline_epochs
+    )

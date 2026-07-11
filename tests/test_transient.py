@@ -33,10 +33,12 @@ from gps_analysis.transient import (
     BPD1Params,
     BPD2Params,
     InversionConfig,
+    InversionResult,
     PriorBounds,
     _log_likelihood_fast,
     _powerlaw_psi,
     _schur_logdet_quad,
+    _start_baseline,
     bpd1_forward,
     bpd2_forward,
     detect_breakpoints,
@@ -498,10 +500,15 @@ class TestRunInversion:
         assert res.optimal.shape == (6,)
         assert res.model == "BPD1"
         assert np.all(np.isfinite(res.p_keep))
-        # kept samples respect the reflected uniform priors
+        # kept samples respect the reflected uniform priors; the intercept
+        # row is reported in the INPUT frame (+ y_ref, zero-reference
+        # conditioning) so its prior window is shifted by y_ref.
         eps = 1e-9
-        assert np.all(res.m_keep >= bounds.lower[:, None] - eps)
-        assert np.all(res.m_keep <= bounds.upper[:, None] + eps)
+        assert np.all(res.m_keep[1:] >= bounds.lower[1:, None] - eps)
+        assert np.all(res.m_keep[1:] <= bounds.upper[1:, None] + eps)
+        assert res.y_ref == pytest.approx(_start_baseline(y, 30), abs=0)
+        assert np.all(res.m_keep[0] >= bounds.lower[0] + res.y_ref - eps)
+        assert np.all(res.m_keep[0] <= bounds.upper[0] + res.y_ref + eps)
         # the optimum attains the maximum kept log-posterior
         assert np.max(res.p_keep) == pytest.approx(
             float(
@@ -614,6 +621,14 @@ class TestRunInversion:
         |v - 6| ~ 1.3 plus short-chain wander around the ML point (observed
         optimum spread ~ +-0.9 over chain seeds). The dv/tb tolerances are
         likewise ~1.5-2 GLS sigma for this design.
+
+        ``baseline_epochs=0``: the synthetic is already referenced (a=0.5),
+        so conditioning is a physical no-op here, but subtracting r ~ 0.7
+        shifts the frame the fixed trial sequence walks through and lands
+        this audited seed at v=3.74 (short-chain wander, just past the
+        band). Disabling it preserves the exact chain the tolerance audit
+        above was computed for; conditioning itself is covered by
+        TestZeroReferenceConditioning and the TS14 window parity test.
         """
         rng = np.random.default_rng(42)
         t = 2019.0 + np.arange(500) / 365.0
@@ -628,6 +643,7 @@ class TestRunInversion:
             seed=1,
             start=np.array([0.4, 5.5, -10.0, 2019.33, 7.0, 2019.62, -1.0, 1.0]),
             t_runs=120,
+            baseline_epochs=0,
         )
         a, v, dv1, tb1, dv2, tb2, kappa, amp = (float(x) for x in res.optimal)
         assert v == pytest.approx(6.0, abs=2.0)
@@ -635,6 +651,144 @@ class TestRunInversion:
         assert tb1 == pytest.approx(2019.3, abs=0.05)
         assert dv2 == pytest.approx(8.0, abs=2.0)
         assert tb2 == pytest.approx(2019.65, abs=0.05)
+
+
+# =========================================================================
+# Zero-reference input conditioning + saturation guard (input contract)
+# =========================================================================
+
+
+class TestZeroReferenceConditioning:
+    """Auto-conditioning contract: fit ``y − r``, report in the input frame.
+
+    ``r`` = median of the first ``baseline_epochs`` samples
+    (:func:`_start_baseline`) — numerical conditioning against the fixed
+    ±5 mm intercept prior of ``prepareModel_ts.m``, not a physics change
+    (the ``velocity.estimate_velocity`` ``t_ref`` precedent). The binding
+    property is **shift invariance**: under ``y → y + c`` every parameter
+    except the intercept must be unchanged and the intercept must shift by
+    exactly ``c`` (frame round-trip through ``y_ref``).
+    """
+
+    START = np.array([0.8, 4.0, -13.0, 2019.45, -1.0, 1.0])
+
+    def _run(
+        self, t: np.ndarray, y: np.ndarray, *, baseline_epochs: int = 30
+    ) -> InversionResult:
+        return run_inversion(
+            t,
+            y,
+            1.0,
+            InversionConfig(n_runs=600, t_runs=30, seed=17),
+            prepare_bounds(self.START),
+            "BPD1",
+            baseline_epochs=baseline_epochs,
+        )
+
+    def test_start_baseline_is_leading_median(self) -> None:
+        y = np.arange(100.0)
+        assert _start_baseline(y, 30) == float(np.median(y[:30]))
+
+    def test_start_baseline_robust_to_leading_outlier(self) -> None:
+        """Median (50% breakdown): one wild first sample does not move r."""
+        y = np.zeros(60)
+        y[0] = 1.0e3
+        assert _start_baseline(y, 30) == 0.0
+
+    def test_start_baseline_short_series_uses_all_samples(self) -> None:
+        y = np.array([1.0, 3.0, 2.0])
+        assert _start_baseline(y, 30) == 2.0
+
+    def test_start_baseline_rejects_nonpositive_window(self) -> None:
+        with pytest.raises(ValueError, match=">= 1"):
+            _start_baseline(np.zeros(10), 0)
+
+    @pytest.mark.parametrize("c", [-12.0, 50.0])
+    def test_shift_invariance(self, c: float) -> None:
+        """y + c: physics params identical, intercepts differ by exactly c.
+
+        The trial sequence depends only on the RNG seed and bounds, never on
+        the data, and the conditioned series ``(y + c) − (r + c)`` matches
+        ``y − r`` to float64 rounding — so for a fixed seed the two chains
+        take identical accept decisions and the kept parameters agree to
+        ~1e-9 (rounding of the shifted subtraction), while the reported
+        intercept row and optimum carry the +c frame shift through
+        ``y_ref``. This is the proof that conditioning is pure frame
+        bookkeeping: a constant offset carries no deformation information.
+        """
+        t, y, truth = _synthetic_bpd1(n=150)
+        base = self._run(t, y)
+        shifted = self._run(t, y + c)
+        # frame provenance: r shifts with the data
+        assert shifted.y_ref - base.y_ref == pytest.approx(c, abs=1e-9)
+        # v, dv, tb, kappa, amp: shift-invariant (optimum and full chain)
+        np.testing.assert_allclose(
+            shifted.optimal[1:], base.optimal[1:], rtol=0, atol=1e-9
+        )
+        np.testing.assert_allclose(
+            shifted.m_keep[1:], base.m_keep[1:], rtol=0, atol=1e-9
+        )
+        np.testing.assert_allclose(shifted.p_keep, base.p_keep, rtol=1e-9)
+        # intercept: differs by exactly c — the frame round-trips
+        assert shifted.optimal[0] - base.optimal[0] == pytest.approx(c, abs=1e-9)
+        np.testing.assert_allclose(
+            shifted.m_keep[0] - base.m_keep[0], c, rtol=0, atol=1e-9
+        )
+        # and the reported intercept lives in the INPUT frame, near truth
+        assert base.optimal[0] == pytest.approx(truth["a"], abs=2.0)
+
+    def test_disabled_conditioning_reports_zero_reference(self) -> None:
+        """baseline_epochs=0: upstream contract, y_ref = 0, frame untouched."""
+        t, y, _ = _synthetic_bpd1(n=150)
+        res = self._run(t, y, baseline_epochs=0)
+        assert res.y_ref == 0.0
+
+    def test_guard_raises_on_unreferenced_offset_when_disabled(self) -> None:
+        """Option-C backstop: a +50 mm offset with conditioning off saturates
+        the ±5 mm intercept prior — the leaf must refuse, not return a fit
+        whose offset has leaked into the trend."""
+        t, y, _ = _synthetic_bpd1(n=150)
+        with pytest.raises(ValueError, match="saturates its prior"):
+            self._run(t, y + 50.0, baseline_epochs=0)
+
+    def test_guard_raises_on_pathological_input(self) -> None:
+        """Pathological even AFTER conditioning: a steep drift makes the
+        30-day baseline sit ~12 mm below y(t0) (r ≈ v·14.5 d ≈ −11.9 mm at
+        v = −300 mm/yr), so the conditioned intercept still needs ~+12 mm
+        and wedges against the +5 mm bound → ValueError, not a silent
+        saturated fit."""
+        rng = np.random.default_rng(5)
+        t = 2019.0 + np.arange(200) / 365.0
+        p = BPD1Params(0.0, -300.0, 40.0, 2019.3, 0.0, 0.0)
+        y = bpd1_forward(p, t) + rng.standard_normal(200)
+        start = np.array([0.0, -290.0, 38.0, 2019.3, -1.0, 1.0])
+        with pytest.raises(ValueError, match="saturates its prior"):
+            run_inversion(
+                t,
+                y,
+                1.0,
+                InversionConfig(n_runs=600, t_runs=30, seed=17),
+                prepare_bounds(start),
+                "BPD1",
+            )
+
+    def test_negative_baseline_epochs_raises(self) -> None:
+        t, y, _ = _synthetic_bpd1(n=60)
+        with pytest.raises(ValueError, match="baseline_epochs"):
+            self._run(t, y, baseline_epochs=-1)
+        with pytest.raises(ValueError, match="baseline_epochs"):
+            detect_breakpoints(t, y, 1.0, n_runs=10, baseline_epochs=-1)
+
+    def test_detect_breakpoints_conditions_offset_series(self) -> None:
+        """Raw offset series through the one-call entry: the auto-seed is
+        computed in the conditioned frame (no ±5 clipping artifact) and the
+        chain runs; y_ref carries the offset."""
+        t, y, _ = _synthetic_bpd1(n=150)
+        res = detect_breakpoints(
+            t, y + 40.0, 1.0, n_breaks=1, n_runs=300, seed=9, t_runs=20
+        )
+        assert res.m_keep.shape == (7, 300)
+        assert res.y_ref == pytest.approx(41.0, abs=2.0)  # offset + a + drift
 
 
 class TestDetectBreakpoints:
@@ -667,18 +821,23 @@ class TestDetectBreakpoints:
 class TestTS14Reference:
     @pytest.mark.slow
     def test_ts14_window_parity(self) -> None:
-        """BPD1 on TS14 restricted to 2020.5-2022.5 (731 epochs), zero-referenced.
+        """BPD1 on TS14 restricted to 2020.5-2022.5 (731 epochs), RAW input.
 
-        The window is re-referenced (minus its first-30-day mean, ~8.6 mm)
-        because the intercept prior is HARD-CODED to +-5 mm upstream
-        (``prepareModel_ts.m`` l.51-52) and GBIS4TS expects series referenced
-        near zero (``GBISrun_ts.m`` carries a commented-out
-        ``timeseries(:,2) - timeseries(1,2); % force the intercept to be
-        zero``). The raw window starts ~8.3 mm above zero: the intercept then
-        saturates at +5 (observed a=4.916) and the sampler compensates by
+        The window is passed UNREFERENCED on purpose: the intercept prior is
+        HARD-CODED to +-5 mm upstream (``prepareModel_ts.m`` l.51-52) and
+        GBIS4TS expects series referenced near zero (``GBISrun_ts.m`` l.110
+        carries a commented-out ``timeseries(:,2) - timeseries(1,2); % force
+        the intercept to be zero``), while the raw window starts ~8.3 mm
+        above zero. Pre-conditioning (earlier audit), the intercept then
+        saturated at +5 (observed a=4.916) and the sampler compensated by
         inflating v toward its own prior bound 8.8136 (observed v=8.068 vs
-        windowed-GLS v=4.06 +- 0.96 free / 7.39 with a pinned at +5) —
-        an input-referencing artifact, not a window-identifiability limit.
+        windowed-GLS v=4.06 +- 0.96 free / 7.39 with a pinned at +5) — an
+        input-referencing artifact, not a window-identifiability limit. The
+        leaf now auto-conditions (fits ``y - median(y[:30])``, reports the
+        intercept back in the input frame — ``InversionResult.y_ref``), so
+        feeding the raw window actively tests that behavior on real data;
+        the manual first-30-day-mean subtraction this test used before is
+        gone.
 
         The full-series reference (SI Table S4, scheme beta=4, g=-20:
         optimal dv=-20.0, tb=2021.5109, kappa=-0.7, amp=4.0) is checked with
@@ -687,13 +846,14 @@ class TestTS14Reference:
         95% half-width (windowed exact GLS-ML: dv=-18.2, tb=2021.4507,
         v=4.81 at reference kappa/amp), tb within +-0.15 yr, v within ~3
         GLS-sigma of the windowed value, kappa/amp within the physically
-        sampled ranges. Seeded run observed: a=-1.02, v=5.50, dv=-18.68,
-        tb=2021.4405, kappa=-0.64, amp=3.95.
+        sampled ranges. Seeded run observed (median baseline y_ref=8.757 vs
+        the old manual mean 8.639): a=7.815 (input frame; conditioned-frame
+        a=-0.942), v=4.95, dv=-18.35, tb=2021.4590, kappa=-0.58, amp=3.71.
         """
         t, y = _load_ts14()
         mask = (t >= 2020.5) & (t <= 2022.5)
         tw = t[mask]
-        yw = y[mask] - float(np.mean(y[mask][:30]))  # zero-reference (see doc)
+        yw = y[mask]  # raw — the leaf's auto-conditioning is under test
         res = run_inversion(
             tw,
             yw,
@@ -710,9 +870,13 @@ class TestTS14Reference:
         # v: windowed GLS gives 4.06 +- 0.96, so [2.0, 8.0] is ~+-3 sigma —
         # a meaningful sanity band once the input is properly referenced.
         assert 2.0 <= v <= 8.0
-        # saturation guard: the intercept must sit OFF its +-5 prior bounds
-        # (a wedged at a bound reproduces the referencing artifact above).
-        assert abs(a) < 4.5
+        # conditioning provenance: r is the raw window's start level (~8.4 mm)
+        assert res.y_ref == float(np.median(yw[:30]))
+        assert 5.0 <= res.y_ref <= 12.0
+        # conditioned-frame intercept off the +-5 prior bounds: numerically
+        # identical to the leaf's own saturation guard (margin 0.05*10 = 0.5),
+        # kept as an explicit cross-check that the input frame round-trips.
+        assert abs(a - res.y_ref) < 4.5
         assert -1.2 <= kappa <= -0.2
         assert 2.0 <= amp <= 6.5
 
