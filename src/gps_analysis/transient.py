@@ -17,6 +17,19 @@ originating ``.m`` file; ``reference/gbis4ts/SOURCE_MAP.md`` pins the map):
    (``BPD1.m`` / ``BPD2.m``): continuity-preserving piecewise-linear trajectory
    ``y = a − v·t₀ + v·t + Σ_k g_k·H(t − t_bk)·(t − t*_k)`` with Heaviside
    convention ``H(0) = 1`` and ``t*_k`` the first sample epoch ≥ t_bk.
+   **Seasonal-aware variants** (this port; :func:`bpd1_seasonal_forward` /
+   :func:`bpd2_seasonal_forward`, model codes ``"BPD1S"`` / ``"BPD2S"``) add an
+   annual+semiannual term ``+ sa·cos2πt + sb·sin2πt + sc·cos4πt + sd·sin4πt``
+   (:func:`_seasonal_design`; Blewitt & Lavallée 2002 eq. 2, mirroring
+   :func:`gps_analysis.models.periodic`). The four amplitudes sit BETWEEN the
+   trajectory and noise blocks — vector
+   ``[a, v, (g_k, tb_k)…, sa, sb, sc, sd, κ, β]`` — so the noise pair stays
+   last and the seasonal-blind BPD1/BPD2 path is byte-unchanged (validated
+   against the MATLAB + TS14). The MCMC **co-estimates** the seasonal terms
+   with the break/rate/noise parameters (joint identification): on real GNSS
+   windows ≲ 4.5 yr a seasonal signal aliases into the trend and break unless
+   fit jointly (Blewitt & Lavallée 2002 — pre-removal fails, the seasonal
+   estimate is itself ramp-contaminated on short windows).
 2. **Residual** — ``r = y − model`` (``runInversion_ts.m`` l.114).
 3. **Colored-noise covariance** — :func:`noise_covariance`
    (``UniVarMatrix.m``; Williams 2003, J. Geodesy 76, eq. 4; Yang et al. 2023
@@ -69,7 +82,9 @@ Conventions and caveats (binding, see ``docs/MATH_STANDARDS.md``)
   carries no deformation information and ``v, dv, tb, κ, β`` are invariant
   to it (the same precedent as ``velocity.estimate_velocity`` re-referencing
   ``t`` to ``t_ref``). A post-fit guard raises if the conditioned intercept
-  optimum still saturates its prior (pathological input).
+  optimum still saturates its prior (pathological input). The ±5 mm prior is
+  the seasonal-blind value; the seasonal variants (below) widen it because
+  the median baseline carries the seasonal window-mean.
 - Runtime (task H3, closed): each MCMC pass costs one exact O(N²)
   generalized-Schur factorization+solve (:func:`_schur_logdet_quad`) — ≈ 6 ms
   at N = 1825 vs ≈ 160–600 ms for the pre-H3 dense build+Cholesky (≈ 27–70×);
@@ -104,11 +119,15 @@ from scipy.linalg.blas import daxpy, drot
 __all__ = [
     "BPD1Params",
     "BPD2Params",
+    "BPD1SeasonalParams",
+    "BPD2SeasonalParams",
     "PriorBounds",
     "InversionConfig",
     "InversionResult",
     "bpd1_forward",
     "bpd2_forward",
+    "bpd1_seasonal_forward",
+    "bpd2_seasonal_forward",
     "noise_covariance",
     "log_likelihood",
     "prepare_bounds",
@@ -123,8 +142,47 @@ _LOG_2PI = float(np.log(2.0 * np.pi))
 #: Daily sampling interval ΔT [yr] hard-coded upstream (UniVarMatrix.m l.27).
 _DELTA_T_YR = 1.0 / 365.0
 
-#: Number of parameters of the trajectory+noise function per model.
-_N_FUNC = {"BPD1": 6, "BPD2": 8}
+#: Number of parameters of the trajectory(+seasonal)+noise function per model.
+#: layout: [a, v, (g_k, tb_k)×n_breaks, (sa, sb, sc, sd)?, κ, β] — noise last.
+#: n_func = 2 + 2·n_breaks + 4·seasonal + 2.
+_N_FUNC = {"BPD1": 6, "BPD2": 8, "BPD1S": 10, "BPD2S": 12}
+
+#: Velocity break points per model code.
+_N_BREAKS = {"BPD1": 1, "BPD2": 2, "BPD1S": 1, "BPD2S": 2}
+
+#: Model codes carrying the annual+semiannual seasonal block (this port; the
+#: seasonal-blind BPD1/BPD2 stay byte-parity with the MATLAB — SOURCE_MAP.md).
+_SEASONAL_MODELS = frozenset({"BPD1S", "BPD2S"})
+
+#: Number of seasonal amplitude parameters (annual cos/sin + semiannual cos/sin).
+_N_SEASONAL = 4
+
+#: Symmetric prior half-range for each seasonal cos/sin amplitude [mm].
+#: Icelandic GNSS seasonal amplitudes run a few mm (horizontal) to ~1 cm+
+#: (vertical hydrological loading); ±15 mm per coefficient gives the joint
+#: annual/semiannual amplitude √(a²+b²) up to ~21 mm of headroom while keeping
+#: the search bounded. Symmetric about 0 (a sign flip is a half-cycle phase
+#: shift — no negative-rate swap applies).
+_SEASONAL_AMP_BOUND = 15.0
+
+#: MCMC step for each seasonal amplitude [mm] (mm-scale parameter; cf. the
+#: 1 mm intercept step of prepareModel_ts.m).
+_SEASONAL_STEP = 0.5
+
+#: Intercept prior half-range for the SEASONAL models [mm] (widened from the
+#: ±5 mm of the seasonal-blind BPD1/BPD2). The zero-reference baseline
+#: ``r = median(y[:baseline_epochs])`` (:func:`_start_baseline`) cannot be
+#: seasonally neutral over a short leading window — it carries the seasonal
+#: window-mean — so after conditioning the intercept absorbs ``a_true − r ≈
+#: −(seasonal window-mean)``, whose magnitude for an *in-prior* seasonal fit
+#: is bounded by ``√(sa²+sb²) + √(sc²+sd²) ≤ 2·√2·A_max`` (each cos/sin pair
+#: at its ±A_max corner, both terms near-constant over the short window). The
+#: bound is sized to that worst case plus the ±5 mm genuine-DC allowance, so
+#: the saturation guard can never false-fire on legitimate high-amplitude
+#: (e.g. vertical-loading) seasonal data — it still catches a true DC leak
+#: beyond what the seasonal terms can explain. The intercept is tightly
+#: data-constrained regardless, so the wide prior costs no accuracy.
+_SEASONAL_INTERCEPT_BOUND = 5.0 + 2.0 * math.sqrt(2.0) * _SEASONAL_AMP_BOUND
 
 # Inert hyperparameter slot appended by prepareModel_ts.m l.120-124.
 _HYPER_START = 0.0
@@ -196,6 +254,89 @@ class BPD2Params:
                 self.breakpoint1,
                 self.trend_change2,
                 self.breakpoint2,
+                self.kappa,
+                self.amp,
+            ],
+            dtype=np.float64,
+        )
+
+
+@dataclass(frozen=True)
+class BPD1SeasonalParams:
+    """One-break trajectory + annual/semiannual seasonal + noise parameters.
+
+    Seasonal-aware variant of :class:`BPD1Params` (model code ``"BPD1S"``):
+    the four seasonal amplitudes ``(sa, sb, sc, sd)`` sit **between** the
+    trajectory and noise blocks so the noise pair stays last (κ, β), matching
+    the ``[a, v, g, tb, sa, sb, sc, sd, κ, β]`` sampler layout. Units:
+    displacement mm, time fractional year, rates mm/yr, amplitudes mm.
+    """
+
+    intercept: float
+    trend1: float
+    trend_change: float
+    breakpoint: float
+    cos_annual: float  # a: annual cosine amplitude [mm]
+    sin_annual: float  # b: annual sine amplitude [mm]
+    cos_semiannual: float  # c: semiannual cosine amplitude [mm]
+    sin_semiannual: float  # d: semiannual sine amplitude [mm]
+    kappa: float
+    amp: float
+
+    def as_array(self) -> NDArray[np.float64]:
+        """Parameter vector in sampler order ``[a,v,g,tb,sa,sb,sc,sd,κ,β]``."""
+        return np.array(
+            [
+                self.intercept,
+                self.trend1,
+                self.trend_change,
+                self.breakpoint,
+                self.cos_annual,
+                self.sin_annual,
+                self.cos_semiannual,
+                self.sin_semiannual,
+                self.kappa,
+                self.amp,
+            ],
+            dtype=np.float64,
+        )
+
+
+@dataclass(frozen=True)
+class BPD2SeasonalParams:
+    """Two-break trajectory + annual/semiannual seasonal + noise parameters.
+
+    Seasonal-aware variant of :class:`BPD2Params` (model code ``"BPD2S"``);
+    layout ``[a, v, g1, tb1, g2, tb2, sa, sb, sc, sd, κ, β]`` (noise last).
+    """
+
+    intercept: float
+    trend1: float
+    trend_change1: float
+    breakpoint1: float
+    trend_change2: float
+    breakpoint2: float
+    cos_annual: float
+    sin_annual: float
+    cos_semiannual: float
+    sin_semiannual: float
+    kappa: float
+    amp: float
+
+    def as_array(self) -> NDArray[np.float64]:
+        """Parameter vector ``[a,v,g1,tb1,g2,tb2,sa,sb,sc,sd,κ,β]``."""
+        return np.array(
+            [
+                self.intercept,
+                self.trend1,
+                self.trend_change1,
+                self.breakpoint1,
+                self.trend_change2,
+                self.breakpoint2,
+                self.cos_annual,
+                self.sin_annual,
+                self.cos_semiannual,
+                self.sin_semiannual,
                 self.kappa,
                 self.amp,
             ],
@@ -285,10 +426,11 @@ class InversionResult:
             (upstream stores single — deliberate precision upgrade).
         p_keep: ``(n_runs,)`` log-posterior (= log-likelihood, flat priors) per
             kept column (MATLAB ``PKeep``).
-        optimal: Best-likelihood trajectory+noise parameter vector, length 6
-            (BPD1) or 8 (BPD2), without the hyperparameter slot — MATLAB
-            ``results.optimalmodel``.
-        model: ``"BPD1"`` | ``"BPD2"``.
+        optimal: Best-likelihood trajectory(+seasonal)+noise parameter vector,
+            without the hyperparameter slot — MATLAB ``results.optimalmodel``.
+            Length by model: 6 (BPD1) / 8 (BPD2) / 10 (BPD1S) / 12 (BPD2S);
+            the seasonal variants carry ``(sa, sb, sc, sd)`` before ``(κ, β)``.
+        model: ``"BPD1"`` | ``"BPD2"`` | ``"BPD1S"`` | ``"BPD2S"``.
         y_ref: Start baseline r [mm] subtracted internally before fitting
             (:func:`_start_baseline`) and added back to the reported
             intercepts (``optimal[0]`` and ``m_keep[0, :]``), so the chain
@@ -426,6 +568,122 @@ def bpd2_forward(params: BPD2Params, t: NDArray[np.float64]) -> NDArray[np.float
     """
     tt = _as_time_array(t)
     return _trajectory(params.as_array(), tt, n_breaks=2)
+
+
+def _seasonal_design(t: NDArray[np.float64]) -> NDArray[np.float64]:
+    """Annual + semiannual seasonal design matrix D, columns ``[cos2πt, sin2πt, cos4πt, sin4πt]``.
+
+    Equation (Blewitt & Lavallée 2002, JGR 107(B7), eq. 2; Bevis & Brown 2014,
+    J. Geodesy 88, eq. 1 with n_F = 2):
+        ``D[:, 0] = cos(2πt)``, ``D[:, 1] = sin(2πt)``,
+        ``D[:, 2] = cos(4πt)``, ``D[:, 3] = sin(4πt)``
+    so that ``D · [a, b, c, d] = a·cos(2πt) + b·sin(2πt) + c·cos(4πt) +
+    d·sin(4πt)`` — algebraically identical to
+    :func:`gps_analysis.models.periodic` (the shared house convention;
+    equivalence pinned to float eps in the test suite). The design is built
+    ONCE per :func:`run_inversion` call (t is fixed) so the MCMC hot loop adds
+    the seasonal mean as a single (n×4)·4 matvec.
+
+    Symbols → args:
+        - ``t`` → ``t``: sample epochs [yr, fractional year] — **absolute**
+          ``yearf``, so phase zero is the calendar new year (the seasonal
+          phase must NOT be re-referenced; the zero-reference conditioning of
+          :func:`run_inversion` shifts only the displacement, not t).
+
+    Returns:
+        D, shape (n, 4), float64.
+
+    Reference:
+        Blewitt & Lavallée 2002, JGR 107(B7), eq. 2 (annual+semiannual
+        truncation; co-estimation with v mandatory for windows ≲ 4.5 yr);
+        Bevis & Brown 2014, J. Geodesy 88, eq. 1. Mirrors
+        :func:`gps_analysis.models.periodic` for cross-module consistency.
+
+    Numerical notes:
+        Exact float64 trig on the absolute epochs; the two angular
+        frequencies are 2π and 4π yr⁻¹ (``ω_semiannual = 2·ω_annual``,
+        computed as ``2·(2πt)`` to share the multiply). No re-referencing —
+        see the phase caveat above.
+    """
+    two_pi_t = 2.0 * np.pi * t
+    return np.column_stack(
+        (
+            np.cos(two_pi_t),
+            np.sin(two_pi_t),
+            np.cos(2.0 * two_pi_t),
+            np.sin(2.0 * two_pi_t),
+        )
+    )
+
+
+def bpd1_seasonal_forward(
+    params: BPD1SeasonalParams, t: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Evaluate the one-break trajectory plus annual/semiannual seasonal y(t).
+
+    Equation (additive; :func:`bpd1_forward` + :func:`_seasonal_design`):
+        ``y(t) = a − v·t₀ + v·t + g·H(t − t_b)·(t − t*)
+                 + sa·cos(2πt) + sb·sin(2πt) + sc·cos(4πt) + sd·sin(4πt)``
+    with ``t* = first t ≥ t_b`` and ``H(0) = 1``. The seasonal block is
+    orthogonal to the break/rate/noise parameters in the model (a distinct
+    deterministic-mean term), so setting ``sa = sb = sc = sd = 0`` reproduces
+    :func:`bpd1_forward` **exactly**.
+
+    Symbols → args:
+        - ``a, v, g, t_b`` → as :func:`bpd1_forward`
+        - ``sa, sb, sc, sd`` → ``params.cos_annual`` / ``sin_annual`` /
+          ``cos_semiannual`` / ``sin_semiannual``: seasonal amplitudes [mm]
+        - ``params.kappa``, ``params.amp``: noise parameters, unused here.
+
+    Returns:
+        Model positions y(t) [mm], float64, new array (inputs untouched).
+
+    Reference:
+        Yang et al. 2023, 2023GL103432, eq. 4 (break term); Blewitt &
+        Lavallée 2002, JGR 107(B7), eq. 2 and Bevis & Brown 2014, J. Geodesy
+        88, eq. 1 (annual+semiannual seasonal — why it must be co-estimated,
+        not pre-removed, on short windows).
+
+    Numerical notes:
+        Same conventions/guards as :func:`bpd1_forward`; seasonal via
+        :func:`_seasonal_design` (absolute-``yearf`` phase — do not
+        re-reference t).
+    """
+    tt = _as_time_array(t)
+    m = params.as_array()
+    return _trajectory(m, tt, n_breaks=1) + _seasonal_design(tt) @ m[4:8]
+
+
+def bpd2_seasonal_forward(
+    params: BPD2SeasonalParams, t: NDArray[np.float64]
+) -> NDArray[np.float64]:
+    """Evaluate the two-break trajectory plus annual/semiannual seasonal y(t).
+
+    Equation (:func:`bpd2_forward` + :func:`_seasonal_design`):
+        ``y(t) = a − v·t₀ + v·t + g₁·H(t − t_b1)·(t − t*₁)
+                 + g₂·H(t − t_b2)·(t − t*₂)
+                 + sa·cos(2πt) + sb·sin(2πt) + sc·cos(4πt) + sd·sin(4πt)``.
+    ``sa = sb = sc = sd = 0`` reproduces :func:`bpd2_forward` exactly.
+
+    Symbols → args:
+        - ``a, v, g₁, t_b1, g₂, t_b2`` → as :func:`bpd2_forward`
+        - ``sa, sb, sc, sd`` → seasonal amplitudes [mm]
+        - ``params.kappa``, ``params.amp``: noise parameters, unused here.
+
+    Returns:
+        Model positions y(t) [mm], float64, new array.
+
+    Reference:
+        As :func:`bpd1_seasonal_forward`, break term extended to two breaks
+        (``BPD2.m`` l.15–17).
+
+    Numerical notes:
+        Same conventions/guards as :func:`bpd2_forward`; seasonal amplitudes
+        occupy vector indices 6–9 (noise pair stays last).
+    """
+    tt = _as_time_array(t)
+    m = params.as_array()
+    return _trajectory(m, tt, n_breaks=2) + _seasonal_design(tt) @ m[6:10]
 
 
 def _powerlaw_psi(n: int, kappa: float) -> NDArray[np.float64]:
@@ -730,6 +988,7 @@ def prepare_bounds(start: NDArray[np.float64], model: str = "BPD1") -> PriorBoun
     velocity change g_k       −ĝ_k             2·ĝ_k
     break point t_bk [yr]     t̂_k − 1 (BPD1)   t̂_k + 1 (BPD1)
                               t̂_k − 0.5 (BPD2) t̂_k + 0.5 (BPD2)
+    seasonal ampl. sa…sd [mm] −A_max            +A_max
     spectral index κ          −1.5              0
     PLN amplitude β           0                 1.5·β̂
     ========================  ================  ================
@@ -737,14 +996,32 @@ def prepare_bounds(start: NDArray[np.float64], model: str = "BPD1") -> PriorBoun
     with lower/upper swapped where a negative preliminary rate inverts them
     (``prepareModel_ts.m`` l.54–105). Steps: 1 mm (a), ``0.05·v̂`` (every rate
     parameter — *all* trend steps derive from v̂ upstream), 0.0027 yr (breaks),
-    0.05 (κ), 1 (β). The inert hyperparameter slot (start 0, step 1e-3, bounds
-    ±0.5; ``prepareModel_ts.m`` l.120–124) is appended.
+    ``_SEASONAL_STEP`` mm (each seasonal amplitude), 0.05 (κ), 1 (β). The inert
+    hyperparameter slot (start 0, step 1e-3, bounds ±0.5; ``prepareModel_ts.m``
+    l.120–124) is appended.
+
+    Seasonal models (``"BPD1S"`` / ``"BPD2S"``, this port) add four
+    annual/semiannual amplitudes ``(sa, sb, sc, sd)`` between the trajectory
+    and noise blocks (see :func:`_seasonal_design`). Their prior is symmetric
+    ``±A_max`` = ``_SEASONAL_AMP_BOUND`` (15 mm) — physically motivated by
+    Icelandic GNSS seasonal amplitudes (a few mm horizontal to ~1 cm+ vertical
+    loading); symmetric about 0 so the negative-rate swap does not touch them.
+    The seasonal intercept prior is widened to ``±_SEASONAL_INTERCEPT_BOUND``
+    (``5 + 2√2·A_max`` ≈ 47 mm, vs ±5 for the blind models): the plain-median
+    zero-reference baseline carries the seasonal window-mean, so the
+    conditioned intercept absorbs ``−(seasonal window-mean)`` (magnitude up to
+    ``2√2·A_max`` for an in-prior fit) and would saturate a ±5 prior on
+    high-amplitude data. Sizing to the worst case + ±5 keeps the saturation
+    guard from ever false-firing on legitimate seasonal series (the intercept
+    stays tightly data-constrained, so the wider prior costs nothing).
 
     Symbols → args:
-        - ``start``: preliminary estimates in MATLAB order, length 6 (BPD1:
-          ``[â, v̂, ĝ, t̂, κ̂, β̂]``) or 8 (BPD2: ``[â, v̂, ĝ₁, t̂₁, ĝ₂, t̂₂,
-          κ̂, β̂]``); mm, mm/yr, yr as above.
-        - ``model``: ``"BPD1"`` | ``"BPD2"``.
+        - ``start``: preliminary estimates in the sampler layout, length 6
+          (BPD1 ``[â, v̂, ĝ, t̂, κ̂, β̂]``) / 8 (BPD2
+          ``[â, v̂, ĝ₁, t̂₁, ĝ₂, t̂₂, κ̂, β̂]``) / 10 (BPD1S, seasonal
+          ``[â, v̂, ĝ, t̂, ŝa, ŝb, ŝc, ŝd, κ̂, β̂]``) / 12 (BPD2S); mm,
+          mm/yr, yr as above.
+        - ``model``: ``"BPD1"`` | ``"BPD2"`` | ``"BPD1S"`` | ``"BPD2S"``.
 
     Returns:
         :class:`PriorBounds` of length ``n_func + 1`` (hyperparameter slot
@@ -767,12 +1044,13 @@ def prepare_bounds(start: NDArray[np.float64], model: str = "BPD1") -> PriorBoun
         raise ValueError(
             f"start must have shape ({n_func},) for {model}, got {s.shape}"
         )
+    ss, sb, ib = _SEASONAL_STEP, _SEASONAL_AMP_BOUND, _SEASONAL_INTERCEPT_BOUND
     if model == "BPD1":
         step = np.array([1.0, s[1] * 0.05, s[1] * 0.05, 0.0027, 0.05, 1.0])
         lower = np.array([-5.0, -s[1], -s[2], s[3] - 1.0, -1.5, 0.0])
         upper = np.array([5.0, 2.0 * s[1], 2.0 * s[2], s[3] + 1.0, 0.0, 1.5 * s[5]])
         swap_indices: tuple[int, ...] = (1, 2)
-    else:
+    elif model == "BPD2":
         step = np.array(
             [1.0, s[1] * 0.05, s[1] * 0.05, 0.0027, s[1] * 0.05, 0.0027, 0.05, 1.0]
         )
@@ -787,6 +1065,66 @@ def prepare_bounds(start: NDArray[np.float64], model: str = "BPD1") -> PriorBoun
                 s[5] + 0.5,
                 0.0,
                 1.5 * s[7],
+            ]
+        )
+        swap_indices = (1, 2, 3, 4, 5)
+    elif model == "BPD1S":
+        # [a, v, g, tb, sa, sb, sc, sd, κ, β] — seasonal before the noise pair.
+        step = np.array(
+            [1.0, s[1] * 0.05, s[1] * 0.05, 0.0027, ss, ss, ss, ss, 0.05, 1.0]
+        )
+        lower = np.array([-ib, -s[1], -s[2], s[3] - 1.0, -sb, -sb, -sb, -sb, -1.5, 0.0])
+        upper = np.array(
+            [ib, 2.0 * s[1], 2.0 * s[2], s[3] + 1.0, sb, sb, sb, sb, 0.0, 1.5 * s[9]]
+        )
+        swap_indices = (1, 2)
+    else:  # BPD2S: [a, v, g1, tb1, g2, tb2, sa, sb, sc, sd, κ, β]
+        step = np.array(
+            [
+                1.0,
+                s[1] * 0.05,
+                s[1] * 0.05,
+                0.0027,
+                s[1] * 0.05,
+                0.0027,
+                ss,
+                ss,
+                ss,
+                ss,
+                0.05,
+                1.0,
+            ]
+        )
+        lower = np.array(
+            [
+                -ib,
+                -s[1],
+                -s[2],
+                s[3] - 0.5,
+                -s[4],
+                s[5] - 0.5,
+                -sb,
+                -sb,
+                -sb,
+                -sb,
+                -1.5,
+                0.0,
+            ]
+        )
+        upper = np.array(
+            [
+                ib,
+                2.0 * s[1],
+                2.0 * s[2],
+                s[3] + 0.5,
+                2.0 * s[4],
+                s[5] + 0.5,
+                sb,
+                sb,
+                sb,
+                sb,
+                0.0,
+                1.5 * s[11],
             ]
         )
         swap_indices = (1, 2, 3, 4, 5)
@@ -903,10 +1241,12 @@ def run_inversion(
       ``velocity.estimate_velocity``'s ``t_ref``). The intercept entries of
       ``bounds`` (start and the ±5 range) refer to the **conditioned** frame.
     - **Saturation guard**: if the conditioned-frame intercept optimum lies
-      within ``0.05 × range`` of either prior bound (0.5 mm for ±5), the fit
-      is rejected with :class:`ValueError` — the data is pathological even
-      after referencing (e.g. a step or steep drift inside the baseline
-      window) and the offset would silently leak into the trend.
+      within ``0.05 × range`` of either prior bound (0.5 mm for the ±5 mm
+      blind prior; the seasonal models use the wider
+      ``±_SEASONAL_INTERCEPT_BOUND``), the fit is rejected with
+      :class:`ValueError` — the data is pathological even after referencing
+      (e.g. a step or steep drift inside the baseline window) and the offset
+      would silently leak into the trend.
 
     Symbols → args:
         - ``t``: epochs [yr], ``y``: displacements [mm], 1-D, same length
@@ -914,7 +1254,10 @@ def run_inversion(
         - ``config``: :class:`InversionConfig` (schedule + seed)
         - ``bounds``: :class:`PriorBounds`, length ``n_func`` (hyper slot
           appended automatically) or ``n_func + 1``
-        - ``model``: ``"BPD1"`` | ``"BPD2"``
+        - ``model``: ``"BPD1"`` | ``"BPD2"`` | ``"BPD1S"`` | ``"BPD2S"`` — the
+          ``…S`` variants co-estimate an annual+semiannual seasonal term
+          (:func:`_seasonal_design`) jointly with the break/rate/noise
+          parameters; the seasonal-blind path is byte-unchanged.
         - ``baseline_epochs``: leading samples for the start-baseline median
           ``r`` (≈ days for daily series). Default 30: robust to a leading
           outlier, scatter-suppressing, yet short enough that secular drift
@@ -961,12 +1304,19 @@ def run_inversion(
     if baseline_epochs < 0:
         raise ValueError(f"baseline_epochs must be >= 0, got {baseline_epochs}")
     n_func = _N_FUNC[model]
-    n_breaks = 1 if model == "BPD1" else 2
+    n_breaks = _N_BREAKS[model]
+    has_seasonal = model in _SEASONAL_MODELS
+    n_traj = 2 + 2 * n_breaks  # a, v, (g_k, tb_k)×n_breaks — seasonal follows
 
     # --- Zero-reference conditioning (module conventions; input untouched) ---
     y_ref = _start_baseline(yy, baseline_epochs) if baseline_epochs else 0.0
     if y_ref != 0.0:
         yy = yy - y_ref  # new array — the caller's y is never mutated
+
+    # Seasonal design D (annual+semiannual), built ONCE from the FIXED epochs:
+    # conditioning shifts yy only, so the seasonal phase (absolute yearf) is
+    # preserved. The hot loop adds the seasonal mean as a single D·[sa..sd].
+    seasonal_d = _seasonal_design(tt) if has_seasonal else None
 
     # --- Parameter vectors (hyper slot appended if absent) -------------------
     if bounds.start.size == n_func:
@@ -1032,6 +1382,10 @@ def run_inversion(
         # -- Forward model + colored-noise likelihood (l.95-132) --------------
         m_func = trial[:n_func]
         u = _trajectory(m_func, tt, n_breaks)
+        if seasonal_d is not None:
+            # Co-estimated seasonal mean D·[sa,sb,sc,sd] (indices n_traj..+4);
+            # orthogonal to the covariance (deterministic-mean term only).
+            u = u + seasonal_d @ m_func[n_traj : n_traj + _N_SEASONAL]
         residual = yy - u
         if set_hyper:
             hyper_prev = 1.0  # l.121: hyperparameter pinned to 1 at T = 1
@@ -1120,10 +1474,11 @@ def run_inversion(
                 trial[over] = 2.0 * upper[over] - trial[over]
                 under = trial < lower
                 trial[under] = 2.0 * lower[under] - trial[under]
-            if model == "BPD1":
+            if n_breaks == 1:
                 break
             # BPD2 ordering guard — fidelity flag: swaps the TREND CHANGES
             # (indices 2/4 == MATLAB trial(3)/trial(5)), not the break points.
+            # Trajectory params lead the vector, so 2/4 are g1/g2 for BPD2S too.
             if trial[2] > trial[4]:
                 trial[2], trial[4] = trial[4], trial[2]
             if abs(trial[4] - trial[2]) >= bp_floor * 20.0:
@@ -1166,8 +1521,9 @@ def _preliminary_start(
     y: NDArray[np.float64],
     wn_amp: float,
     n_breaks: int,
+    seasonal: bool = False,
 ) -> NDArray[np.float64]:
-    """Coarse OLS grid seed ``[â, v̂, ĝ..., t̂..., κ̂, β̂]`` for :func:`prepare_bounds`.
+    """Coarse OLS grid seed ``[â, v̂, ĝ.., t̂.., (ŝa..ŝd,) κ̂, β̂]`` for :func:`prepare_bounds`.
 
     Stand-in for the GBIS4TS pre-processing (WLS + variogram noise estimation,
     ``Variogram/*`` — a later slice): break epochs are grid-searched over ≤ 96
@@ -1179,6 +1535,14 @@ def _preliminary_start(
     mm/yr^0.25 at κ = −1]. The intercept is clipped into the fixed ±5 mm prior.
     For production parity pass explicit ``start`` values instead
     (:func:`detect_breakpoints`).
+
+    Seasonal (``seasonal=True``): the four annual+semiannual design columns
+    (:func:`_seasonal_design`) are appended to the OLS design so the seasonal
+    amplitudes are **co-estimated with** the break/rate at every grid epoch
+    (joint, never pre-removed — Blewitt & Lavallée 2002: a pre-removed
+    seasonal is ramp-contaminated on short windows). The four ŝ estimates are
+    inserted between the trajectory and noise seeds, matching the sampler
+    layout ``[â, v̂, ĝ.., t̂.., ŝa, ŝb, ŝc, ŝd, κ̂, β̂]``.
     """
     n = t.size
     lo = max(int(0.05 * n), 1)
@@ -1188,18 +1552,21 @@ def _preliminary_start(
     candidates = np.unique(np.linspace(lo, hi, 96).astype(np.int64))
     ones = np.ones(n, dtype=np.float64)
     t_rel = t - t[0]
+    # Seasonal design columns (co-estimated in the seed); empty if seasonal-blind.
+    seas_cols = list(_seasonal_design(t).T) if seasonal else []
+    n_seas = len(seas_cols)
 
     def _fit(
         columns: list[NDArray[np.float64]],
     ) -> tuple[NDArray[np.float64], float]:
-        g_mat = np.column_stack(columns)
+        g_mat = np.column_stack(columns + seas_cols)
         coef, _, _, _ = np.linalg.lstsq(g_mat, y, rcond=None)
         res = y - g_mat @ coef
         return np.asarray(coef, dtype=np.float64), float(res @ res)
 
     best_rss = np.inf
     best_tb1 = float(t[candidates[0]])
-    best_coef = np.zeros(3)
+    best_coef = np.zeros(3 + n_seas)
     for idx in candidates:
         tb = float(t[idx])
         coef, rss = _fit([ones, t_rel, _break_term(t, 1.0, tb)])
@@ -1207,7 +1574,8 @@ def _preliminary_start(
             best_rss, best_tb1, best_coef = rss, tb, coef
 
     if n_breaks == 1:
-        a_hat, v_hat, g_hat = best_coef
+        a_hat, v_hat, g_hat = best_coef[:3]
+        seasonal_hat = best_coef[3 : 3 + n_seas]
         residual = y - (a_hat + v_hat * t_rel + g_hat * _break_term(t, 1.0, best_tb1))
         trajectory = np.array(
             [float(np.clip(a_hat, -5.0, 5.0)), v_hat, g_hat, best_tb1]
@@ -1216,7 +1584,7 @@ def _preliminary_start(
         col1 = _break_term(t, 1.0, best_tb1)
         best_rss2 = np.inf
         best_tb2 = float("nan")
-        best_coef4 = np.zeros(4)
+        best_coef4 = np.zeros(4 + n_seas)
         for idx in candidates:
             tb2 = float(t[idx])
             if abs(tb2 - best_tb1) < 20.0 * 0.0027:
@@ -1226,7 +1594,8 @@ def _preliminary_start(
                 best_rss2, best_tb2, best_coef4 = rss, tb2, coef
         if not np.isfinite(best_tb2):
             raise ValueError("no admissible second break epoch found")
-        a_hat, v_hat, g1_hat, g2_hat = best_coef4
+        a_hat, v_hat, g1_hat, g2_hat = best_coef4[:4]
+        seasonal_hat = best_coef4[4 : 4 + n_seas]
         tb1, tb2 = best_tb1, best_tb2
         if tb2 < tb1:  # relabel ascending (the model is pair-symmetric)
             tb1, tb2 = tb2, tb1
@@ -1241,10 +1610,12 @@ def _preliminary_start(
             [float(np.clip(a_hat, -5.0, 5.0)), v_hat, g1_hat, tb1, g2_hat, tb2]
         )
 
+    if seasonal:  # subtract the co-estimated seasonal from the noise residual
+        residual = residual - _seasonal_design(t) @ seasonal_hat
     amp_hat = math.sqrt(
         max(float(residual.var()) - wn_amp * wn_amp, 0.25 * wn_amp * wn_amp)
     )
-    return np.concatenate([trajectory, [-1.0, amp_hat]])
+    return np.concatenate([trajectory, seasonal_hat, [-1.0, amp_hat]])
 
 
 def detect_breakpoints(
@@ -1258,6 +1629,7 @@ def detect_breakpoints(
     start: NDArray[np.float64] | None = None,
     t_runs: int = 1000,
     baseline_epochs: int = 30,
+    seasonal: bool = False,
 ) -> InversionResult:
     """High-level one-call entry: build bounds + config, run the inversion.
 
@@ -1279,11 +1651,17 @@ def detect_breakpoints(
         - ``n_breaks``: 1 (BPD1) or 2 (BPD2)
         - ``n_runs``: kept MCMC iterations (paper: 1.2e5 synthetic, 1e6 real)
         - ``seed``: RNG seed for reproducibility
-        - ``start``: optional preliminary estimates in MATLAB order (length 6
-          or 8, see :func:`prepare_bounds`) — the upstream ``startPara`` route.
-          If omitted, a coarse OLS grid seed is derived from the data
-          (:func:`_preliminary_start`; documented heuristic, not the GBIS4TS
-          variogram pre-processing).
+        - ``start``: optional preliminary estimates in the sampler layout
+          (length 6/8, or 10/12 when ``seasonal`` — see :func:`prepare_bounds`)
+          — the upstream ``startPara`` route. If omitted, a coarse OLS grid
+          seed is derived from the data (:func:`_preliminary_start`; documented
+          heuristic, not the GBIS4TS variogram pre-processing; seasonal
+          amplitudes co-estimated in the seed when ``seasonal``).
+        - ``seasonal``: co-estimate an annual+semiannual term jointly with the
+          break/rate/noise (model ``"BPD1S"``/``"BPD2S"``; new API surface,
+          default ``False`` keeps the exact seasonal-blind behavior). Use on
+          real GNSS series, where an un-modeled seasonal signal biases v/dv/tb
+          on windows ≲ 4.5 yr (Blewitt & Lavallée 2002).
         - ``t_runs``: kept iterations per annealing temperature (default 1000
           = upstream; reduce for short exploratory chains so the 16-step
           cooling still completes within ``n_runs``).
@@ -1315,14 +1693,17 @@ def detect_breakpoints(
         raise ValueError(f"n_breaks must be 1 or 2, got {n_breaks}")
     if baseline_epochs < 0:
         raise ValueError(f"baseline_epochs must be >= 0, got {baseline_epochs}")
-    model = "BPD1" if n_breaks == 1 else "BPD2"
+    if n_breaks == 1:
+        model = "BPD1S" if seasonal else "BPD1"
+    else:
+        model = "BPD2S" if seasonal else "BPD2"
     if start is None:
         # Seed on the conditioned series: run_inversion recomputes the same
         # deterministic baseline, so seed frame == sampling frame.
         y_seed = yy
         if baseline_epochs:
             y_seed = yy - _start_baseline(yy, baseline_epochs)
-        seed_params = _preliminary_start(tt, y_seed, wn_amp, n_breaks)
+        seed_params = _preliminary_start(tt, y_seed, wn_amp, n_breaks, seasonal)
     else:
         seed_params = np.asarray(start, dtype=np.float64)
     bounds = prepare_bounds(seed_params, model)

@@ -29,18 +29,25 @@ import numpy as np
 import pytest
 from scipy.linalg import cho_factor, cho_solve, toeplitz
 
+from gps_analysis.models import lineperiodic, periodic
 from gps_analysis.transient import (
+    _SEASONAL_INTERCEPT_BOUND,
     BPD1Params,
+    BPD1SeasonalParams,
     BPD2Params,
+    BPD2SeasonalParams,
     InversionConfig,
     InversionResult,
     PriorBounds,
     _log_likelihood_fast,
     _powerlaw_psi,
     _schur_logdet_quad,
+    _seasonal_design,
     _start_baseline,
     bpd1_forward,
+    bpd1_seasonal_forward,
     bpd2_forward,
+    bpd2_seasonal_forward,
     detect_breakpoints,
     log_likelihood,
     noise_covariance,
@@ -218,6 +225,76 @@ class TestBPD2Forward:
         np.testing.assert_allclose(slopes[pre], 6.0, rtol=1e-9)
         np.testing.assert_allclose(slopes[mid], -6.0, rtol=1e-9)
         np.testing.assert_allclose(slopes[post], 2.0, rtol=1e-9)
+
+
+# =========================================================================
+# Seasonal-aware forward models (this port; Blewitt & Lavallée 2002 eq. 2)
+# =========================================================================
+
+
+class TestSeasonalForward:
+    """Additive annual+semiannual variants: reduce to lineperiodic; ⊂ BPD1/2."""
+
+    T = 2019.0 + np.arange(400) / 365.0
+
+    def test_seasonal_design_equals_models_periodic(self) -> None:
+        """D·[a,b,c,d] == models.periodic (shared house convention, ~1e-15)."""
+        coeffs = np.array([12.0, -6.0, 4.0, -3.0])
+        got = _seasonal_design(self.T) @ coeffs
+        np.testing.assert_allclose(
+            got, periodic(self.T, *coeffs), rtol=1e-15, atol=1e-13
+        )
+
+    def test_bpd1_seasonal_reduces_to_lineperiodic_no_break(self) -> None:
+        """No break (dv=0): the model IS linear+seasonal == models.lineperiodic.
+
+        With trend_change 0 the trajectory is a − v·t₀ + v·t; adding the
+        seasonal block gives exactly ``lineperiodic(t, a−v·t₀, v, a,b,c,d)``
+        (Bevis & Brown 2014 eq. 1). atol 1e-9: float64 re-association of the
+        ~1e4-magnitude v·t₀ term at absolute yearf.
+        """
+        p = BPD1SeasonalParams(2.0, 5.0, 0.0, 2019.5, 12.0, -6.0, 4.0, -3.0, -0.7, 4.0)
+        got = bpd1_seasonal_forward(p, self.T)
+        expected = lineperiodic(
+            self.T, 2.0 - 5.0 * self.T[0], 5.0, 12.0, -6.0, 4.0, -3.0
+        )
+        np.testing.assert_allclose(got, expected, rtol=0, atol=1e-9)
+
+    def test_zero_seasonal_amplitude_identical_to_bpd1(self) -> None:
+        """sa=sb=sc=sd=0 ⇒ byte-identical to bpd1_forward (variant is additive)."""
+        base = BPD1Params(1.3, 5.0, -20.0, 2019.5, -0.7, 4.0)
+        seas = BPD1SeasonalParams(
+            1.3, 5.0, -20.0, 2019.5, 0.0, 0.0, 0.0, 0.0, -0.7, 4.0
+        )
+        np.testing.assert_array_equal(
+            bpd1_seasonal_forward(seas, self.T), bpd1_forward(base, self.T)
+        )
+
+    def test_zero_seasonal_amplitude_identical_to_bpd2(self) -> None:
+        base = BPD2Params(0.5, 6.0, -12.0, 2019.3, 8.0, 2019.65, -0.7, 4.0)
+        seas = BPD2SeasonalParams(
+            0.5, 6.0, -12.0, 2019.3, 8.0, 2019.65, 0.0, 0.0, 0.0, 0.0, -0.7, 4.0
+        )
+        np.testing.assert_array_equal(
+            bpd2_seasonal_forward(seas, self.T), bpd2_forward(base, self.T)
+        )
+
+    def test_bpd2_seasonal_is_bpd2_plus_seasonal(self) -> None:
+        """Additive decomposition: break part + seasonal part."""
+        seas = BPD2SeasonalParams(
+            0.5, 6.0, -12.0, 2019.3, 8.0, 2019.65, 9.0, -4.0, 2.0, 1.0, -0.7, 4.0
+        )
+        base = BPD2Params(0.5, 6.0, -12.0, 2019.3, 8.0, 2019.65, -0.7, 4.0)
+        expected = bpd2_forward(base, self.T) + periodic(self.T, 9.0, -4.0, 2.0, 1.0)
+        np.testing.assert_allclose(
+            bpd2_seasonal_forward(seas, self.T), expected, rtol=0, atol=1e-9
+        )
+
+    def test_input_not_mutated(self) -> None:
+        t = self.T.copy()
+        p = BPD1SeasonalParams(0.0, 5.0, -20.0, 2019.5, 3.0, 2.0, 1.0, 0.5, -0.7, 4.0)
+        bpd1_seasonal_forward(p, t)
+        np.testing.assert_array_equal(t, self.T)
 
 
 # =========================================================================
@@ -437,6 +514,49 @@ class TestPrepareBounds:
     def test_unknown_model_raises(self) -> None:
         with pytest.raises(ValueError, match="model"):
             prepare_bounds(TS14_START, "BPD3")
+
+    def test_bpd1_seasonal_bounds(self) -> None:
+        """BPD1S: seasonal amps between break and noise; widened intercept.
+
+        g = -20 < 0 inverts its (lower, upper) = (20, -40) pair → swapped to
+        (-40, 20), as for the blind negative-rate case.
+        """
+        start = np.array([0.0, 4.0, -20.0, 2021.55, 8.0, -3.0, 2.0, 1.0, -0.7, 4.0])
+        b = prepare_bounds(start, "BPD1S")
+        assert b.start.size == 11  # 10 + hyper slot
+        ib = _SEASONAL_INTERCEPT_BOUND  # widened intercept (vs +-5 blind)
+        # seasonal +-15 symmetric between break and noise blocks
+        np.testing.assert_allclose(
+            b.lower, [-ib, -4.0, -40.0, 2020.55, -15, -15, -15, -15, -1.5, 0.0, -0.5]
+        )
+        np.testing.assert_allclose(
+            b.upper, [ib, 8.0, 20.0, 2022.55, 15, 15, 15, 15, 0.0, 6.0, 0.5]
+        )
+        np.testing.assert_allclose(
+            b.step, [1.0, 0.2, 0.2, 0.0027, 0.5, 0.5, 0.5, 0.5, 0.05, 1.0, 1e-3]
+        )
+        # bound sized so an in-prior seasonal fit can never saturate the guard
+        assert ib >= 2.0 * np.sqrt(2.0) * 15.0
+
+    def test_bpd2_seasonal_bounds_and_swaps(self) -> None:
+        start = np.array(
+            [0.4, 5.5, -10.0, 2019.33, 7.0, 2019.62, 9.0, -4.0, 2.0, 1.0, -1.0, 1.0]
+        )
+        b = prepare_bounds(start, "BPD2S")
+        assert b.start.size == 13
+        ib = _SEASONAL_INTERCEPT_BOUND
+        np.testing.assert_allclose(
+            b.lower,
+            [-ib, -5.5, -20, 2018.83, -7, 2019.12, -15, -15, -15, -15, -1.5, 0.0, -0.5],
+        )
+        np.testing.assert_allclose(
+            b.upper,
+            [ib, 11.0, 10.0, 2019.83, 14.0, 2020.12, 15, 15, 15, 15, 0.0, 1.5, 0.5],
+        )
+
+    def test_seasonal_wrong_length_raises(self) -> None:
+        with pytest.raises(ValueError, match="shape"):
+            prepare_bounds(TS14_START, "BPD1S")  # 6 != 10
 
 
 class TestPriorBounds:
@@ -789,6 +909,172 @@ class TestZeroReferenceConditioning:
         )
         assert res.m_keep.shape == (7, 300)
         assert res.y_ref == pytest.approx(41.0, abs=2.0)  # offset + a + drift
+
+
+# =========================================================================
+# Seasonal-aware inversion: conditioning, shift-invariance, debiasing
+# =========================================================================
+
+
+def _synthetic_bpd1_seasonal(
+    n: int = 840,
+    tb: float = 2020.6,
+    seed: int = 2023,
+    amps: tuple[float, float, float, float] = (12.0, 6.0, 4.0, -3.0),
+    wn: float = 1.5,
+    kappa: float = -0.9,
+    beta: float = 3.0,
+) -> tuple[np.ndarray, np.ndarray, dict[str, float]]:
+    """Break + annual/semiannual seasonal + colored noise on a ~2.3-yr window.
+
+    Non-integer start/span (Blewitt & Lavallée 2002 rate-leakage regime) and
+    a break placed late enough to leave a ~1.4-yr pre-break segment that
+    constrains v. Colored noise drawn from the exact power-law covariance
+    (Cholesky of :func:`noise_covariance`).
+    """
+    t = 2019.15 + np.arange(n) / 365.0
+    truth = {"a": 0.0, "v": 6.0, "dv": -18.0, "tb": tb}
+    p = BPD1SeasonalParams(truth["a"], truth["v"], truth["dv"], tb, *amps, kappa, beta)
+    mean = bpd1_seasonal_forward(p, t)
+    cov = noise_covariance(n, wn, kappa, beta)
+    noise = np.linalg.cholesky(cov) @ np.random.default_rng(seed).standard_normal(n)
+    return t, mean + noise, {**truth, "wn": wn}
+
+
+class TestSeasonalInversion:
+    def test_bpd1s_chain_shapes(self) -> None:
+        """BPD1S: 10 params + hyper slot; optimum length 10; y_ref populated."""
+        t, y, tr = _synthetic_bpd1_seasonal(n=200)
+        res = detect_breakpoints(
+            t, y, tr["wn"], n_breaks=1, n_runs=400, seed=5, t_runs=25, seasonal=True
+        )
+        assert res.model == "BPD1S"
+        assert res.m_keep.shape == (11, 400)
+        assert res.optimal.shape == (10,)
+        assert res.y_ref == pytest.approx(_start_baseline(y, 30), abs=0)
+
+    def test_bpd2s_smoke(self) -> None:
+        """BPD2S runs end-to-end (12 params + hyper) with the ordering guard.
+
+        Explicit start with ordered trend changes (g1 < g2): every subsequent
+        kept sample is guard-processed (indices 2,4) or a repeat of an ordered
+        predecessor, so the whole chain stays ordered — the shared BPD2
+        ordering guard is active for the seasonal variant too.
+        """
+        t, y, tr = _synthetic_bpd1_seasonal(n=300)
+        start = np.array(
+            [0.0, 5.0, -10.0, 2019.9, 8.0, 2020.4, 10.0, 5.0, 3.0, -2.0, -1.0, 3.0]
+        )
+        res = run_inversion(
+            t,
+            y,
+            tr["wn"],
+            InversionConfig(n_runs=400, t_runs=25, seed=5),
+            prepare_bounds(start, "BPD2S"),
+            "BPD2S",
+        )
+        assert res.model == "BPD2S"
+        assert res.m_keep.shape == (13, 400)
+        assert np.all(np.isfinite(res.p_keep))
+        # BPD2 ordering guard active on the trend changes (indices 2,4)
+        assert np.all(res.m_keep[2] <= res.m_keep[4])
+
+    def test_high_amplitude_seasonal_does_not_false_fire_guard(self) -> None:
+        """Worst case for the guard: a large annual amplitude with the record
+        starting near the seasonal peak makes the 30-day-median baseline carry
+        ~the full amplitude, so the conditioned intercept lands near
+        −(window-mean). With the ±5 mm blind prior this would saturate and
+        raise; the widened seasonal intercept prior (sized to 2√2·A_max + 5)
+        must let it through. Regression for the mid-implementation guard fix.
+        """
+        # annual amplitude 15 mm (vertical-loading scale), start phase at the
+        # cosine peak (t ≈ integer year) so median(y[:30]) ≈ +15 mm.
+        n = 300
+        t = 2019.0 + np.arange(n) / 365.0
+        p = BPD1SeasonalParams(0.0, 4.0, -12.0, 2019.6, 15.0, 0.0, 0.0, 0.0, 0.0, 0.0)
+        y = bpd1_seasonal_forward(p, t) + np.random.default_rng(0).standard_normal(n)
+        assert float(np.median(y[:30])) > 10.0  # baseline really is ~ +15 mm
+        # must return (not raise): the seasonal intercept prior absorbs a_fit
+        res = detect_breakpoints(
+            t, y, 1.0, n_breaks=1, n_runs=400, seed=3, t_runs=25, seasonal=True
+        )
+        assert res.model == "BPD1S"
+
+    @pytest.mark.parametrize("c", [-15.0, 60.0])
+    def test_seasonal_shift_invariance(self, c: float) -> None:
+        """Seasonal variant auto-conditions AND round-trips the frame (task #1).
+
+        Under ``y → y + c`` the fixed-seed chain is identical modulo the
+        intercept: v, dv, tb and the four seasonal amplitudes are unchanged
+        (shift-invariant), the intercept differs by exactly c, and y_ref
+        shifts by c — proving the seasonal path inherits the zero-reference
+        conditioning. A short chain suffices (invariance is exact per seed,
+        independent of convergence).
+        """
+        t, y, tr = _synthetic_bpd1_seasonal(n=200)
+        start = np.array([0.0, 5.0, -16.0, 2020.5, 10.0, 5.0, 3.0, -2.0, -1.0, 3.0])
+        kw = dict(
+            wn_amp=tr["wn"],
+            config=InversionConfig(n_runs=500, t_runs=25, seed=8),
+            bounds=prepare_bounds(start, "BPD1S"),
+            model="BPD1S",
+        )
+        base = run_inversion(t, y, **kw)  # type: ignore[arg-type]
+        shifted = run_inversion(t, y + c, **kw)  # type: ignore[arg-type]
+        assert shifted.y_ref - base.y_ref == pytest.approx(c, abs=1e-9)
+        # v, dv, tb (idx 1,2,3) and seasonal amps (idx 4-7) shift-invariant
+        np.testing.assert_allclose(
+            shifted.optimal[1:], base.optimal[1:], rtol=0, atol=1e-9
+        )
+        np.testing.assert_allclose(
+            shifted.m_keep[1:], base.m_keep[1:], rtol=0, atol=1e-9
+        )
+        # intercept differs by exactly c (input-frame round-trip)
+        assert shifted.optimal[0] - base.optimal[0] == pytest.approx(c, abs=1e-8)
+
+    @pytest.mark.slow
+    def test_seasonal_debiases_break_and_rate(self) -> None:
+        """The point of the task: seasonal-aware recovers v/dv/tb; blind is biased.
+
+        Synthetic (:func:`_synthetic_bpd1_seasonal`): v=6, dv=-18,
+        tb=2020.6, annual (12,6) + semiannual (4,-3) mm, colored noise
+        (κ=-0.9, β=3, σ_w=1.5) on a 2.3-yr non-integer window. The seasonal
+        signal aliases into the trend/break unless co-estimated (Blewitt &
+        Lavallée 2002).
+
+        Seeded run (seed=1, n_runs=12000, t_runs=250) observed:
+          AWARE (BPD1S): v=7.08, dv=-17.58, tb=2020.499,
+              seasonal=(11.8, 5.6, 3.8, -3.2) ≈ truth (12, 6, 4, -3);
+              |Δv|=1.1, |Δdv|=0.4, |Δtb|=0.10.
+          BLIND (BPD1):  v=2.20, dv=-42.12, tb=2021.001 (break shoved to the
+              prior bound); |Δdv|=24.1, |Δtb|=0.40.
+        i.e. the blind rate-change error is ~57× the aware one and the break
+        is misplaced by ~0.4 yr — quantified justification for the variant.
+        Tolerances are generous over the observed values (short-chain margin).
+        """
+        t, y, tr = _synthetic_bpd1_seasonal()
+        wn = tr["wn"]
+        common = dict(n_breaks=1, n_runs=12000, seed=1, t_runs=250)
+        aware = detect_breakpoints(t, y, wn, seasonal=True, **common)  # type: ignore[arg-type]
+        blind = detect_breakpoints(t, y, wn, seasonal=False, **common)  # type: ignore[arg-type]
+        assert aware.model == "BPD1S" and blind.model == "BPD1"
+
+        va, dva, tba = (float(aware.optimal[i]) for i in (1, 2, 3))
+        vb, dvb, tbb = (float(blind.optimal[i]) for i in (1, 2, 3))
+
+        # (1) seasonal-AWARE recovers the deformation params within tolerance
+        assert va == pytest.approx(tr["v"], abs=2.0)
+        assert dva == pytest.approx(tr["dv"], abs=2.0)
+        assert tba == pytest.approx(tr["tb"], abs=0.15)
+        # and the seasonal amplitudes themselves (co-estimated, not removed)
+        np.testing.assert_allclose(aware.optimal[4:8], [12.0, 6.0, 4.0, -3.0], atol=2.0)
+
+        # (2) seasonal-BLIND is measurably biased on both dv and tb
+        assert abs(dvb - tr["dv"]) > 10.0  # blind dv error observed ~24 mm/yr
+        assert abs(tbb - tr["tb"]) > 0.25  # blind break misplaced ~0.4 yr
+        # quantified improvement: blind rate-change bias >= 3x the aware bias
+        assert abs(dvb - tr["dv"]) >= 3.0 * abs(dva - tr["dv"])
+        assert abs(tbb - tr["tb"]) >= 3.0 * abs(tba - tr["tb"])
 
 
 class TestDetectBreakpoints:

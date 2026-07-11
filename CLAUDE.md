@@ -49,6 +49,16 @@ All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDAR
 > intercepts back in the input frame (`InversionResult.y_ref`, the `velocity.t_ref`
 > precedent); a saturation guard raises `ValueError` instead of returning a fit whose
 > offset leaked into the trend. Shift-invariance + guard are test-pinned.
+> **Seasonal-aware variant (#2, 2026-07-11):** new model codes `BPD1S`/`BPD2S`
+> (`detect_breakpoints(..., seasonal=True)`, `run_inversion(model="BPD1S")`,
+> `bpd1_seasonal_forward`) add annual+semiannual cos/sin terms (Blewitt & Lavallée 2002,
+> mirrors `models.periodic`) between the trajectory and noise blocks and **co-estimate**
+> them with break/rate/noise (joint, not pre-removal). Seasonal-blind BPD1/BPD2 stay
+> byte-identical (TS14 optimum unchanged); H3 Schur likelihood + #1 conditioning inherited
+> (seasonal intercept prior widened ±5→±(5+2√2·A_max)≈47 mm, sized so the guard
+> never false-fires on legitimate high-amplitude vertical seasonal, since the median baseline
+> carries the seasonal window-mean). Debiasing test-pinned: on a break+seasonal+colored-noise synthetic
+> the blind rate-change error is ~57× the seasonal-aware one and the break is misplaced ~0.4 yr.
 
 ## Commands
 
@@ -62,4 +72,4 @@ uv run mypy src tests && uv run pytest
 - Home: **GitHub** (libs); CI: `.github/workflows/ci.yml`.
 
 ---
-*Last reviewed: 2026-07-11 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; H3 generalized-Schur O(N²) likelihood landed — slow suite 2 min → 35 s; zero-reference auto-conditioning + saturation guard landed in `transient`).*
+*Last reviewed: 2026-07-11 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; H3 generalized-Schur O(N²) likelihood; zero-reference auto-conditioning + saturation guard; seasonal-aware BPD1S/BPD2S variant (joint annual+semiannual) landed in `transient`).*
