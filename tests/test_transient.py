@@ -27,13 +27,16 @@ from pathlib import Path
 
 import numpy as np
 import pytest
-from scipy.linalg import toeplitz
+from scipy.linalg import cho_factor, cho_solve, toeplitz
 
 from gps_analysis.transient import (
     BPD1Params,
     BPD2Params,
     InversionConfig,
     PriorBounds,
+    _log_likelihood_fast,
+    _powerlaw_psi,
+    _schur_logdet_quad,
     bpd1_forward,
     bpd2_forward,
     detect_breakpoints,
@@ -283,6 +286,105 @@ class TestLogLikelihood:
     def test_shape_mismatch_raises(self) -> None:
         with pytest.raises(ValueError, match="does not match"):
             log_likelihood(np.zeros(3), np.eye(4))
+
+
+# =========================================================================
+# Fast likelihood — generalized Schur displacement path (task H3)
+# =========================================================================
+
+
+class TestFastLikelihoodSchur:
+    """Exact-parity evidence for the O(N²) hot-loop path.
+
+    The fast path (:func:`_schur_logdet_quad`) is an *algebraically exact*
+    factorization of the same matrix as ``noise_covariance`` + Cholesky —
+    tolerances below are pure float64 rounding-order differences (observed
+    ≤ 3e-15 relative on logdet/quad up to N = 1825; asserted at rel 1e-11
+    with margin for BLAS/LAPACK build variation).
+    """
+
+    WN, AMP = TS14_WN, 4.03
+
+    @staticmethod
+    def _dense_reference(
+        r: np.ndarray, n: int, kappa: float, wn: float, amp: float
+    ) -> tuple[float, float]:
+        cov = noise_covariance(n, wn, kappa, amp)
+        factor = cho_factor(cov, lower=True)
+        quad = float(r @ cho_solve(factor, r))
+        logdet = 2.0 * float(np.sum(np.log(np.diag(factor[0]))))
+        return logdet, quad
+
+    @pytest.mark.parametrize("kappa", [-0.7, -1.0, -1.5])
+    @pytest.mark.parametrize("n", [100, 365, 730])
+    def test_matches_dense_cholesky(self, n: int, kappa: float) -> None:
+        """logdet, quad and ln P == dense noise_covariance+Cholesky path."""
+        rng = np.random.default_rng(n)
+        r = 4.0 * rng.standard_normal(n)
+        logdet_ref, quad_ref = self._dense_reference(r, n, kappa, self.WN, self.AMP)
+        logdet, quad = _schur_logdet_quad(r, self.WN, kappa, self.AMP)
+        assert logdet == pytest.approx(logdet_ref, rel=1e-11)
+        assert quad == pytest.approx(quad_ref, rel=1e-11)
+        lnp_ref = log_likelihood(r, noise_covariance(n, self.WN, kappa, self.AMP))
+        assert _log_likelihood_fast(r, self.WN, kappa, self.AMP) == pytest.approx(
+            lnp_ref, rel=1e-12, abs=1e-9
+        )
+
+    def test_white_noise_limit_closed_form(self) -> None:
+        """amp = 0: L = wn·I exactly => ln P = -(r.r/wn² + n·ln(2π·wn²))/2."""
+        r = np.array([1.0, -2.0, 0.5, 3.0])
+        wn = 2.0
+        expected = -0.5 * (
+            float(r @ r) / (wn * wn) + 4.0 * np.log(2.0 * np.pi * wn * wn)
+        )
+        assert _log_likelihood_fast(r, wn, -1.0, 0.0) == pytest.approx(
+            expected, rel=1e-14
+        )
+
+    def test_kappa_zero_closed_form(self) -> None:
+        """κ = 0: C = (wn² + amp²)·I => white-noise form at variance wn²+amp²."""
+        r = np.linspace(-2.0, 2.0, 30)
+        var = 2.0 * 2.0 + 3.0 * 3.0
+        expected = -0.5 * (float(r @ r) / var + 30.0 * np.log(2.0 * np.pi * var))
+        assert _log_likelihood_fast(r, 2.0, 0.0, 3.0) == pytest.approx(
+            expected, rel=1e-13
+        )
+
+    def test_covariance_is_not_toeplitz(self) -> None:
+        """Documents WHY Levinson/solve_toeplitz is not used (H3 decision).
+
+        Power-law noise with κ ≤ −1 is nonstationary (Hosking 1981): the
+        diagonals of T·Tᵀ grow with the epoch index, so C deviates from the
+        Toeplitz matrix of its first column by tens of percent — a Toeplitz
+        solver would be a material approximation, not an edge effect.
+        """
+        cov = noise_covariance(365, self.WN, -1.0, self.AMP)
+        deviation = np.abs(cov - toeplitz(cov[:, 0])).max() / np.abs(cov).max()
+        assert deviation > 0.1
+
+    def test_displacement_identity(self) -> None:
+        """C − Z·C·Zᵀ == σ_w²·e₀e₀ᵀ + β̃²·ψψᵀ (the structure Schur exploits)."""
+        n, kappa = 200, -1.0
+        cov = noise_covariance(n, self.WN, kappa, self.AMP)
+        displaced = cov.copy()
+        displaced[1:, 1:] -= cov[:-1, :-1]
+        beta = self.AMP * (1.0 / 365.0) ** (-kappa / 4.0)
+        gen = np.zeros((n, 2))
+        gen[0, 0] = self.WN
+        gen[:, 1] = beta * _powerlaw_psi(n, kappa)
+        np.testing.assert_allclose(
+            displaced, gen @ gen.T, rtol=0, atol=1e-12 * np.abs(cov).max()
+        )
+
+    def test_input_not_mutated(self) -> None:
+        r = np.linspace(-1.0, 1.0, 50)
+        r0 = r.copy()
+        _schur_logdet_quad(r, self.WN, -1.0, self.AMP)
+        np.testing.assert_array_equal(r, r0)
+
+    def test_non_1d_residual_raises(self) -> None:
+        with pytest.raises(ValueError, match="1-D"):
+            _schur_logdet_quad(np.zeros((3, 3)), 1.0, -1.0, 1.0)
 
 
 # =========================================================================

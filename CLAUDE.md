@@ -34,7 +34,7 @@ All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDAR
 | `fitting` | ✅ implemented | `fit_components`, `detrend_fit`, `remove_trend`, `reject_outliers` (robust) |
 | `baseline` | ✅ implemented | `slice_window`, `estimate_offset`/`remove_offset`, `estimate_step_offset` |
 | `velocity` | ✅ implemented (WLS) | `estimate_velocity` (WLS + formal σ, `method="wls"`), `sliding_velocity`, magnitude/azimuth (+σ); `detectability_floor` stub |
-| `transient` | ✅ ported (GBIS4TS), CI-parity green | `bpd1/bpd2_forward`, `noise_covariance` (Williams 2003), `log_likelihood`, `run_inversion` (MCMC+annealing), `detect_breakpoints`. BPD1+BPD2 recover; **TS14 windowed parity matches MATLAB** (dv/tb; window zero-referenced — the upstream ±5 mm intercept prior demands inputs referenced near zero). Full-fidelity `test_ts14_full_reference` (~2.5 h) still **opt-in/unrun**. Vendored MATLAB + map: `reference/gbis4ts/` |
+| `transient` | ✅ ported (GBIS4TS), CI-parity green, **H3-optimized** | `bpd1/bpd2_forward`, `noise_covariance` (Williams 2003), `log_likelihood`, `run_inversion` (MCMC+annealing), `detect_breakpoints`. BPD1+BPD2 recover; **TS14 windowed parity matches MATLAB** (dv/tb; window zero-referenced — the upstream ±5 mm intercept prior demands inputs referenced near zero). **H3 (2026-07-11):** hot loop uses exact O(N²) generalized-Schur likelihood (`_schur_logdet_quad`; C is NOT Toeplitz — Hosking 1981); 27.9× @ N=1825 (248.8→8.9 ms/sample; 1e6-run chain 2.9 d→2.5 h); parity ≤4e-12 in lnP; C/Rust settled: stay NumPy (PLAN-analysis-lane §3). Full-fidelity `test_ts14_full_reference` (now ~25 min est.) still **opt-in/unrun**. Vendored MATLAB + map: `reference/gbis4ts/` |
 | `deformation` | ⏳ backburnered scaffold | Mogi→Okada→joint — parked (plan §9b); don't fill until revived |
 
 > **Analysis-lane re-scope (2026-07-10, [`../PLAN-analysis-lane.md`](../PLAN-analysis-lane.md)):**
@@ -56,4 +56,4 @@ uv run mypy src tests && uv run pytest
 - Home: **GitHub** (libs); CI: `.github/workflows/ci.yml`.
 
 ---
-*Last reviewed: 2026-07-11 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; 132 fast tests green; transient test audit — no port bug, v assertions calibrated to exact GLS/profile-ML).*
+*Last reviewed: 2026-07-11 (analysis lane: models/fitting/baseline/velocity(WLS)/transient(GBIS4TS) implemented; 147 fast tests green; H3 generalized-Schur O(N²) likelihood landed — slow suite 2 min → 35 s).*

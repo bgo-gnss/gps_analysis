@@ -65,6 +65,19 @@ into the estimator — so the reader can follow the flow top-down before reading
   JGR 107(B7). (annual/semiannual terms in `lineperiodic`; why window length matters.)
 - **Segall 2010** — *Earthquake and Volcano Deformation* (Princeton). (Mogi/Okada,
   trajectory models — backburnered lane, cite when it revives.)
+- **Hosking 1981** — J.R.M. Hosking, *Fractional differencing*, Biometrika 68(1),
+  eq. 2.4. (ψ coefficients of `(1−L)^(κ/2)`; nonstationarity for κ ≤ −1 — why the
+  power-law covariance is NOT Toeplitz.)
+- **Kailath & Sayed 1995** — *Displacement structure: theory and applications*,
+  SIAM Review 37(3), §1–4. (generalized Schur algorithm — the exact O(N²)
+  factorization behind `transient._schur_logdet_quad`, task H3; displacement rank:
+  Kailath, Kung & Morf 1979, J. Math. Anal. Appl. 68.)
+- **Chandrasekaran & Sayed 1996** — *Stabilizing the generalized Schur algorithm*,
+  SIAM J. Matrix Anal. Appl. 17(4). (backward stability of the positive-definite
+  displacement case — only orthogonal rotations.)
+- **Bos et al. 2013** — *Fast error analysis of continuous GNSS observations with
+  missing data*, J. Geodesy 87. (Hector's O(N²)-class fast MLE — the comparison
+  point for the H3 fast-likelihood path.)
 - Add domain refs (Hackl et al., Bevis & Brown trajectory model, Hector) as used —
   always with the specific equation/section.
 

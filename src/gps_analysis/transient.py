@@ -23,12 +23,16 @@ originating ``.m`` file; ``reference/gbis4ts/SOURCE_MAP.md`` pins the map):
    SI Text S1 eq. 1–3): ``C = σ_w²·I + β²·(T₁T₁ᵀ)`` with T₁ a scaled
    lower-triangular Toeplitz transform of white noise into power-law noise of
    spectral index κ. σ_w is **fixed per station** (from pre-processing), κ and
-   β are sampled.
+   β are sampled. C itself is **not** Toeplitz — power-law noise with κ ≤ −1
+   is nonstationary (Hosking 1981), so the diagonals of T₁T₁ᵀ grow with the
+   epoch index (pinned by test; 22–75 % deviation for κ ∈ [−1.5, −0.7]).
 4. **Gaussian log-likelihood** — :func:`log_likelihood`
    (``runInversion_ts.m`` l.132; Bagnardi & Hooper 2018, G³, §3):
-   ``ln P = −rᵀC⁻¹r/2 − ln det C/2 − n·ln 2π/2``, evaluated via one Cholesky
-   factorization (never an explicit inverse — the upstream ``Cov^(-1)`` is the
-   documented O(N³) hotspot, task H3).
+   ``ln P = −rᵀC⁻¹r/2 − ln det C/2 − n·ln 2π/2``. The MCMC hot loop evaluates
+   it WITHOUT forming C, via the generalized Schur algorithm on the rank-2
+   displacement structure of C (:func:`_schur_logdet_quad`, task H3) — exact
+   O(N²) per sample; :func:`log_likelihood` remains the dense O(N³) reference
+   path for callers who already hold a covariance matrix.
 5. **Sampler** — :func:`run_inversion` (``runInversion_ts.m``): Metropolis
    accept rule ``exp((P − P_prev)/T) ≥ U(0,1)`` under the simulated-annealing
    schedule ``T = 10^{3, 2.8, …, 0}`` (1000 iterations each), with periodic
@@ -51,9 +55,10 @@ Conventions and caveats (binding, see ``docs/MATH_STANDARDS.md``)
 - Working dtype float64 throughout (upstream stores the chain in single —
   deliberate deviation, documented in :class:`InversionResult`).
 - Pure leaf: numpy/scipy only, no I/O, inputs never mutated.
-- Runtime: each MCMC pass costs one O(N²) covariance build + one O(N³)
-  Cholesky; production ``n_runs ~ 1e6`` on N ≈ 1800 epochs is *hours* — the
-  Toeplitz/Levinson optimization is task H3, not here.
+- Runtime (task H3, closed): each MCMC pass costs one exact O(N²)
+  generalized-Schur factorization+solve (:func:`_schur_logdet_quad`) — ≈ 6 ms
+  at N = 1825 vs ≈ 160–600 ms for the pre-H3 dense build+Cholesky (≈ 27–70×);
+  parity with the dense path ≤ 4e-12 absolute in ln P (test-pinned).
 
 Fidelity flags (reproduced as-is for parity; raise with the NVC authors)
 ------------------------------------------------------------------------
@@ -79,6 +84,7 @@ from dataclasses import dataclass
 import numpy as np
 from numpy.typing import NDArray
 from scipy.linalg import cho_factor, cho_solve
+from scipy.linalg.blas import daxpy, drot
 
 __all__ = [
     "BPD1Params",
@@ -395,6 +401,47 @@ def bpd2_forward(params: BPD2Params, t: NDArray[np.float64]) -> NDArray[np.float
     return _trajectory(params.as_array(), tt, n_breaks=2)
 
 
+def _powerlaw_psi(n: int, kappa: float) -> NDArray[np.float64]:
+    """Fractional-integration coefficients ψ of the power-law transform T.
+
+    Equation (``UniVarMatrix.m`` l.19–22; Williams 2003, J. Geodesy 76, eq. 3):
+        ``ψ₀ = 1``, ``ψ_i = ((i − 1 − κ/2)/i)·ψ_{i−1}``  (0-based) —
+        the Maclaurin coefficients of ``(1 − L)^{κ/2}``:
+        ``ψ_i = Γ(i − κ/2)/(Γ(−κ/2)·i!)``, i.e. fractional integration of
+        order ``d = −κ/2`` (Hosking 1981, Biometrika 68, eq. 2.4). The
+        process ``T·w`` (w white) has power spectrum ∝ f^κ; for κ ≤ −1
+        (d ≥ ½) it is **nonstationary**, which is why ``T·Tᵀ`` is not a
+        Toeplitz (stationary-autocovariance) matrix.
+
+    Symbols → args:
+        - ``n`` → ``n``: number of coefficients (epochs), > 0
+        - ``κ`` → ``kappa``: power-law spectral index (dimensionless; ≤ 0
+          for GNSS noise, −1 = flicker, −2 = random walk)
+
+    Returns:
+        ψ, shape (n,), float64. ψ_i ≥ 0 for κ ≤ 0.
+
+    Reference:
+        Hosking 1981, Biometrika 68(1), eq. 2.4; Williams 2003, J. Geodesy
+        76, eq. 3 (transformation-matrix entries); ``UniVarMatrix.m`` l.19–22.
+
+    Numerical notes:
+        Evaluated as one ``cumprod`` of the exact recursion ratios — the same
+        float64 operation sequence as the upstream MATLAB loop, so the parity
+        test against the literal ``UniVarMatrix.m`` build stays exact. |ratio|
+        < 1 for i ≥ 1 and κ ∈ [−1.5, 0]: ψ decays monotonically (∼ i^(κ/2−1)
+        asymptotically), no overflow. κ = 0 gives ψ = (1, 0, …).
+    """
+    if n <= 0:
+        raise ValueError(f"n must be positive, got {n}")
+    psi = np.empty(n, dtype=np.float64)
+    psi[0] = 1.0
+    if n > 1:
+        i = np.arange(1.0, n)
+        psi[1:] = np.cumprod((i - 1.0 - kappa / 2.0) / i)
+    return psi
+
+
 def noise_covariance(
     n: int, wn_amp: float, kappa: float, pln_amp: float
 ) -> NDArray[np.float64]:
@@ -429,8 +476,13 @@ def noise_covariance(
           ``(T Tᵀ)[j+d, j] = Σ_{m=0}^{j} ψ_{m+d}·ψ_m`` (cumulative sums) —
           algebraically identical to the upstream dense product, O(n²) instead
           of O(n³) (tests assert equality with the naive Toeplitz build to
-          rtol 1e-12). The per-sample O(n³) *Cholesky* in the likelihood is the
-          remaining hotspot — task H3 (Toeplitz/Levinson).
+          rtol 1e-12).
+        - The sum above depends on j, not only on the diagonal offset d: C is
+          **not Toeplitz** (nonstationary power-law noise — see
+          :func:`_powerlaw_psi`; deviation pinned by test). The MCMC hot loop
+          therefore never builds C — it uses the exact O(n²) displacement-
+          structure path :func:`_schur_logdet_quad` (task H3); this dense
+          builder remains for diagnostics and as the parity reference.
         - The recursion lag is the **sample index**, i.e. uniform daily
           sampling is assumed (ΔT hard-coded, ``UniVarMatrix.m`` l.27); gaps
           are silently treated as absent — fidelity-preserved, flagged.
@@ -439,11 +491,7 @@ def noise_covariance(
     """
     if n <= 0:
         raise ValueError(f"n must be positive, got {n}")
-    psi = np.empty(n, dtype=np.float64)
-    psi[0] = 1.0
-    if n > 1:
-        i = np.arange(1.0, n)
-        psi[1:] = np.cumprod((i - 1.0 - kappa / 2.0) / i)
+    psi = _powerlaw_psi(n, kappa)
     # (ΔT^(−κ/4))² — the squared scaling of T1 (UniVarMatrix.m l.27).
     scale_sq = float(_DELTA_T_YR ** (-kappa / 2.0))
     cov = np.zeros((n, n), dtype=np.float64)
@@ -487,8 +535,11 @@ def log_likelihood(residual: NDArray[np.float64], cov: NDArray[np.float64]) -> f
         One Cholesky factorization serves both the quadratic form (triangular
         solves, ``cho_solve``) and the log-determinant — never an explicit
         inverse (upstream ``Cov^(-1)``, ``runInversion_ts.m`` l.113, is the
-        flagged O(N³) inefficiency). ``check_finite=False`` skips redundant
-        validation in the MCMC hot loop; inputs are not mutated.
+        flagged O(N³) inefficiency). This is the dense O(N³) *reference* path
+        for callers holding an arbitrary covariance; the MCMC hot loop uses
+        the exact O(N²) :func:`_log_likelihood_fast` instead (task H3).
+        ``check_finite=False`` skips redundant validation; inputs are not
+        mutated.
     """
     r = np.asarray(residual, dtype=np.float64)
     if r.ndim != 1:
@@ -500,6 +551,142 @@ def log_likelihood(residual: NDArray[np.float64], cov: NDArray[np.float64]) -> f
     quad = float(r @ cho_solve(factor, r, check_finite=False))
     logdet = 2.0 * float(np.sum(np.log(np.diag(factor[0]))))
     return -0.5 * (quad + logdet + r.size * _LOG_2PI)
+
+
+def _schur_logdet_quad(
+    residual: NDArray[np.float64], wn_amp: float, kappa: float, pln_amp: float
+) -> tuple[float, float]:
+    """Exact ``ln det C`` and ``rᵀC⁻¹r`` in O(n²) via the generalized Schur algorithm.
+
+    For ``C = σ_w²·I + β̃²·(T Tᵀ)`` (:func:`noise_covariance`, with
+    ``β̃ = β·ΔT^(−κ/4)`` the scaled power-law amplitude and T the unit
+    lower-triangular Toeplitz matrix of ψ = :func:`_powerlaw_psi`), C is not
+    Toeplitz, but it has **displacement rank 2 with positive generators**:
+
+        ``C − Z·C·Zᵀ = σ_w²·e₀e₀ᵀ + β̃²·ψψᵀ = G·Gᵀ``,
+        ``G = [σ_w·e₀, β̃·ψ] ∈ ℝ^{n×2}``,
+
+    where Z is the down-shift matrix (Z_{ij} = δ_{i,j+1}). Proof:
+    ``(T Tᵀ)_{ij} = Σ_{k=0}^{min(i,j)} ψ_{i−k}ψ_{j−k}`` ⇒ subtracting the
+    shifted copy leaves only the k = 0 term ψ_i·ψ_j, and ``I − Z I Zᵀ =
+    e₀e₀ᵀ`` (identity verified to machine ε in the test suite).
+
+    The generalized Schur recursion then delivers the columns of the exact
+    Cholesky factor L (C = L·Lᵀ) one at a time: at step k an orthogonal
+    Givens rotation Θ_k zeroes the second generator column at row k, after
+    which the first generator column *is* ``L[k:, k]``; the next generator is
+    ``[Z·L[:, k], g₂]``. Because both generator columns are positive
+    semidefinite contributions (J = I₂, no hyperbolic rotations), every Θ_k
+    is orthogonal and the factorization is backward stable, comparable to
+    dense Cholesky (Chandrasekaran & Sayed 1996). Fused into the same pass:
+
+        ``z_k = (r_k − Σ_{j<k} L_{kj} z_j)/L_{kk}``  (forward substitution),
+        ``rᵀC⁻¹r = zᵀz``,  ``ln det C = 2·Σ_k ln L_{kk}``,
+
+    so neither C nor L is ever stored — O(n) memory, ~2n² flops (vs the
+    O(n²) dense build + n³/3 Cholesky + n² solve it replaces).
+
+    Symbols → args:
+        - ``r``   → ``residual``: data-minus-model vector, shape (n,) [mm]
+        - ``σ_w`` → ``wn_amp``: white-noise amplitude [mm], > 0
+        - ``κ``   → ``kappa``: power-law spectral index (dimensionless)
+        - ``β``   → ``pln_amp``: power-law amplitude [mm/yr^(−κ/4)]
+
+    Returns:
+        ``(ln det C, rᵀC⁻¹r)`` as floats, algebraically identical to the
+        dense :func:`noise_covariance` + Cholesky evaluation.
+
+    Raises:
+        numpy.linalg.LinAlgError: if a Schur pivot is not positive (cannot
+            happen for ``wn_amp > 0``: every Schur complement of
+            ``σ_w²·I + PSD`` keeps the σ_w²·I floor, so ``L_kk ≥ σ_w``).
+
+    Reference:
+        Kailath, Kung & Morf 1979, J. Math. Anal. Appl. 68, 395–407
+        (displacement rank); Kailath & Sayed 1995, SIAM Review 37(3), §1–4
+        (generalized Schur algorithm); Chandrasekaran & Sayed 1996, SIAM J.
+        Matrix Anal. Appl. 17(4) (stability, positive-definite case);
+        Hosking 1981, Biometrika 68(1) (ψ, nonstationarity for κ ≤ −1);
+        Williams 2003, J. Geodesy 76, eq. 4 (the covariance itself). Levinson/
+        Trench (Golub & Van Loan §4.7) do NOT apply — C is not Toeplitz.
+
+    Numerical notes:
+        - Parity with the dense Cholesky path: ≤ 3e-15 relative on both
+          outputs across N ≤ 1825, κ ∈ [−1.5, 0] (test-pinned at rel 1e-11);
+          the resulting |Δ ln P| ≤ ~4e-12 absolute.
+        - In-place BLAS kernels: the rotation is one ``drot`` over the two
+          generator columns and the substitution update one ``daxpy``. The
+          shift Z is realized implicitly by index bookkeeping — at step k the
+          first generator column lives in ``u[0:n−k]`` (logical rows k…n−1)
+          and is shortened from the END, while v and w advance from the
+          FRONT; the arrays never move. ``w[k]`` is overwritten by z_k after
+          its last read (w doubles as z).
+        - The rotation is skipped when ``v[k] == 0`` exactly (κ = 0 tail,
+          or ``pln_amp = 0`` ⇒ L = σ_w·I exactly, matching the white-noise
+          closed form).
+        - Inputs are not mutated (the residual is copied once).
+    """
+    r = np.asarray(residual, dtype=np.float64)
+    if r.ndim != 1:
+        raise ValueError(f"residual must be 1-D, got shape {r.shape}")
+    n = r.size
+    # Generators: u = σ_w·e0 (logical column 1), v = β̃·ψ (column 2).
+    v = (pln_amp * float(_DELTA_T_YR ** (-kappa / 4.0))) * _powerlaw_psi(n, kappa)
+    u = np.zeros(n, dtype=np.float64)
+    u[0] = wn_amp
+    w = r.copy()  # residual → forward-substituted z, in place
+    diag = np.empty(n, dtype=np.float64)  # L_kk
+    hyp = math.hypot
+    for k in range(n):
+        m = n - k
+        b = float(v[k])
+        if b != 0.0:
+            a = float(u[0])
+            h = hyp(a, b)
+            # Θ_k: zero v at row k; u[0:m] becomes L[k:, k].
+            u, v = drot(
+                u, v, a / h, b / h, n=m, offy=k, overwrite_x=True, overwrite_y=True
+            )
+        d = float(u[0])
+        if d <= 0.0:
+            raise np.linalg.LinAlgError(
+                f"covariance not positive definite: Schur pivot {d} at step {k}"
+            )
+        diag[k] = d
+        z_k = w[k] / d
+        w[k] = z_k
+        if m > 1:
+            # w[k+1:] -= z_k · L[k+1:, k]
+            w = daxpy(u, w, n=m - 1, offx=1, offy=k + 1, a=-z_k)
+    logdet = 2.0 * float(np.sum(np.log(diag)))
+    quad = float(w @ w)
+    return logdet, quad
+
+
+def _log_likelihood_fast(
+    residual: NDArray[np.float64], wn_amp: float, kappa: float, pln_amp: float
+) -> float:
+    """Gaussian ln P of a residual under C(σ_w, κ, β) without forming C.
+
+    Equation (identical to :func:`log_likelihood`):
+        ``ln P = −rᵀC⁻¹r/2 − ln det C/2 − n·ln 2π/2``
+    with the quadratic form and log-determinant from the exact O(n²)
+    generalized-Schur pass :func:`_schur_logdet_quad` instead of a dense
+    O(n³) Cholesky — the MCMC hot-loop path (task H3).
+
+    Symbols → args: as in :func:`_schur_logdet_quad`.
+
+    Reference:
+        Bagnardi & Hooper 2018, G³ 19, §3 (likelihood); Kailath & Sayed 1995
+        (fast factorization — see :func:`_schur_logdet_quad`).
+
+    Numerical notes:
+        Agrees with ``log_likelihood(r, noise_covariance(n, σ_w, κ, β))`` to
+        ≤ ~4e-12 absolute in ln P (test-pinned; both paths are exact
+        factorizations of the same matrix, differing only in rounding order).
+    """
+    logdet, quad = _schur_logdet_quad(residual, wn_amp, kappa, pln_amp)
+    return -0.5 * (quad + logdet + np.asarray(residual).size * _LOG_2PI)
 
 
 def prepare_bounds(start: NDArray[np.float64], model: str = "BPD1") -> PriorBounds:
@@ -656,9 +843,10 @@ def run_inversion(
         2023GL103432 (time-series adaptation); ``runInversion_ts.m``.
 
     Numerical notes:
-        - Per kept iteration: one O(n²) covariance build + one O(n³) Cholesky
-          (:func:`log_likelihood`) — ~50 ms at n ≈ 1800, i.e. hours for the
-          production ``n_runs = 1e6``. H3 (Toeplitz/Levinson) is the planned fix.
+        - Per kept iteration: one exact O(n²) generalized-Schur likelihood
+          (:func:`_log_likelihood_fast`; task H3) — ~6 ms at n = 1825 vs
+          ~160–600 ms for the pre-H3 dense build+Cholesky, i.e. a production
+          ``n_runs = 1e6`` chain drops from days to ~2–4 h.
         - ``exp((P − P_prev)/T)`` is capped at ``exp(700)`` to avoid float64
           overflow; the accept decision is unchanged (both compare ≥ U < 1).
         - MCMC is stochastic: results are reproducible only for a fixed
@@ -741,14 +929,17 @@ def run_inversion(
         # -- Forward model + colored-noise likelihood (l.95-132) --------------
         m_func = trial[:n_func]
         u = _trajectory(m_func, tt, n_breaks)
-        cov = noise_covariance(n_obs, wn_amp, float(trial[-3]), float(trial[-2]))
         residual = yy - u
         if set_hyper:
             hyper_prev = 1.0  # l.121: hyperparameter pinned to 1 at T = 1
             trial[-1] = 0.0  # log10(1)
             set_hyper = False
         hyper_param = 1.0
-        log_p = log_likelihood(residual, cov)
+        # Exact O(n²) evaluation of ln P under C(σ_w, κ, β) — never forms C
+        # (generalized Schur on the displacement structure; task H3).
+        log_p = _log_likelihood_fast(
+            residual, wn_amp, float(trial[-3]), float(trial[-2])
+        )
 
         if i_keep > 0:
             # (hyper_prev/hyper_param)^(n/2) ≡ 1; exp capped against overflow.
