@@ -176,6 +176,32 @@ class TestBPD2Forward:
         )
         np.testing.assert_array_equal(bpd2_forward(p, self.T), expected)
 
+    def test_matches_independent_segment_construction(self) -> None:
+        """Cross-check vs segment-wise slope integration (different algebra).
+
+        The trajectory must equal the piecewise line through the anchor nodes
+        (t*_k, y(t*_k)) with slopes v / v+g1 / v+g1+g2, built here by
+        cumulative node evaluation — an independent construction sharing no
+        algebra with the ``H(t-tb)*(t-t*)`` ramp sum of ``BPD2.m``. atol
+        1e-9 mm: float64 rounding of the re-associated sums (observed max
+        |diff| ~ 1e-12 mm on this grid).
+        """
+        p = BPD2Params(0.5, 6.0, -12.0, 2019.3, 8.0, 2019.65, -0.7, 4.0)
+        t = self.T
+        ts1 = float(t[np.argmax(t >= p.breakpoint1)])
+        ts2 = float(t[np.argmax(t >= p.breakpoint2)])
+        v, g1, g2 = p.trend1, p.trend_change1, p.trend_change2
+        pre = t < ts1
+        mid = (t >= ts1) & (t < ts2)
+        post = t >= ts2
+        y = np.empty_like(t)
+        y[pre] = p.intercept + v * (t[pre] - t[0])
+        y_ts1 = p.intercept + v * (ts1 - t[0])
+        y[mid] = y_ts1 + (v + g1) * (t[mid] - ts1)
+        y_ts2 = y_ts1 + (v + g1) * (ts2 - ts1)
+        y[post] = y_ts2 + (v + g1 + g2) * (t[post] - ts2)
+        np.testing.assert_allclose(bpd2_forward(p, t), y, rtol=0, atol=1e-9)
+
     def test_segment_slopes(self) -> None:
         """Slopes are v / v+g1 / v+g1+g2 on the three segments."""
         p = BPD2Params(0.0, 6.0, -12.0, 2019.3, 8.0, 2019.65, -0.7, 4.0)
@@ -471,15 +497,21 @@ class TestRunInversion:
     def test_recovers_synthetic_bpd2(self) -> None:
         """Two-break recovery; same construction, both ramps well resolved.
 
-        Data span (n=500 -> ends ~2020.37) deliberately covers the SECOND
-        break's uniform prior (tb2 +- 0.5 yr -> up to 2020.12): with the
-        original 300-epoch span (ended 2019.82) the prior extended ~0.3 yr past
-        the last datum, so `tb2` could wander into a no-data region where the
-        second ramp is unconstrained and the initial trend `v` absorbed the
-        slack (recovered v=4.14 vs truth 6.0). With adequate span all six
-        trajectory parameters are identifiable. `v` (the initial secular trend)
-        is the weakest-constrained parameter in a two-break fit — hence its
-        wider +-2 mm/yr tolerance vs the break-change and epoch assertions.
+        Data span (n=500 -> ends ~2020.37) covers the SECOND break's uniform
+        prior (tb2 +- 0.5 yr -> up to 2020.12): with the original 300-epoch
+        span (ended 2019.82) the prior extended ~0.3 yr past the last datum,
+        where the second ramp vanishes (H = 0) and dv2 goes unidentified —
+        extending the span tightens dv2 (GLS sigma at truth breaks:
+        2.2 -> 0.7 mm/yr) and firms up the whole joint optimum.
+
+        v tolerance +-2.0 mm/yr, audited against the EXACT likelihood: for
+        this noise realization (data seed 42) the profile maximum over all
+        admissible break pairs sits at v = 4.75 (n=500; 4.80 at n=300) vs
+        truth 6.0 — pure single-realization noise (GLS at truth breaks gives
+        v = 5.30 +- 0.82, C=I), so a CORRECT sampler must be allowed
+        |v - 6| ~ 1.3 plus short-chain wander around the ML point (observed
+        optimum spread ~ +-0.9 over chain seeds). The dv/tb tolerances are
+        likewise ~1.5-2 GLS sigma for this design.
         """
         rng = np.random.default_rng(42)
         t = 2019.0 + np.arange(500) / 365.0
@@ -533,20 +565,36 @@ class TestDetectBreakpoints:
 class TestTS14Reference:
     @pytest.mark.slow
     def test_ts14_window_parity(self) -> None:
-        """BPD1 on TS14 restricted to 2020.5-2022.5 (730 epochs).
+        """BPD1 on TS14 restricted to 2020.5-2022.5 (731 epochs), zero-referenced.
+
+        The window is re-referenced (minus its first-30-day mean, ~8.6 mm)
+        because the intercept prior is HARD-CODED to +-5 mm upstream
+        (``prepareModel_ts.m`` l.51-52) and GBIS4TS expects series referenced
+        near zero (``GBISrun_ts.m`` carries a commented-out
+        ``timeseries(:,2) - timeseries(1,2); % force the intercept to be
+        zero``). The raw window starts ~8.3 mm above zero: the intercept then
+        saturates at +5 (observed a=4.916) and the sampler compensates by
+        inflating v toward its own prior bound 8.8136 (observed v=8.068 vs
+        windowed-GLS v=4.06 +- 0.96 free / 7.39 with a pinned at +5) —
+        an input-referencing artifact, not a window-identifiability limit.
 
         The full-series reference (SI Table S4, scheme beta=4, g=-20:
         optimal dv=-20.0, tb=2021.5109, kappa=-0.7, amp=4.0) is checked with
-        tolerances widened for (a) the two-year window, which weakens v and
-        the noise parameters, and (b) the shortened chain (n_runs=6000,
-        t_runs=150). Margins: dv within 2x the reference 95% half-width,
-        tb within +-0.15 yr, kappa/amp within the physically sampled ranges.
+        tolerances widened for (a) the two-year window and (b) the shortened
+        chain (n_runs=6000, t_runs=150). Margins: dv within 2x the reference
+        95% half-width (windowed exact GLS-ML: dv=-18.2, tb=2021.4507,
+        v=4.81 at reference kappa/amp), tb within +-0.15 yr, v within ~3
+        GLS-sigma of the windowed value, kappa/amp within the physically
+        sampled ranges. Seeded run observed: a=-1.02, v=5.50, dv=-18.68,
+        tb=2021.4405, kappa=-0.64, amp=3.95.
         """
         t, y = _load_ts14()
         mask = (t >= 2020.5) & (t <= 2022.5)
+        tw = t[mask]
+        yw = y[mask] - float(np.mean(y[mask][:30]))  # zero-reference (see doc)
         res = run_inversion(
-            t[mask],
-            y[mask],
+            tw,
+            yw,
             TS14_WN,
             InversionConfig(n_runs=6000, t_runs=150, seed=20230710),
             prepare_bounds(TS14_START, "BPD1"),
@@ -557,9 +605,12 @@ class TestTS14Reference:
         # matched to the SI Table S4 reference within the widened tolerances.
         assert dv == pytest.approx(TS14_REF_OPTIMAL["dv"], abs=2.6)
         assert tb == pytest.approx(TS14_REF_OPTIMAL["tb"], abs=0.15)
-        # v (secular rate) is a loose sanity band only: a 2-year window weakly
-        # constrains the trend (see docstring), so it is not a parity target.
-        assert 1.0 <= v <= 11.0
+        # v: windowed GLS gives 4.06 +- 0.96, so [2.0, 8.0] is ~+-3 sigma —
+        # a meaningful sanity band once the input is properly referenced.
+        assert 2.0 <= v <= 8.0
+        # saturation guard: the intercept must sit OFF its +-5 prior bounds
+        # (a wedged at a bound reproduces the referencing artifact above).
+        assert abs(a) < 4.5
         assert -1.2 <= kappa <= -0.2
         assert 2.0 <= amp <= 6.5
 
