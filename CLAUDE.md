@@ -24,9 +24,10 @@ Consolidates `~/work/projects/gps_data_analyses` (`svartsengi-model`,
 
 ## Module map
 
-`models` · `fitting` · `velocity` · `baseline` · `preprocess` · `deformation` · `transient`
+`models` · `fitting` · `velocity` · `baseline` · `preprocess` · `deformation` · `joint` · `transient`
 — fill surfaces in place; don't rename modules without updating plan §10.2
-(`preprocess` added by refactor-B slice 2 — flag to plan §10.2 at next plan edit).
+(`preprocess` added by refactor-B slice 2, `joint` by the GPS+InSAR slice —
+flag both to plan §10.2 at next plan edit).
 All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDARDS.md) (binding).
 Shared internal: `_mcmc` — the ONE GBIS Metropolis/annealing/adaptive-step core
 (Bagnardi & Hooper 2018 §3; `T_SCHEDULE`, `sensitivity_schedule`, `metropolis`,
@@ -42,7 +43,8 @@ Shared internal: `_mcmc` — the ONE GBIS Metropolis/annealing/adaptive-step cor
 | `preprocess` | ✅ implemented (refactor-B slice 2) | `screen_uncertainty` (formal-σ epoch screen), `prep_plot_series`/`prep_neu_series` — the two explicit legacy profiles (D1: plot/getData `iprep` vs .NEU/gamittoNEU `vshift`), bit-parity on live paths, geo_dataread goldens pin them end-to-end |
 | `velocity` | ✅ implemented (WLS) | `estimate_velocity` (WLS + formal σ, `method="wls"`), `sliding_velocity`, magnitude/azimuth (+σ); `detectability_floor` stub |
 | `transient` | ✅ ported (GBIS4TS), CI-parity green, **H3-optimized** | `bpd1/bpd2_forward`, `noise_covariance` (Williams 2003), `log_likelihood`, `run_inversion` (MCMC+annealing), `detect_breakpoints`. BPD1+BPD2 recover; **TS14 windowed parity matches MATLAB** (dv/tb; raw window — the leaf auto-conditions the ±5 mm-prior zero-reference contract, `y_ref` provenance). **H3 (2026-07-11):** hot loop uses exact O(N²) generalized-Schur likelihood (`_schur_logdet_quad`; C is NOT Toeplitz — Hosking 1981); 27.9× @ N=1825 (248.8→8.9 ms/sample; 1e6-run chain 2.9 d→2.5 h); parity ≤4e-12 in lnP; C/Rust settled: stay NumPy (PLAN-analysis-lane §3). **Full-fidelity `test_ts14_full_reference` PASSED 2026-07-11** (125 s on the Schur path; posterior optimum + 95% intervals inside SI Table S4 for v/dv/tb/κ/amp). Vendored MATLAB + map: `reference/gbis4ts/` |
-| `deformation` | ✅ implemented (GPS-only) | Mogi/McTigue/Okada forwards + NLLS inversions (`mogi_invert`, `okada_invert`), Bayesian `mogi_invert_bayes` (shared `_mcmc` sampler), **distributed slip** (`discretize_fault` → `okada_greens` → `okada_invert_slip`: Laplacian-regularized ± non-negative linear inversion, `slip_lcurve`/`lcurve_corner` λ selection — Okada 1985; Harris & Segall 1987; Jónsson et al. 2002; Aster et al. 2018 ch. 4), ΔV↔ΔP/rate products. Joint GPS+InSAR still parked (plan §9b) |
+| `deformation` | ✅ implemented (GPS-only) | Mogi/McTigue/Okada forwards + NLLS inversions (`mogi_invert`, `okada_invert`), Bayesian `mogi_invert_bayes` (shared `_mcmc` sampler), **distributed slip** (`discretize_fault` → `okada_greens` → `okada_invert_slip`: Laplacian-regularized ± non-negative linear inversion, `slip_lcurve`/`lcurve_corner` λ selection — Okada 1985; Harris & Segall 1987; Jónsson et al. 2002; Aster et al. 2018 ch. 4), ΔV↔ΔP/rate products. Joint GPS+InSAR → `joint` |
+| `joint` | ✅ implemented (2026-07-12) | **Joint GPS+InSAR Mogi inversion** — `los_unit_vector`/`los_project` (ground→satellite ENU unit vector; **positive LOS = motion toward satellite/range decrease** — Hanssen 2001 ch. 2, Fialko et al. 2001 eq. 1), `InsarLos` leaf contract (downsampled points + σ or dense cov; quadtree/variogram = reader's job, Lohman & Simons 2005), per-track offset/linear-ramp nuisance (`ramp_design`, Bagnardi & Hooper 2018), `mogi_invert_joint` (whitened NLLS, analytic LOS-projected Jacobian) with **Helmert VCE** dataset weighting (`variance_components` — Sudhaus & Jónsson 2009; Koch 1999 ch. 3). **Depth–ΔV trade-off break test-pinned** (`test_joint.py` exit gate): 5-station synthetic — empirical σ_depth 986→252 m (×0.26) single descending track; formal σ_depth 523→215 m, cov(d,ΔV) ×0.14, ρ 0.972→0.917; asc+desc (Wright et al. 2004) tightens further (σ_depth 171 m). Bayesian joint variant on `_mcmc` = next slice; real InSAR via KITE reader (geo_dataread) = later |
 
 > **Analysis-lane re-scope (2026-07-10, [`../PLAN-analysis-lane.md`](../PLAN-analysis-lane.md)):**
 > `transient` (GBIS4TS) is **un-backburnered and ported** (H1). `velocity` ships **WLS**;
@@ -79,4 +81,4 @@ uv run mypy src tests && uv run pytest
 - Home: **GitHub** (libs); CI: `.github/workflows/ci.yml`.
 
 ---
-*Last reviewed: 2026-07-12 (shared `_mcmc` GBIS sampler core extracted — transient bit-parity preserved, deformation's private copy deleted; Okada distributed-slip inversion (patch Green's functions + Laplacian regularization + NNLS + L-curve) added to `deformation`; earlier: H3 generalized-Schur O(N²) likelihood, zero-reference auto-conditioning + saturation guard, seasonal BPD1S/BPD2S, `preprocess` module).*
+*Last reviewed: 2026-07-12 (NEW `joint` module: joint GPS+InSAR Mogi inversion — LOS projection, InsarLos leaf contract, per-track nuisance, Helmert-VCE weighting; depth–ΔV trade-off break demonstrated on synthetics and test-pinned. Earlier same day: shared `_mcmc` GBIS sampler core extracted — transient bit-parity preserved, deformation's private copy deleted; Okada distributed-slip inversion (patch Green's functions + Laplacian regularization + NNLS + L-curve) added to `deformation`.)*
