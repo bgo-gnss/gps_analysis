@@ -46,15 +46,21 @@ parameter p₁ is the secular rate** (:func:`~gps_analysis.models.linear`,
 
 Method provenance (binding, ``docs/MATH_STANDARDS.md`` §6)
 ----------------------------------------------------------
-Every result carries ``method="wls"``. The white-noise formal σ_v is
+WLS results carry ``method="wls"``. The white-noise formal σ_v is
 **optimistic** for real GNSS daily solutions — temporally correlated
 (flicker/random-walk) noise inflates true rate uncertainty by factors of
-several (Williams 2003, J. Geodesy 76, eqs. 23–30). Honest colored-noise
-uncertainties arrive with the GBIS4TS lane (:mod:`gps_analysis.transient`,
-plan §10.7) and will carry ``method="gbis"``; the API contract
-distinguishes the two so consumers never mistake a WLS σ for an honest one.
-The per-station :func:`detectability_floor` (velocity-change alarm
-threshold) depends on that noise model and is a documented stub here.
+several (Williams 2003, J. Geodesy 76, eqs. 23–30). The honest-σ upgrade
+is :func:`estimate_velocity_mle` (``method="mle"``, plan §9b): the same
+windowed trajectory fit under a **white + power-law colored-noise model**
+estimated jointly by maximum likelihood (:mod:`gps_analysis.noise` —
+Zhang et al. 1997; Williams 2003; Williams et al. 2004; Bos et al. 2013),
+whose σ_v comes from the colored-noise GLS covariance. Posterior
+(MCMC) noise estimates from the GBIS4TS lane
+(:mod:`gps_analysis.transient`, plan §10.7) carry ``method="gbis"``; the
+API contract distinguishes all three so consumers never mistake a WLS σ
+for an honest one. The per-station :func:`detectability_floor`
+(velocity-change alarm threshold) evaluates the exact colored-noise rate
+uncertainty for any (σ_w, β, κ) triple — MLE- or GBIS-estimated.
 
 All functions are pure: float64 arithmetic, no I/O, inputs never mutated,
 units the caller's business ([L] below; velocity [L/yr], azimuth degrees,
@@ -62,12 +68,13 @@ time ``yearf``).
 """
 
 import dataclasses
+import math
 import warnings
 from collections.abc import Sequence
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
-from scipy import optimize
+from scipy import optimize, stats
 
 from . import models
 from .baseline import slice_window
@@ -82,12 +89,16 @@ from .fitting import (
     fit_components,
 )
 from .models import FloatArray, TrajectoryParams
+from .noise import NoiseModel, estimate_noise_mle, powerlaw_rate_sigma
+from .transient import _DELTA_T_YR
 
 __all__ = [
     "SlidingVelocity",
     "VelocityEstimate",
+    "VelocityEstimateMLE",
     "detectability_floor",
     "estimate_velocity",
+    "estimate_velocity_mle",
     "horizontal_azimuth",
     "horizontal_azimuth_sigma",
     "horizontal_magnitude",
@@ -104,8 +115,13 @@ _RATE_INDEX = 1
 convention (``models.linear`` / ``models.lineperiodic`` positional order)."""
 
 _METHOD_WLS = "wls"
-"""Method tag of this estimator (API contract, plan §10.5 /
-MATH_STANDARDS §6); the GBIS4TS upgrade will tag ``"gbis"``."""
+"""Method tag of the WLS estimator (API contract, plan §10.5 /
+MATH_STANDARDS §6)."""
+
+_METHOD_MLE = "mle"
+"""Method tag of the colored-noise MLE estimator
+(:func:`estimate_velocity_mle`; API contract, plan §10.5 / §9b). The
+GBIS4TS posterior lane tags ``"gbis"``."""
 
 _NAMED_MODELS: dict[str, ModelFunc] = {
     "linear": models.linear,
@@ -308,6 +324,55 @@ def horizontal_azimuth_sigma(
     return np.asarray(np.where(mag_sq > 0.0, prop, np.nan), dtype=np.float64)
 
 
+def _horizontal_products(
+    names: Sequence[str] | None,
+    rates: FloatArray,
+    sigmas: FloatArray,
+) -> tuple[float | None, float | None, float | None, float | None]:
+    """Derive the horizontal magnitude/azimuth products from labelled rates.
+
+    Equation (composition of the four atomic horizontal functions):
+        ``|v_h| = √(v_E² + v_N²)``, ``α = atan2(v_E, v_N)·180/π (mod 360)``
+        with their delta-method σ — evaluated only when ``names`` contains
+        exactly one ``"north"`` and one ``"east"`` (case-insensitive).
+
+    Symbols → args:
+        - component labels → ``names``: per-component labels or None
+        - ``v`` → ``rates``: per-component rates, shape (C,) [L/yr]
+        - ``σ_v`` → ``sigmas``: their 1-σ uncertainties, shape (C,) [L/yr]
+
+    Returns:
+        ``(magnitude, azimuth, magnitude_sigma, azimuth_sigma)`` floats
+        [L/yr, deg, L/yr, deg], or ``(None, None, None, None)`` when the
+        horizontal pair is not identifiable from the labels.
+
+    Reference:
+        Thin orchestration over :func:`horizontal_magnitude`,
+        :func:`horizontal_azimuth`, :func:`horizontal_magnitude_sigma`,
+        :func:`horizontal_azimuth_sigma` (see those for the math) —
+        shared by the WLS and MLE estimators so the API products are
+        method-independent (plan §10.5).
+
+    Numerical notes:
+        No math of its own; the NaN conventions of the ``*_sigma``
+        functions at |v_h| = 0 pass through.
+    """
+    if names is None:
+        return None, None, None, None
+    lowered = [name.lower() for name in names]
+    if lowered.count("north") != 1 or lowered.count("east") != 1:
+        return None, None, None, None
+    i_n, i_e = lowered.index("north"), lowered.index("east")
+    v_e, v_n = rates[i_e], rates[i_n]
+    s_e, s_n = sigmas[i_e], sigmas[i_n]
+    return (
+        float(horizontal_magnitude(v_e, v_n)),
+        float(horizontal_azimuth(v_e, v_n)),
+        float(horizontal_magnitude_sigma(v_e, v_n, s_e, s_n)),
+        float(horizontal_azimuth_sigma(v_e, v_n, s_e, s_n)),
+    )
+
+
 @dataclasses.dataclass(frozen=True)
 class VelocityEstimate:
     """Fixed-window WLS secular velocity for one or more components.
@@ -383,6 +448,40 @@ class VelocityEstimate:
             raise ValueError(f"got {len(self.fits)} fits for {rates.size} components")
         object.__setattr__(self, "rates", rates)
         object.__setattr__(self, "sigmas", sigmas)
+
+
+@dataclasses.dataclass(frozen=True)
+class VelocityEstimateMLE(VelocityEstimate):
+    """Fixed-window colored-noise **MLE** secular velocity (honest σ_v).
+
+    Result of :func:`estimate_velocity_mle` — shape-compatible with
+    :class:`VelocityEstimate` (same rates/sigmas/fits/horizontal products,
+    ``method="mle"``) plus the per-component white + power-law noise
+    models the uncertainties are conditioned on. ``sigmas`` here are the
+    **colored-noise GLS** 1-σ rate errors ``√(ŝ²·(AᵀC₀⁻¹A)⁻¹)₁₁`` —
+    typically several × the WLS formal error for flicker-dominated GNSS
+    series (Zhang et al. 1997; Williams et al. 2004).
+
+    Attributes:
+        noise: Per-component :class:`gps_analysis.noise.NoiseModel`
+            (σ̂_w [L], β̂ [L·yr^(−κ/4)], κ̂, ln L̂, n), in the same row
+            order as ``rates`` — the MATH_STANDARDS §6 provenance that
+            makes the σ honest.
+
+    Numerical notes:
+        Inherits the coercion/validation of :class:`VelocityEstimate`;
+        additionally requires one noise model per component.
+    """
+
+    noise: tuple[NoiseModel, ...] = ()
+
+    def __post_init__(self) -> None:
+        super().__post_init__()
+        n_components = np.asarray(self.rates).size
+        if len(self.noise) != n_components:
+            raise ValueError(
+                f"got {len(self.noise)} noise models for {n_components} components"
+            )
 
 
 @dataclasses.dataclass(frozen=True)
@@ -602,20 +701,9 @@ def estimate_velocity(
     rates = np.asarray([f.params[_RATE_INDEX] for f in fits], dtype=np.float64)
     sigmas = np.asarray([f.uncertainties[_RATE_INDEX] for f in fits], dtype=np.float64)
 
-    magnitude: float | None = None
-    azimuth: float | None = None
-    magnitude_sigma: float | None = None
-    azimuth_sigma: float | None = None
-    if names is not None:
-        lowered = [name.lower() for name in names]
-        if lowered.count("north") == 1 and lowered.count("east") == 1:
-            i_n, i_e = lowered.index("north"), lowered.index("east")
-            v_e, v_n = rates[i_e], rates[i_n]
-            s_e, s_n = sigmas[i_e], sigmas[i_n]
-            magnitude = float(horizontal_magnitude(v_e, v_n))
-            azimuth = float(horizontal_azimuth(v_e, v_n))
-            magnitude_sigma = float(horizontal_magnitude_sigma(v_e, v_n, s_e, s_n))
-            azimuth_sigma = float(horizontal_azimuth_sigma(v_e, v_n, s_e, s_n))
+    magnitude, azimuth, magnitude_sigma, azimuth_sigma = _horizontal_products(
+        names, rates, sigmas
+    )
 
     return VelocityEstimate(
         rates=rates,
@@ -630,6 +718,183 @@ def estimate_velocity(
         azimuth=azimuth,
         magnitude_sigma=magnitude_sigma,
         azimuth_sigma=azimuth_sigma,
+    )
+
+
+def estimate_velocity_mle(
+    t: ArrayLike,
+    y: ArrayLike,
+    *,
+    model: str | ModelFunc = "lineperiodic",
+    window: tuple[float | None, float | None] | None = None,
+    tol: float = _DEFAULT_TOL,
+    names: Sequence[str] | None = None,
+    kappa_bounds: tuple[float, float] = (-2.5, 0.0),
+) -> VelocityEstimateMLE:
+    """Estimate the secular velocity with an honest colored-noise MLE σ_v.
+
+    Equation (per component, over the windowed samples):
+        ``(p̂, σ̂_w, β̂, κ̂) = argmax  ln L(p, σ_w, β, κ)``,
+        ``y = A(t−t_ref)·p + ε``,  ``ε ~ N(0, C(σ_w, β, κ))``,
+        ``C = σ_w²·I + β²·ΔT^(−κ/2)·(T Tᵀ)``  →
+        ``v̂ = p̂₁`` [L/yr],  ``σ_v = √(Ĉ_p)₁₁``,
+        ``Ĉ_p = ŝ²·(AᵀC₀⁻¹A)⁻¹`` (colored-noise GLS covariance)
+
+    solved by :func:`gps_analysis.noise.estimate_noise_mle` — the same
+    white + power-law covariance family as :mod:`gps_analysis.transient`,
+    factorized exactly in O(n²) by the generalized-Schur machinery. This
+    is the honest-σ upgrade of :func:`estimate_velocity`: the rate v̂ is
+    essentially the WLS/GLS estimate, but σ_v is inflated by the fitted
+    temporal correlation (typically several × the white-noise formal
+    error for flicker-dominated GNSS series). Result carries
+    ``method="mle"``; horizontal magnitude/azimuth and their delta-method
+    σ are derived exactly as in :func:`estimate_velocity` when
+    ``names`` labels a unique north/east pair.
+
+    Symbols → args:
+        - ``tᵢ`` → ``t``: epochs, fractional years (``yearf``) [yr] —
+          **time-ordered, uniformly (daily) sampled** (the covariance lag
+          is the sample index; :mod:`gps_analysis.noise` caveat)
+        - ``yᵢ`` → ``y``: observations, component-major [L]
+        - ``A``  → ``model``: linear-in-parameters trajectory design with
+          ``params[1]`` = secular rate — ``"lineperiodic"`` (default) or
+          ``"linear"`` (or a callable registered in ``_LINEAR_DESIGNS``)
+        - ``t_ref`` → internal: mean windowed epoch (returned) [yr]
+        - ``κ`` search range → ``kappa_bounds``: (κ_min, κ_max) ⊂ [−3, 0]
+
+    Args:
+        t: Epochs, shape (N,) [yr]. Finite; sort ascending.
+        y: Observations, shape (N,) or (C, N) [L]. Finite.
+        model: A **linear-in-parameters** named model
+            (``"lineperiodic"``/``"linear"``) or a callable registered in
+            :data:`gps_analysis.fitting._LINEAR_DESIGNS`. Nonlinear models
+            are rejected — the closed-form GLS profile of the MLE needs a
+            fixed design matrix.
+        window: Optional (start, end) window [yr]; either bound ``None``
+            (open). ``None`` uses the whole series.
+        tol: Window boundary tolerance δ [yr] (legacy 0.001 yr default).
+        names: Optional per-component labels (e.g. ``("north", "east",
+            "up")``) — stored, and used to locate the horizontal pair.
+        kappa_bounds: Spectral-index search bounds forwarded to
+            :func:`gps_analysis.noise.estimate_noise_mle`; default
+            (−2.5, 0) spans white … beyond random walk.
+
+    Returns:
+        :class:`VelocityEstimateMLE` — per-component rate v̂ and honest
+        colored-noise σ_v, the WLS trajectory fits (for reference — the
+        ``fits`` carry the white-noise covariance and the same rate), the
+        per-component :class:`gps_analysis.noise.NoiseModel`, window
+        provenance, ``method="mle"``, and horizontal products.
+
+    Raises:
+        ValueError: On non-finite ``t``, shape mismatches, a nonlinear or
+            unknown model, a model without a rate parameter, a window with
+            too few samples for the trajectory + noise parameters, or a
+            rank-deficient design / noise-free series (propagated from the
+            MLE).
+
+    Reference:
+        Colored-noise rate uncertainty: Williams 2003, J. Geodesy 76;
+        MLE practice and typical flicker-driven inflation: Zhang et al.
+        1997, JGR 102(B8); Williams et al. 2004, JGR 109, B03412;
+        Langbein 2004, JGR 109, B04406; fast MLE: Bos et al. 2013,
+        J. Geodesy 87. Seasonal co-estimation on short windows: Blewitt &
+        Lavallée 2002, JGR 107(B7). The estimator itself:
+        :func:`gps_analysis.noise.estimate_noise_mle`.
+
+    Numerical notes:
+        Epochs are re-referenced to t_ref (mean windowed epoch) before
+        building the design, exactly as :func:`estimate_velocity`; the
+        rate and σ_v are translation-invariant so ``params[1]`` /
+        ``√Ĉ_p[1,1]`` are read directly. Each component is fitted
+        independently (a 2-D (φ, κ) search over an exact O(n²·P) profile
+        likelihood — coarse grid + Nelder–Mead polish). For provenance,
+        the reference white-noise WLS ``fits`` are also computed (cheap
+        closed form) so callers can compare formal vs honest σ side by
+        side. A κ̂ landing on a ``kappa_bounds`` edge is a diagnostic
+        (widen the bounds) — surfaced via the returned ``noise``.
+    """
+    model_func = _resolve_model(model)
+    n_params = _rate_param_count(model_func)
+    design = _LINEAR_DESIGNS.get(model_func)
+    if design is None:
+        raise ValueError(
+            "estimate_velocity_mle requires a linear-in-parameters model "
+            "(a fixed design matrix); got a nonlinear/unregistered model - "
+            "use 'lineperiodic', 'linear', or another _LINEAR_DESIGNS model"
+        )
+
+    tt = np.asarray(t, dtype=np.float64)
+    if tt.ndim != 1:
+        raise ValueError(f"t must be 1-D, got shape {tt.shape}")
+    if not np.all(np.isfinite(tt)):
+        raise ValueError("t must be finite")
+    yy, was_1d = _components_2d(y, "y")
+    if yy.shape[1] != tt.size:
+        raise ValueError(
+            f"t must be 1-D with y.shape[-1] = {yy.shape[1]}, got shape {tt.shape}"
+        )
+    if names is not None and len(names) != yy.shape[0]:
+        raise ValueError(f"names has {len(names)} entries for {yy.shape[0]} components")
+
+    if window is None:
+        mask = np.ones(tt.shape, dtype=np.bool_)
+    else:
+        mask = slice_window(tt, window[0], window[1], tol=tol)
+    n_obs = int(np.count_nonzero(mask))
+    # Need P trajectory params + (kappa, phi, scale) degrees of freedom.
+    if n_obs < n_params + 3:
+        raise ValueError(
+            f"window has {n_obs} samples for {n_params} trajectory parameters "
+            f"plus (kappa, phi, scale) - need at least {n_params + 3}"
+        )
+
+    t_win = tt[mask]
+    t_ref = float(np.mean(t_win))
+    a_full = design.build(t_win)
+    if design.trend_column is not None:
+        a_full[:, design.trend_column] = t_win - t_ref
+
+    fits: list[TrajectoryParams] = []
+    noise_models: list[NoiseModel] = []
+    rates_list: list[float] = []
+    sigmas_list: list[float] = []
+    for i in range(yy.shape[0]):
+        y_i = yy[i][mask]
+        mle = estimate_noise_mle(a_full, y_i, kappa_bounds=kappa_bounds)
+        noise_models.append(mle.noise)
+        rates_list.append(float(mle.params[_RATE_INDEX]))
+        sigmas_list.append(float(np.sqrt(mle.covariance[_RATE_INDEX, _RATE_INDEX])))
+        # Reference white-noise WLS fit (provenance: formal vs honest sigma).
+        wls_params, wls_cov = _wls_solve(a_full, y_i, None, absolute_sigma=False)
+        fits.append(
+            TrajectoryParams(
+                params=wls_params,
+                covariance=wls_cov,
+                component=None if names is None else names[i],
+            )
+        )
+
+    rates = np.asarray(rates_list, dtype=np.float64)
+    sigmas = np.asarray(sigmas_list, dtype=np.float64)
+    magnitude, azimuth, magnitude_sigma, azimuth_sigma = _horizontal_products(
+        names, rates, sigmas
+    )
+
+    return VelocityEstimateMLE(
+        rates=rates,
+        sigmas=sigmas,
+        fits=tuple(fits),
+        components=None if names is None else tuple(names),
+        n_obs=n_obs,
+        t_ref=t_ref,
+        span=(float(np.min(t_win)), float(np.max(t_win))),
+        method=_METHOD_MLE,
+        magnitude=magnitude,
+        azimuth=azimuth,
+        magnitude_sigma=magnitude_sigma,
+        azimuth_sigma=azimuth_sigma,
+        noise=tuple(noise_models),
     )
 
 
@@ -866,52 +1131,105 @@ def detectability_floor(
     window_years: float,
     *,
     confidence: float = 0.95,
+    dt_years: float = _DELTA_T_YR,
+    single_window: bool = False,
 ) -> float:
-    """Per-station velocity-change alarm threshold — **stub** (Phase 2).
+    """Minimum detectable velocity change under a colored-noise model.
 
-    Planned quantity: the smallest velocity change |Δv| between adjacent
-    analysis windows of length T that is detectable at the given
-    confidence against the station's noise,
+    Equation (Williams 2003, J. Geodesy 76, §5; two-sided z-test on the
+    difference of two window rate estimates):
 
-        ``Δv_min = z_{1−α/2} · √2 · σ_v(T; σ_w, A, κ)``
+        ``Δv_min = z_{1−α/2} · √2 · σ_v(T; σ_w, β, κ)``
 
-    where σ_v(T) is the **colored-noise** rate uncertainty of a window of
-    length T under a white (σ_w) + power-law (amplitude A, spectral index
-    κ) noise model — Williams 2003 (J. Geodesy 76, eqs. 23–30: σ_v² ∝ T⁻³
-    for white noise, ∝ T⁻² for flicker, ∝ T⁻¹ for random walk), and √2
-    accounts for differencing two independent window estimates.
+    — the smallest velocity change |Δv| between two adjacent, independent
+    analysis windows of length T detectable at confidence 1 − α, where
+    σ_v(T; σ_w, β, κ) = :func:`gps_analysis.noise.powerlaw_rate_sigma`
+    is the exact finite-n **colored-noise** GLS rate uncertainty of a
+    straight-line fit under white (σ_w) + power-law (amplitude β, spectral
+    index κ) noise. The √2 propagates the two independent window rate
+    errors of the difference Δv = v₂ − v₁ (σ_Δv = √2·σ_v for equal-length
+    windows); set ``single_window=True`` to drop it and get the detection
+    threshold on a *single* rate (Δv_min = z·σ_v), i.e. the smallest rate
+    distinguishable from zero. Williams 2003 (eqs. 23–30) gives the span
+    scalings σ_v² ∝ T^(−3−κ): T⁻³ white (κ=0), T⁻² flicker (κ=−1), T⁻¹
+    random walk (κ=−2) — reproduced by the exact σ_v used here.
 
-    The per-station noise parameters (σ_w, A, κ) come from the GBIS4TS
-    MLE/MCMC noise model (Yang, Sigmundsson & Geirsson 2023, GRL
-    2023GL103432) — analysis-lane task H1 / plan §10.7, currently
-    backburnered. Implementing the floor with the optimistic WLS
-    white-noise σ_v would defeat its purpose (alarms would fire on noise),
-    so this function is deliberately **not** implemented until the noise
-    model lands; results produced meanwhile carry ``method="wls"`` and
-    the Williams-2003 caveat.
+    Symbols → args:
+        - ``σ_w`` → ``sigma_white``: white-noise amplitude [L], ≥ 0
+        - ``β``  → ``amplitude_powerlaw``: power-law amplitude
+          [L·yr^(−κ/4)] (Williams 2003 normalization), ≥ 0; not both 0
+        - ``κ``  → ``spectral_index``: spectral index ∈ [−3, 0]
+          [dimensionless]
+        - ``T``  → ``window_years``: analysis-window length [yr], such
+          that ``T/ΔT + 1 ≥ 3`` epochs
+        - ``ΔT`` → ``dt_years``: sampling interval [yr], > 0 (default
+          1/365, the daily convention of :mod:`gps_analysis.transient`)
+        - ``z_{1−α/2}`` → from ``confidence`` = 1 − α (standard-normal
+          two-sided quantile)
 
     Args:
         sigma_white: White-noise amplitude σ_w [L].
-        amplitude_powerlaw: Power-law noise amplitude A [L·yr^(−κ/4)]
-            (Williams 2003 normalization).
-        spectral_index: Spectral index κ (0 white, −1 flicker, −2 random
-            walk) [dimensionless].
+        amplitude_powerlaw: Power-law amplitude β [L·yr^(−κ/4)].
+        spectral_index: Spectral index κ [dimensionless].
         window_years: Analysis-window length T [yr].
-        confidence: Two-sided detection confidence 1 − α [dimensionless].
+        confidence: Two-sided detection confidence 1 − α ∈ (0, 1)
+            [dimensionless]; 0.95 ⇒ z ≈ 1.95996.
+        dt_years: Sampling interval ΔT [yr]; default daily (1/365).
+        single_window: Drop the √2 (single-rate detection vs zero) when
+            True; default False (velocity *change* between two windows).
 
     Returns:
-        Detectable velocity change Δv_min [L/yr] — once implemented.
+        Detectable velocity change Δv_min [L/yr] (float, > 0). The noise
+        triple (σ_w, β, κ) comes from a colored-noise estimate —
+        :func:`estimate_velocity_mle` (``method="mle"``) or the GBIS4TS
+        posterior (``method="gbis"``); passing the optimistic WLS
+        white-noise σ here would under-report the floor (alarms on noise).
 
     Raises:
-        NotImplementedError: Always, until the GBIS4TS colored-noise
-            model (task H1) provides σ_v(T; σ_w, A, κ).
+        ValueError: On negative amplitudes / both zero, κ outside [−3, 0],
+            a window shorter than 3 epochs, ``dt_years ≤ 0``, or
+            ``confidence`` outside (0, 1).
 
     Reference:
-        Williams 2003, J. Geodesy 76, eqs. 23–30; Yang, Sigmundsson &
-        Geirsson 2023, GRL 2023GL103432; plan §10.7 (detectability floor).
+        Williams 2003, J. Geodesy 76, §5 and eqs. 23–30 (rate uncertainty
+        and its span scaling); Williams et al. 2004, JGR 109, B03412
+        (typical colored-noise levels); Langbein 2004, JGR 109, B04406
+        (detection implications of the noise model); Bos et al. 2013,
+        J. Geodesy 87 (the GLS σ_v inside Hector). Noise parameters from
+        the MLE (:func:`gps_analysis.noise.estimate_noise_mle`) or the
+        GBIS4TS posterior (Yang, Sigmundsson & Geirsson 2023, GRL
+        2023GL103432). Plan §9b / §10.7 (detectability floor).
+
+    Numerical notes:
+        σ_v is the exact finite-n GLS value (:func:`~gps_analysis.noise.
+        powerlaw_rate_sigma`), not the large-n asymptotic, so short
+        windows are handled honestly. The window is discretized to
+        ``n = round(T/ΔT) + 1`` uniformly spaced epochs (the covariance
+        lag is the sample index — uniform-sampling assumption of the
+        noise model). z is ``scipy.stats.norm.ppf((1+confidence)/2)``.
+        Assumes a pure two-parameter linear fit per window; co-estimated
+        seasonal terms inflate σ_v (hence Δv_min) further on sub-annual
+        to few-year windows (Blewitt & Lavallée 2002).
     """
-    raise NotImplementedError(
-        "detectability_floor requires the GBIS4TS colored-noise model "
-        "(analysis-lane task H1, plan §10.7); WLS velocities carry "
-        "method='wls' and Williams-2003-optimistic sigmas until then"
+    if not 0.0 < confidence < 1.0:
+        raise ValueError(f"confidence must be in (0, 1), got {confidence}")
+    if window_years <= 0.0:
+        raise ValueError(f"window_years must be > 0, got {window_years}")
+    if dt_years <= 0.0:
+        raise ValueError(f"dt_years must be > 0, got {dt_years}")
+    n_epochs = int(round(window_years / dt_years)) + 1
+    if n_epochs < 3:
+        raise ValueError(
+            f"window_years = {window_years} yr is fewer than 3 epochs at "
+            f"dt_years = {dt_years} yr"
+        )
+    sigma_v = powerlaw_rate_sigma(
+        sigma_white,
+        amplitude_powerlaw,
+        spectral_index,
+        n_epochs,
+        dt_years=dt_years,
     )
+    z = float(stats.norm.ppf(0.5 * (1.0 + confidence)))
+    factor = 1.0 if single_window else math.sqrt(2.0)
+    return factor * z * sigma_v
