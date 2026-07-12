@@ -28,6 +28,11 @@ Consolidates `~/work/projects/gps_data_analyses` (`svartsengi-model`,
 — fill surfaces in place; don't rename modules without updating plan §10.2
 (`preprocess` added by refactor-B slice 2 — flag to plan §10.2 at next plan edit).
 All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDARDS.md) (binding).
+Shared internal: `_mcmc` — the ONE GBIS Metropolis/annealing/adaptive-step core
+(Bagnardi & Hooper 2018 §3; `T_SCHEDULE`, `sensitivity_schedule`, `metropolis`,
+`PriorBounds`/`InversionConfig` homes) — `transient` (via fidelity hooks,
+**bit-parity preserved**, pinned by `tests/test_mcmc.py`) and `deformation`
+(`mogi_invert_bayes`, hook-free) both delegate to it; never re-duplicate the loop.
 
 | Module | Status | Contents |
 |---|---|---|

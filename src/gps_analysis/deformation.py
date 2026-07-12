@@ -19,8 +19,9 @@ Derivation chain
 3. Inversion — :func:`mogi_invert` / :func:`okada_invert` (weighted
    nonlinear least squares, scipy trust-region-reflective, optional robust
    loss; formal covariance from the Jacobian) and :func:`mogi_invert_bayes`
-   (Metropolis MCMC with the GBIS annealing/adaptive-step scheme reused
-   from :mod:`gps_analysis.transient`; Bagnardi & Hooper 2018 §3).
+   (Metropolis MCMC with the GBIS annealing/adaptive-step scheme shared
+   with the transient lane via :mod:`gps_analysis._mcmc`; Bagnardi &
+   Hooper 2018 §3).
 4. Physical products — :func:`pressure_from_volume` /
    :func:`volume_from_pressure` (ΔV ↔ ΔP through the spherical-cavity
    relation ΔV = π a³ ΔP / μ; Segall 2010 §7.2), plus the volume-rate unit
@@ -61,13 +62,8 @@ import numpy as np
 from numpy.typing import ArrayLike
 from scipy.optimize import least_squares
 
+from gps_analysis._mcmc import InversionConfig, PriorBounds, metropolis
 from gps_analysis.models import FloatArray
-from gps_analysis.transient import (
-    _T_SCHEDULE,
-    InversionConfig,
-    PriorBounds,
-    _sensitivity_schedule,
-)
 
 __all__ = [
     "MogiSource",
@@ -1431,158 +1427,6 @@ class MogiPosterior:
     p_opt: float
 
 
-def _gbis_metropolis(
-    log_post: Callable[[FloatArray], float],
-    bounds: PriorBounds,
-    config: InversionConfig,
-) -> tuple[FloatArray, FloatArray, FloatArray, float]:
-    """Metropolis–Hastings sampler with the GBIS annealing/step adaptation.
-
-    The generic core of the GBIS4TS sampler in
-    :mod:`gps_analysis.transient` (``runInversion_ts.m``), reused here for
-    arbitrary forward models — same scheme, none of the BPD-specific quirks
-    (no inert hyperparameter slot, no break-point step floor, no BPD2
-    ordering guard):
-
-    - **Accept rule**: ``exp((lnP − lnP_prev)/T) ≥ U(0, 1)``.
-    - **Annealing**: ``T = 10^{3, 2.8, …, 0}`` (module ``_T_SCHEDULE``),
-      advanced every ``config.t_runs`` kept iterations, chain restarting
-      from the running optimum on each advance.
-    - **Adaptive steps**: on the ``_sensitivity_schedule`` counts each
-      parameter is perturbed alone by ±step/2; its acceptance probability
-      is compared to a target ``0.5^{1/n}`` retuned toward
-      ``config.rejection_target``; steps shrink/grow by ``exp(∓2Δ/·)`` and
-      cap at the prior range. Sensitivity trials are never kept.
-    - **Bounds**: uniform priors; proposals reflect at both limits.
-
-    Symbols → args:
-        - ``lnP`` → ``log_post``: callable m ↦ log-posterior (flat priors ⇒
-          log-likelihood up to a constant)
-        - ``bounds``: :class:`~gps_analysis.transient.PriorBounds`
-          (start/lower/upper/step, length n)
-        - ``config``: :class:`~gps_analysis.transient.InversionConfig`
-          (``breakpoint_step_floor`` and ``n_save`` are inert here)
-
-    Returns:
-        ``(m_keep (n, n_runs), p_keep (n_runs,), optimal (n,), p_opt)``.
-
-    Reference:
-        Bagnardi & Hooper 2018, G³ 19, 2194–2211
-        (doi:10.1029/2018GC007585), §3.2–3.3 (sampler, adaptive steps,
-        annealed burn-in); implementation mirrored from the verified
-        GBIS4TS port (``gps_analysis.transient.run_inversion``).
-
-    Numerical notes:
-        ``exp`` argument capped at 700 against float64 overflow; results
-        reproducible only for fixed ``config.seed``. MCMC convergence is
-        the caller's to assess (chain length vs. posterior complexity).
-    """
-    m = bounds.start.copy()
-    lower = bounds.lower.copy()
-    upper = bounds.upper.copy()
-    step = bounds.step.copy()
-    if bool(np.any(m > upper)) or bool(np.any(m < lower)):
-        bad = np.nonzero((m > upper) | (m < lower))[0]
-        raise ValueError(f"starting model out of bounds at indices {bad.tolist()}")
-
-    n_model = m.size
-    prm_range = upper - lower
-    prob_target = 0.5 ** (1.0 / n_model)
-    prob_sens = np.zeros(n_model, dtype=np.float64)
-    sens_schedule = _sensitivity_schedule(config.n_runs)
-    rng = np.random.default_rng(config.seed)
-
-    m_keep = np.zeros((n_model, config.n_runs), dtype=np.float64)
-    p_keep = np.zeros(config.n_runs, dtype=np.float64)
-
-    i_keep = 0
-    i_reject = 0
-    i_keep_save = 0
-    i_reject_save = 0
-    p_opt = -1.0e99
-    p_prev = -np.inf
-    optimal = m.copy()
-    i_temp = 0
-    n_temp = _T_SCHEDULE.size
-    temperature = float(_T_SCHEDULE[0])
-    sensitivity_test = 0
-    trial = m.copy()
-
-    while i_keep < config.n_runs:
-        if i_keep % config.t_runs == 0 and i_temp < n_temp:
-            temperature = float(_T_SCHEDULE[i_temp])
-            i_temp += 1
-            if i_keep > 0:
-                trial = optimal.copy()
-        if i_keep in sens_schedule:
-            sensitivity_test = 1
-
-        log_p = log_post(trial)
-        if i_keep > 0:
-            p_ratio = math.exp(min((log_p - p_prev) / temperature, 700.0))
-        else:
-            p_ratio = 1.0
-
-        if sensitivity_test > 1:
-            idx = sensitivity_test - 2
-            if idx < n_model:
-                prob_sens[idx] = p_ratio
-            if sensitivity_test > n_model:
-                if i_keep_save > 0:
-                    rejection_ratio = (i_reject - i_reject_save) / (
-                        i_keep - i_keep_save
-                    )
-                    prob_target = max(
-                        prob_target * rejection_ratio / config.rejection_target,
-                        1.0e-6,
-                    )
-                sensitivity_test = 0
-                ps = prob_sens.copy()
-                above = ps > 1.0
-                ps[above] = 1.0 / ps[above]
-                p_diff = prob_target - ps
-                shrink = p_diff > 0.0
-                step[shrink] *= np.exp(-p_diff[shrink] / prob_target * 2.0)
-                grow = p_diff < 0.0
-                step[grow] *= np.exp(-p_diff[grow] / (1.0 - prob_target) * 2.0)
-                too_big = step > prm_range
-                step[too_big] = prm_range[too_big]
-                i_keep_save = i_keep
-                i_reject_save = i_reject
-        else:
-            i_keep += 1
-            if p_ratio >= rng.random():
-                m = trial.copy()
-                m_keep[:, i_keep - 1] = m
-                p_keep[i_keep - 1] = log_p
-                p_prev = log_p
-                if log_p > p_opt:
-                    optimal = m.copy()
-                    p_opt = log_p
-            else:
-                i_reject += 1
-                m_keep[:, i_keep - 1] = m_keep[:, i_keep - 2]
-                p_keep[i_keep - 1] = p_keep[i_keep - 2]
-
-        if sensitivity_test > 0:
-            k = sensitivity_test - 1
-            trial = m.copy()
-            if k < n_model:
-                trial[k] += step[k] * float(np.sign(rng.standard_normal())) / 2.0
-                if trial[k] > upper[k]:
-                    trial[k] -= step[k]
-            sensitivity_test += 1
-        else:
-            random_step = step * (rng.random(n_model) - 0.5) * 2.0
-            trial = m + random_step
-            over = trial > upper
-            trial[over] = 2.0 * upper[over] - trial[over]
-            under = trial < lower
-            trial[under] = 2.0 * lower[under] - trial[under]
-
-    return m_keep, p_keep, optimal, p_opt
-
-
 def mogi_invert_bayes(
     e: ArrayLike,
     n: ArrayLike,
@@ -1599,8 +1443,10 @@ def mogi_invert_bayes(
         ``ln P(m | d) = −½ Σᵢ ((dᵢ − Gᵢ(m))/σᵢ)² + const`` (constant
         dropped — only differences enter Metropolis ratios), with
         G = :func:`mogi_forward` over ``m = [x_s, y_s, d, ΔV]``, sampled by
-        :func:`_gbis_metropolis` (annealed adaptive Metropolis; Bagnardi &
-        Hooper 2018 §3).
+        the shared GBIS sampler :func:`gps_analysis._mcmc.metropolis`
+        (annealed adaptive Metropolis; Bagnardi & Hooper 2018 §3) — the same
+        engine as the transient lane, hook-free here (no hyperparameter
+        slot, no break-point step floor, no ordering guard).
 
     Symbols → args:
         - ``dᵢ`` → ``obs``: ``(3, N)`` displacements [L], rows (east, north,
@@ -1657,10 +1503,10 @@ def mogi_invert_bayes(
         r = (dflat - model.ravel()) / sflat
         return -0.5 * float(r @ r)
 
-    m_keep, p_keep, optimal, p_opt = _gbis_metropolis(log_post, bounds, config)
+    result = metropolis(log_post, bounds, config)
     return MogiPosterior(
-        m_keep=m_keep,
-        p_keep=p_keep,
-        optimal=MogiSource.from_array(optimal),
-        p_opt=p_opt,
+        m_keep=result.m_keep,
+        p_keep=result.p_keep,
+        optimal=MogiSource.from_array(result.optimal),
+        p_opt=result.p_opt,
     )

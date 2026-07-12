@@ -51,7 +51,13 @@ originating ``.m`` file; ``reference/gbis4ts/SOURCE_MAP.md`` pins the map):
    schedule ``T = 10^{3, 2.8, …, 0}`` (1000 iterations each), with periodic
    single-parameter sensitivity sweeps that retune step sizes toward a 77 %
    rejection rate, uniform priors enforced by boundary reflection, and a
-   one-day floor on the break-point step.
+   one-day floor on the break-point step. The generic loop (accept rule,
+   annealing, adaptive steps, reflection) lives in the shared
+   :mod:`gps_analysis._mcmc` module (Bagnardi & Hooper 2018 §3.2–3.3, also
+   driving the deformation lane); the BPD quirks below enter through its
+   hooks, and the composition is **bit-parity-preserving** — same seed →
+   the identical chain of the pre-consolidation implementation
+   (RNG call sequence and float64 op order pinned by test).
 6. **Priors / entry point** — :func:`prepare_bounds` builds the uniform search
    ranges of ``prepareModel_ts.m`` (= Yang et al. 2023 SI Table S3) from
    preliminary estimates; :func:`detect_breakpoints` is the one-call
@@ -109,12 +115,15 @@ scheme β = 4 mm/yr^0.25, Δv = −20 mm/yr; reference posterior in SI Table S4)
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import numpy as np
 from numpy.typing import NDArray
 from scipy.linalg import cho_factor, cho_solve
 from scipy.linalg.blas import daxpy, drot
+
+from gps_analysis._mcmc import InversionConfig, PriorBounds, metropolis
 
 __all__ = [
     "BPD1Params",
@@ -189,12 +198,6 @@ _HYPER_START = 0.0
 _HYPER_STEP = 1.0e-3
 _HYPER_LOWER = -0.5
 _HYPER_UPPER = 0.5
-
-#: Simulated-annealing cooling schedule 10.^(3:-0.2:0) (GBISrun_ts.m l.125).
-_T_SCHEDULE: NDArray[np.float64] = 10.0 ** np.linspace(3.0, 0.0, 16)
-
-#: Safety cap on the BPD2 trial-regeneration loop (upstream can spin forever).
-_MAX_TRIAL_REGEN = 100_000
 
 #: Saturation-guard margin as a fraction of the intercept prior range: an
 #: intercept optimum within 5 % of either bound (0.5 mm for the fixed ±5 mm
@@ -344,75 +347,14 @@ class BPD2SeasonalParams:
         )
 
 
-@dataclass(frozen=True)
-class PriorBounds:
-    """Uniform search bounds + MCMC step per parameter (``prepareModel_ts.m``).
-
-    Order must match the model's parameter vector. Table S3 of Yang et al. 2023
-    SI is the reference for the ranges (see :func:`prepare_bounds`, which builds
-    them from preliminary estimates). Vectors may be of length ``n_func`` (6 for
-    BPD1, 8 for BPD2) or ``n_func + 1`` when the inert hyperparameter slot is
-    already appended; :func:`run_inversion` appends it if missing.
-
-    Numerical notes:
-        Arrays are coerced to float64 1-D of equal length at construction; the
-        dataclass is frozen but ndarrays are not immutable — treat as read-only.
-        Steps inherit the sign of the preliminary rate (upstream does not take
-        absolute values); the sampler only uses them symmetrically, so a
-        negative step is equivalent to its magnitude.
-    """
-
-    start: NDArray[np.float64]
-    lower: NDArray[np.float64]
-    upper: NDArray[np.float64]
-    step: NDArray[np.float64]
-
-    def __post_init__(self) -> None:
-        arrays = {
-            name: np.asarray(getattr(self, name), dtype=np.float64)
-            for name in ("start", "lower", "upper", "step")
-        }
-        n = arrays["start"].size
-        for name, arr in arrays.items():
-            if arr.ndim != 1:
-                raise ValueError(f"{name} must be 1-D, got shape {arr.shape}")
-            if arr.size != n:
-                raise ValueError(
-                    f"{name} has {arr.size} entries, expected {n} (same as start)"
-                )
-            object.__setattr__(self, name, arr)
-
-
-@dataclass(frozen=True)
-class InversionConfig:
-    """Sampler schedule (``runInversion_ts.m`` / ``GBISrun_ts.m``).
-
-    Defaults mirror the MATLAB: annealing ``10**arange(3, -0.2, -0.2)``,
-    ``t_runs=1000`` per temperature, breakpoint step floor ``0.0027`` yr (~1 day),
-    sensitivity test tuned to a 77% rejection rate.
-
-    Attributes:
-        n_runs: Number of kept MCMC iterations (``invpar.nRuns``).
-        n_save: Upstream save/print block size (``invpar.nSave``) — accepted
-            for parity, unused here (the port neither prints nor writes).
-        t_runs: Kept iterations per annealing temperature (``invpar.TRuns``);
-            the schedule has 16 temperatures, so annealing spans
-            ``16*t_runs`` iterations before T = 1.
-        rejection_target: Target rejection rate of the adaptive-step retune
-            (``runInversion_ts.m`` l.150 hard-codes 0.77).
-        breakpoint_step_floor: Minimum |random step| for the break-point
-            parameter [yr] (l.244; 0.0027 yr ≈ 1 day). Also spaces the BPD2
-            trend changes at ``20×`` this value (l.264 — see the fidelity flag).
-        seed: Seed for :class:`numpy.random.Generator`; ``None`` draws entropy
-            from the OS (non-reproducible).
-    """
-
-    n_runs: int
-    n_save: int = 1000
-    t_runs: int = 1000
-    rejection_target: float = 0.77
-    breakpoint_step_floor: float = 0.0027
-    seed: int | None = None
+# PriorBounds and InversionConfig live in the shared sampler module
+# (gps_analysis._mcmc) and are re-exported here unchanged: for the GBIS4TS
+# lane, PriorBounds vectors follow the model's parameter order (see
+# :func:`prepare_bounds`, Yang et al. 2023 SI Table S3) and may be of length
+# ``n_func`` (6 BPD1 / 8 BPD2 / 10 BPD1S / 12 BPD2S) or ``n_func + 1`` with
+# the inert hyperparameter slot appended (:func:`run_inversion` appends it
+# if missing); InversionConfig.breakpoint_step_floor also spaces the BPD2
+# trend changes at 20× its value (runInversion_ts.m l.264 — fidelity flag).
 
 
 @dataclass(frozen=True)
@@ -1139,19 +1081,6 @@ def prepare_bounds(start: NDArray[np.float64], model: str = "BPD1") -> PriorBoun
     )
 
 
-def _sensitivity_schedule(n_runs: int) -> frozenset[int]:
-    """Kept-iteration counts that trigger a sensitivity sweep (GBISrun_ts.m l.120).
-
-    MATLAB: ``[1:100:10000, 11000:1000:30000, 40000:10000:nRuns]``.
-    """
-    parts = (
-        np.arange(1, 10001, 100),
-        np.arange(11000, 30001, 1000),
-        np.arange(40000, n_runs + 1, 10000),
-    )
-    return frozenset(int(v) for arr in parts for v in arr)
-
-
 def _start_baseline(y: NDArray[np.float64], n_baseline: int) -> float:
     """Start-of-series displacement baseline ``r = median(y₀ … y_{k−1})``.
 
@@ -1334,52 +1263,10 @@ def run_inversion(
             f"bounds must have {n_func} or {n_func + 1} entries for {model}, "
             f"got {bounds.start.size}"
         )
-    if bool(np.any(m > upper)) or bool(np.any(m < lower)):
-        bad = np.nonzero((m > upper) | (m < lower))[0]
-        raise ValueError(f"starting model out of bounds at indices {bad.tolist()}")
-
-    n_model = m.size
-    n_obs = tt.size
-    prm_range = upper - lower  # model.range
-    prob_target = 0.5 ** (1.0 / n_model)
-    prob_sens = np.zeros(n_model, dtype=np.float64)
-    sens_schedule = _sensitivity_schedule(config.n_runs)
     bp_floor = config.breakpoint_step_floor
 
-    rng = np.random.default_rng(config.seed)
-
-    m_keep = np.zeros((n_model, config.n_runs), dtype=np.float64)
-    p_keep = np.zeros(config.n_runs, dtype=np.float64)
-
-    i_keep = 0
-    i_reject = 0
-    i_keep_save = 0
-    i_reject_save = 0
-    p_opt = -1.0e99
-    p_prev = -np.inf  # set on first (always accepted) iteration
-    hyper_prev = 1.0  # idem
-    optimal_full = m.copy()
-    func_opt = m[:n_func].copy()
-    i_temp = 0
-    n_temp = _T_SCHEDULE.size
-    temperature = _T_SCHEDULE[0]
-    sensitivity_test = 0
-    set_hyper = False
-    trial = m.copy()
-
-    while i_keep < config.n_runs:
-        # -- Annealing schedule (runInversion_ts.m l.74-88) -------------------
-        if i_keep % config.t_runs == 0 and i_temp < n_temp:
-            temperature = float(_T_SCHEDULE[i_temp])
-            i_temp += 1
-            if i_keep > 0:
-                trial = optimal_full.copy()  # restart from current optimum
-            set_hyper = temperature == 1.0
-
-        if i_keep in sens_schedule:
-            sensitivity_test = 1
-
-        # -- Forward model + colored-noise likelihood (l.95-132) --------------
+    # -- Log-posterior: forward model + colored-noise likelihood (l.95-132) ---
+    def _log_post(trial: NDArray[np.float64]) -> float:
         m_func = trial[:n_func]
         u = _trajectory(m_func, tt, n_breaks)
         if seasonal_d is not None:
@@ -1387,108 +1274,56 @@ def run_inversion(
             # orthogonal to the covariance (deterministic-mean term only).
             u = u + seasonal_d @ m_func[n_traj : n_traj + _N_SEASONAL]
         residual = yy - u
-        if set_hyper:
-            hyper_prev = 1.0  # l.121: hyperparameter pinned to 1 at T = 1
-            trial[-1] = 0.0  # log10(1)
-            set_hyper = False
-        hyper_param = 1.0
         # Exact O(n²) evaluation of ln P under C(σ_w, κ, β) — never forms C
-        # (generalized Schur on the displacement structure; task H3).
-        log_p = _log_likelihood_fast(
+        # (generalized Schur on the displacement structure; task H3). The
+        # GBIS hyperparameter prefactor (hyper_prev/hyper)^(n/2) of l.132 is
+        # identically 1 (hyper fixed to 1 upstream) and therefore absent.
+        return _log_likelihood_fast(
             residual, wn_amp, float(trial[-3]), float(trial[-2])
         )
 
-        if i_keep > 0:
-            # (hyper_prev/hyper_param)^(n/2) ≡ 1; exp capped against overflow.
-            p_ratio = (hyper_prev / hyper_param) ** (n_obs / 2.0) * math.exp(
-                min((log_p - p_prev) / temperature, 700.0)
-            )
-        else:
-            p_ratio = 1.0  # first iteration always kept (l.140)
+    # -- BPD-specific sampler hooks (fidelity quirks; see module docstring) ---
+    def _floor_break_step(random_step: NDArray[np.float64]) -> None:
+        # One-day floor on the break-point step (parameter 4 only; l.244).
+        if abs(random_step[3]) < bp_floor:
+            random_step[3] = bp_floor * float(np.sign(random_step[3]))
 
-        # -- Sensitivity bookkeeping / accept-reject (l.145-225) --------------
-        if sensitivity_test > 1:
-            idx = sensitivity_test - 2  # parameter whose perturbation this was
-            if idx < n_model:
-                # (Beyond n_model MATLAB grows probSens and later crashes on
-                # the step update — the BPD2 regen loop can over-increment.
-                # We drop the overflow entry instead; flagged deviation.)
-                prob_sens[idx] = p_ratio
-            if sensitivity_test > n_model:  # sweep complete: retune steps
-                if i_keep_save > 0:
-                    rejection_ratio = (i_reject - i_reject_save) / (
-                        i_keep - i_keep_save
-                    )
-                    prob_target = max(
-                        prob_target * rejection_ratio / config.rejection_target,
-                        1.0e-6,
-                    )
-                sensitivity_test = 0
-                ps = prob_sens.copy()
-                above = ps > 1.0
-                ps[above] = 1.0 / ps[above]
-                p_diff = prob_target - ps
-                shrink = p_diff > 0.0
-                step[shrink] *= np.exp(-p_diff[shrink] / prob_target * 2.0)
-                grow = p_diff < 0.0
-                step[grow] *= np.exp(-p_diff[grow] / (1.0 - prob_target) * 2.0)
-                too_big = step > prm_range
-                step[too_big] = prm_range[too_big]
-                i_keep_save = i_keep
-                i_reject_save = i_reject
-        else:
-            i_keep += 1
-            if p_ratio >= rng.random():
-                m = trial.copy()
-                m_keep[:, i_keep - 1] = m
-                p_keep[i_keep - 1] = log_p
-                p_prev = log_p
-                hyper_prev = hyper_param
-                if log_p > p_opt:
-                    optimal_full = m.copy()
-                    func_opt = m_func.copy()
-                    p_opt = log_p
-            else:
-                i_reject += 1
-                m_keep[:, i_keep - 1] = m_keep[:, i_keep - 2]
-                p_keep[i_keep - 1] = p_keep[i_keep - 2]
+    constrain: Callable[[NDArray[np.float64]], bool] | None = None
+    if n_breaks == 2:
 
-        # -- Next trial (l.229-269) -------------------------------------------
-        for _ in range(_MAX_TRIAL_REGEN):
-            if sensitivity_test > 0:
-                # Single-parameter sensitivity perturbation of ±step/2.
-                k = sensitivity_test - 1
-                trial = m.copy()
-                if k < n_model:
-                    trial[k] += step[k] * float(np.sign(rng.standard_normal())) / 2.0
-                    if trial[k] > upper[k]:  # upper only, as upstream (l.235)
-                        trial[k] -= step[k]
-                sensitivity_test += 1
-            else:
-                random_step = step * (rng.random(n_model) - 0.5) * 2.0
-                # One-day floor on the break-point step (parameter 4 only).
-                if abs(random_step[3]) < bp_floor:
-                    random_step[3] = bp_floor * float(np.sign(random_step[3]))
-                trial = m + random_step
-                over = trial > upper  # reflection at the bounds (l.249-253)
-                trial[over] = 2.0 * upper[over] - trial[over]
-                under = trial < lower
-                trial[under] = 2.0 * lower[under] - trial[under]
-            if n_breaks == 1:
-                break
+        def _bpd2_order_guard(trial: NDArray[np.float64]) -> bool:
             # BPD2 ordering guard — fidelity flag: swaps the TREND CHANGES
             # (indices 2/4 == MATLAB trial(3)/trial(5)), not the break points.
-            # Trajectory params lead the vector, so 2/4 are g1/g2 for BPD2S too.
+            # Trajectory params lead the vector, so 2/4 are g1/g2 for BPD2S
+            # too. False ⇒ regenerate the proposal (l.255-269).
             if trial[2] > trial[4]:
                 trial[2], trial[4] = trial[4], trial[2]
-            if abs(trial[4] - trial[2]) >= bp_floor * 20.0:
-                break
-        else:
-            raise RuntimeError(
-                "BPD2 trial regeneration exceeded the safety cap - the prior "
-                "ranges force |trend_change2 - trend_change1| below the "
-                f"minimum separation {bp_floor * 20.0}"
-            )
+            return bool(abs(trial[4] - trial[2]) >= bp_floor * 20.0)
+
+        constrain = _bpd2_order_guard
+
+    def _pin_hyper(temperature: float, trial: NDArray[np.float64]) -> None:
+        # l.121: the inert hyperparameter is pinned to 1 when T reaches 1;
+        # its chain slot records log10(1) = 0 from that evaluation on.
+        if temperature == 1.0:
+            trial[-1] = 0.0
+
+    result = metropolis(
+        _log_post,
+        PriorBounds(start=m, lower=lower, upper=upper, step=step),
+        config,
+        adjust_step=_floor_break_step,
+        constrain_trial=constrain,
+        on_anneal=_pin_hyper,
+        regen_message=(
+            "BPD2 trial regeneration exceeded the safety cap - the prior "
+            "ranges force |trend_change2 - trend_change1| below the "
+            f"minimum separation {bp_floor * 20.0}"
+        ),
+    )
+    m_keep = result.m_keep
+    p_keep = result.p_keep
+    func_opt = result.optimal[:n_func].copy()
 
     # --- Saturation guard (conditioned frame) --------------------------------
     a_lo, a_hi = float(lower[0]), float(upper[0])
