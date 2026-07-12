@@ -78,6 +78,21 @@ into the estimator — so the reader can follow the flow top-down before reading
 - **Bos et al. 2013** — *Fast error analysis of continuous GNSS observations with
   missing data*, J. Geodesy 87. (Hector's O(N²)-class fast MLE — the comparison
   point for the H3 fast-likelihood path.)
+- **Okada 1985** — *Surface deformation due to shear and tensile faults in a
+  half-space*, BSSA 75(4), 1135–1154, eqs. (24)–(30). (rectangular dislocation —
+  `okada_forward` kernels, patch Green's functions.)
+- **Harris & Segall 1987** — *Detection of a locked zone at depth on the Parkfield,
+  California, segment of the San Andreas fault*, JGR 92(B8), 7945–7962. (regularized
+  distributed-slip inversion from geodesy — smoothing + positivity; `okada_invert_slip`.)
+- **Jónsson et al. 2002** — *Fault slip distribution of the 1999 Mw 7.1 Hector Mine,
+  California, earthquake, estimated from satellite radar and GPS measurements*,
+  BSSA 92(4), 1377–1389. (Laplacian smoothing with zero-slip edges + NNLS —
+  `patch_laplacian`, the non-negative option.)
+- **Aster, Borchers & Thurber 2018** — *Parameter Estimation and Inverse Problems*
+  (3rd ed., Elsevier), ch. 4 (Tikhonov regularization, L-curve), §9.2 (nonlinear-LSQ
+  covariance). (`_solve_regularized`, `_lsq_covariance`.)
+- **Hansen 1992** — *Analysis of discrete ill-posed problems by means of the L-curve*,
+  SIAM Review 34(4), 561–580. (L-curve corner criterion — `lcurve_corner`.)
 - Add domain refs (Hackl et al., Bevis & Brown trajectory model, Hector) as used —
   always with the specific equation/section.
 
