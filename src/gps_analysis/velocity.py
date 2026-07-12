@@ -72,11 +72,13 @@ from scipy import optimize
 from . import models
 from .baseline import slice_window
 from .fitting import (
+    _LINEAR_DESIGNS,
     ModelFunc,
     _components_2d,
     _n_model_params,
     _per_component_p0,
     _per_component_sigma,
+    _wls_solve,
     fit_components,
 )
 from .models import FloatArray, TrajectoryParams
@@ -464,9 +466,10 @@ def estimate_velocity(
         ``Ĉ = (JᵀWJ)⁻¹``, ``W = diag(1/σᵢ²)``  →
         ``v̂ = p̂₁`` [L/yr], ``σ_v = √Ĉ₁₁``
 
-    solved via :func:`gps_analysis.fitting.fit_components`
-    (``scipy.optimize.curve_fit``); the rate v̂ and its 1-σ error come
-    straight from the returned
+    solved via :func:`gps_analysis.fitting.fit_components` (closed-form
+    weighted least squares for the linear-in-parameters named models;
+    ``scipy.optimize.curve_fit`` for nonlinear custom callables); the
+    rate v̂ and its 1-σ error come straight from the returned
     :class:`~gps_analysis.models.TrajectoryParams` — ``params[1]`` /
     ``uncertainties[1]``. When ``names`` contains exactly one ``"north"``
     and one ``"east"`` (case-insensitive), the horizontal magnitude,
@@ -521,8 +524,9 @@ def estimate_velocity(
         ValueError: On non-finite ``t``, shape mismatches, an unknown
             model name, a model without a rate parameter, or a window
             with fewer than P + 1 samples (no degrees of freedom).
-        RuntimeError: Propagated from ``curve_fit`` when the fit does not
-            converge.
+        RuntimeError: Propagated from ``curve_fit`` when a nonlinear
+            custom-model fit does not converge (cannot occur for the
+            named linear-in-parameters models — closed-form solve).
 
     Reference:
         WLS / Gauss–Markov covariance: Aitken 1936, Proc. R. Soc. Edinb.
@@ -539,10 +543,12 @@ def estimate_velocity(
         fitting, decorrelating intercept and rate (absolute ``yearf``
         makes those Jacobian columns nearly collinear); the rate and σ_v
         are invariant under this translation, the returned fit parameters
-        refer to t − t_ref. Ĉ comes from ``curve_fit``'s SVD-based
-        pseudo-inverse of JᵀWJ — no explicit matrix inverse is formed
-        here. σ_v is ``inf`` if the Jacobian is singular at the solution
-        (``curve_fit`` convention).
+        refer to t − t_ref. Ĉ comes from an SVD-based pseudo-inverse of
+        JᵀWJ (``gps_analysis.fitting._wls_solve`` for the linear models,
+        ``curve_fit`` internally for nonlinear ones) — no explicit matrix
+        inverse is formed here. σ_v is ``inf`` if the design/Jacobian is
+        singular at the solution (``curve_fit`` convention, mirrored by
+        the closed-form path).
     """
     model_func = _resolve_model(model)
     n_params = _rate_param_count(model_func)
@@ -664,11 +670,12 @@ def sliding_velocity(
 
     Gap / degeneracy policy (documented behavior, not an error):
         a window is **skipped** — NaN rate and σ, count still recorded —
-        when it holds fewer than ``min_obs`` samples, when the fit does
-        not converge (``curve_fit`` ``RuntimeError``), or when its
-        covariance is not estimable (singular Jacobian,
-        ``OptimizeWarning``). The centre grid stays regular so data gaps
-        appear as NaN runs rather than silently shifting epochs.
+        when it holds fewer than ``min_obs`` samples, when its covariance
+        is not estimable (singular design/Jacobian, ``OptimizeWarning``
+        from either fit path), or — nonlinear custom models only — when
+        the fit does not converge (``curve_fit`` ``RuntimeError``). The
+        centre grid stays regular so data gaps appear as NaN runs rather
+        than silently shifting epochs.
 
     Args:
         t: Epochs, shape (N,) [yr]; finite, need not be sorted.
@@ -716,10 +723,19 @@ def sliding_velocity(
         ancestor).
 
     Numerical notes:
-        Each window is fitted independently in window-local time
-        (t − mean windowed epoch) — the conditioning argument of
-        :func:`estimate_velocity` applies per window. Components are
-        fitted one at a time so a failure in one component NaNs only that
+        For the linear-in-parameters named models the full-series design
+        matrix (incl. the seasonal trig columns, on **absolute** t) is
+        built once and each window solves a row slice of it in closed
+        form (:func:`gps_analysis.fitting._wls_solve`) — no per-window
+        basis rebuild, no iteration. The absolute-t trig basis spans the
+        same column space as the window-local one (a time translation is
+        an exact rotation of the (a,b)/(c,d) seasonal pairs), so v̂ and
+        σ_v are unchanged; only the raw-t trend column is re-centered per
+        window (t − mean windowed epoch), which the rate is invariant
+        under — the conditioning argument of :func:`estimate_velocity`
+        applies per window. Nonlinear custom models keep the per-window
+        iterative fit in window-local time. Components are fitted one at
+        a time so a failure in one component NaNs only that
         (component, window) cell. The window count K uses a 10⁻⁹ yr guard
         against float truncation at exact multiples of ``step_years``.
         NaN σ (skipped) is distinct from ``inf`` σ — the latter cannot
@@ -771,11 +787,44 @@ def sliding_velocity(
     sigma_series = np.full((n_components, n_windows), np.nan, dtype=np.float64)
     counts = np.zeros(n_windows, dtype=np.int64)
 
+    # Linear-in-parameters models: build the full-series design once and
+    # solve each window from row slices of it (finding #5) — the seasonal
+    # trig columns are evaluated a single time, on absolute t (same fitted
+    # rate/σ_v as the window-local-time basis: a time translation only
+    # rotates the intercept/phase coefficients, spanning the identical
+    # column space). Only the raw-t trend column is re-centered per window
+    # for conditioning; the rate and its variance are invariant under that
+    # centering.
+    design = _LINEAR_DESIGNS.get(model_func)
+    basis = None if design is None else design.build(tt)
+
     for k, center in enumerate(centers):
         mask = slice_window(tt, center - half, center + half, tol=tol)
         count = int(np.count_nonzero(mask))
         counts[k] = count
         if count < min_obs:
+            continue
+        if design is not None and basis is not None:
+            a_win = basis[mask]
+            if design.trend_column is not None:
+                a_win = a_win.copy()
+                trend = a_win[:, design.trend_column]
+                a_win[:, design.trend_column] = trend - float(np.mean(trend))
+            for i in range(n_components):
+                s_i = sigma_rows[i]
+                try:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", optimize.OptimizeWarning)
+                        params, cov = _wls_solve(
+                            a_win,
+                            yy[i][mask],
+                            None if s_i is None else s_i[mask],
+                            absolute_sigma,
+                        )
+                except optimize.OptimizeWarning:
+                    continue  # window stays NaN for this component
+                rate_series[i, k] = params[_RATE_INDEX]
+                sigma_series[i, k] = float(np.sqrt(cov[_RATE_INDEX, _RATE_INDEX]))
             continue
         t_local = tt[mask] - float(np.mean(tt[mask]))
         for i in range(n_components):
