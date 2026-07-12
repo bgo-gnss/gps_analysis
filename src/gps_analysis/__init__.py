@@ -63,6 +63,12 @@ from gps_analysis.models import (
     poly2_peak_value,
     poly2_rate,
 )
+from gps_analysis.noise import (
+    NoiseMLEFit,
+    NoiseModel,
+    estimate_noise_mle,
+    powerlaw_rate_sigma,
+)
 from gps_analysis.preprocess import (
     prep_neu_series,
     prep_plot_series,
@@ -85,8 +91,10 @@ from gps_analysis.transient import (
 from gps_analysis.velocity import (
     SlidingVelocity,
     VelocityEstimate,
+    VelocityEstimateMLE,
     detectability_floor,
     estimate_velocity,
+    estimate_velocity_mle,
     horizontal_azimuth,
     horizontal_azimuth_sigma,
     horizontal_magnitude,
@@ -126,14 +134,21 @@ __all__ = [
     "prep_neu_series",
     # velocity
     "VelocityEstimate",
+    "VelocityEstimateMLE",
     "SlidingVelocity",
     "estimate_velocity",
+    "estimate_velocity_mle",
     "sliding_velocity",
     "horizontal_magnitude",
     "horizontal_azimuth",
     "horizontal_magnitude_sigma",
     "horizontal_azimuth_sigma",
     "detectability_floor",
+    # noise (colored-noise MLE)
+    "NoiseModel",
+    "NoiseMLEFit",
+    "estimate_noise_mle",
+    "powerlaw_rate_sigma",
     # transient (GBIS4TS)
     "BPD1Params",
     "BPD2Params",

@@ -8,30 +8,69 @@ noise level (chi-square rescaling: residuals scaled by k scale sigma_v by
 k), horizontal magnitude/azimuth analytic axis + quadrant cases with
 delta-method sigma propagation, sliding-window recovery of piecewise-linear
 segment rates, the min-obs/gap policy (NaN with counts recorded), guard
-validation, purity (no input mutation), and the wls method tag +
-detectability-floor stub.
+validation, purity (no input mutation), the wls method tag, the
+colored-noise MLE velocity (method="mle": noise-param + rate recovery,
+sigma_v inflation vs WLS, white-noise limit) and the detectability floor.
 
 Tolerances: noise-free/linear-in-parameters fits recover values at
 rtol <= 1e-6 (optimizer convergence, not float eps); analytic sigma
 identities at rtol 1e-6; delta-method formulas checked exactly against
-their own closed forms (rtol 1e-12).
+their own closed forms (rtol 1e-12). MLE recovery is a stochastic check
+(fixed-seed synthetics; loose tolerances documented at each assert).
 """
+
+import math
 
 import numpy as np
 import pytest
+from scipy import stats
 
 from gps_analysis.models import linear, lineperiodic
+from gps_analysis.noise import estimate_noise_mle, powerlaw_rate_sigma
+from gps_analysis.transient import _DELTA_T_YR, _powerlaw_psi, noise_covariance
 from gps_analysis.velocity import (
     SlidingVelocity,
     VelocityEstimate,
+    VelocityEstimateMLE,
     detectability_floor,
     estimate_velocity,
+    estimate_velocity_mle,
     horizontal_azimuth,
     horizontal_azimuth_sigma,
     horizontal_magnitude,
     horizontal_magnitude_sigma,
     sliding_velocity,
 )
+
+
+def _synthetic_colored(
+    n: int,
+    sigma_white: float,
+    beta: float,
+    kappa: float,
+    rate: float,
+    seed: int,
+    *,
+    seasonal: bool = True,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Daily series: line (+ seasonal) + white + power-law noise.
+
+    Power-law noise is white noise passed through the fractional-integration
+    filter psi = (1-L)^(kappa/2) (Hosking 1981; the same transform used by
+    transient.noise_covariance), scaled by beta*ΔT^(-kappa/4) so beta matches
+    the Williams-2003 amplitude normalization the estimator reports.
+    """
+    rng = np.random.default_rng(seed)
+    t = 2015.0 + np.arange(n) / 365.0
+    psi = _powerlaw_psi(n, kappa)
+    scale = beta * float(_DELTA_T_YR ** (-kappa / 4.0))
+    colored = scale * np.convolve(psi, rng.standard_normal(n))[:n]
+    tt = np.arange(n) * _DELTA_T_YR
+    y = 3.0 + rate * tt + sigma_white * rng.standard_normal(n) + colored
+    if seasonal:
+        y = y + 4.0 * np.cos(2 * np.pi * t) - 2.0 * np.sin(2 * np.pi * t)
+    return t, y
+
 
 TRUE_LP = np.array([12.0, -3.5, 4.0, -2.0, 1.0, 0.5])
 """offset, rate, cos_annual, sin_annual, cos_semiannual, sin_semiannual."""
@@ -374,7 +413,216 @@ class TestSlidingVelocity:
         np.testing.assert_allclose(fast.sigmas, slow.sigmas, rtol=1e-5)
 
 
+class TestPowerlawRateSigma:
+    """Exact colored-noise GLS rate uncertainty (Williams 2003, eqs. 23-30)."""
+
+    def test_white_matches_closed_form(self) -> None:
+        # White noise (kappa=0, beta=0): sigma_v = sigma_w / sqrt(Sum (t-tbar)^2)
+        # with centered t = ΔT*(i-(n-1)/2), Sum (t-tbar)^2 = ΔT^2*n*(n^2-1)/12.
+        n, sw = 366, 1.3
+        got = powerlaw_rate_sigma(sw, 0.0, 0.0, n)
+        exact = sw / (_DELTA_T_YR * math.sqrt(n * (n**2 - 1) / 12.0))
+        assert got == pytest.approx(exact, rel=1e-10)
+
+    def test_matches_dense_gls_covariance(self) -> None:
+        # Reference parity: the Schur-based sigma_v equals the dense
+        # (A^T C^-1 A)^-1 built from transient.noise_covariance.
+        n, sw, beta, kappa = 200, 1.0, 4.0, -1.0
+        c = noise_covariance(n, sw, kappa, beta)
+        t = _DELTA_T_YR * (np.arange(n) - (n - 1) / 2.0)
+        a = np.column_stack((np.ones_like(t), t))
+        cov = np.linalg.inv(a.T @ np.linalg.solve(c, a))
+        assert powerlaw_rate_sigma(sw, beta, kappa, n) == pytest.approx(
+            math.sqrt(cov[1, 1]), rel=1e-8
+        )
+
+    @pytest.mark.parametrize(
+        ("kappa", "expected_exponent"),
+        [(0.0, -3.0), (-1.0, -2.0), (-2.0, -1.0)],
+    )
+    def test_span_scaling(self, kappa: float, expected_exponent: float) -> None:
+        # Williams 2003: sigma_v^2 ∝ T^(-3-kappa) at fixed ΔT. Doubling the
+        # span (~doubling n) scales sigma_v by 2^((-3-kappa)/2).
+        white, pln = (1.0, 0.0) if kappa == 0.0 else (0.0, 4.0)
+        n1, n2 = 2 * 365 + 1, 4 * 365 + 1
+        s1 = powerlaw_rate_sigma(white, pln, kappa, n1)
+        s2 = powerlaw_rate_sigma(white, pln, kappa, n2)
+        assert s2 / s1 == pytest.approx(2.0 ** (expected_exponent / 2.0), rel=0.02)
+
+    def test_guards(self) -> None:
+        with pytest.raises(ValueError, match="both be zero"):
+            powerlaw_rate_sigma(0.0, 0.0, -1.0, 100)
+        with pytest.raises(ValueError, match=">= 0"):
+            powerlaw_rate_sigma(-1.0, 1.0, -1.0, 100)
+        with pytest.raises(ValueError, match="spectral_index"):
+            powerlaw_rate_sigma(1.0, 1.0, -4.0, 100)
+        with pytest.raises(ValueError, match="n_epochs"):
+            powerlaw_rate_sigma(1.0, 1.0, -1.0, 2)
+
+
+class TestEstimateNoiseMLE:
+    """Joint trajectory + white/power-law noise MLE (module gps_analysis.noise)."""
+
+    def test_recovers_flicker_noise_and_rate(self) -> None:
+        # Injected flicker (kappa=-1) + white; MLE recovers noise triple and
+        # rate. Single fixed seed -> loose tolerances (finite-sample MLE
+        # scatter); the multi-seed calibration lives in the class docstring.
+        n = 1461  # 4 yr daily
+        t, y = _synthetic_colored(n, 1.0, 4.0, -1.0, -3.5, seed=6)
+        tt = np.arange(n) * _DELTA_T_YR
+        a = np.column_stack(
+            (
+                np.ones(n),
+                tt - tt.mean(),
+                np.cos(2 * np.pi * t),
+                np.sin(2 * np.pi * t),
+                np.cos(4 * np.pi * t),
+                np.sin(4 * np.pi * t),
+            )
+        )
+        fit = estimate_noise_mle(a, y)
+        assert fit.noise.spectral_index == pytest.approx(-1.0, abs=0.35)
+        assert fit.noise.amplitude_powerlaw == pytest.approx(4.0, rel=0.35)
+        assert fit.noise.sigma_white == pytest.approx(1.0, abs=0.5)
+        assert fit.params[1] == pytest.approx(
+            -3.5, abs=3.0 * math.sqrt(fit.covariance[1, 1])
+        )
+        assert fit.noise.n_obs == n
+
+    def test_white_series_gives_negligible_powerlaw(self) -> None:
+        # A pure white series: the MLE should not manufacture power-law noise,
+        # so sigma_v stays close to the white-noise WLS formal error.
+        n = 1200
+        t, y = _synthetic_colored(n, 1.5, 0.0, -1.0, 8.0, seed=3, seasonal=False)
+        a = np.column_stack((np.ones(n), np.arange(n) * _DELTA_T_YR))
+        fit = estimate_noise_mle(a, y)
+        white_cov = np.linalg.inv(a.T @ a) * (
+            float(((y - a @ np.linalg.lstsq(a, y, rcond=None)[0]) ** 2).sum()) / (n - 2)
+        )
+        inflation = math.sqrt(fit.covariance[1, 1] / white_cov[1, 1])
+        assert inflation == pytest.approx(1.0, abs=0.25)
+
+    def test_guards(self) -> None:
+        a = np.column_stack((np.ones(10), np.arange(10.0)))
+        with pytest.raises(ValueError, match="P \\+ 3"):
+            estimate_noise_mle(a[:4], np.arange(4.0))
+        with pytest.raises(ValueError, match="finite"):
+            estimate_noise_mle(a, np.r_[np.arange(9.0), np.nan])
+        with pytest.raises(ValueError, match="kappa_bounds"):
+            estimate_noise_mle(a, np.arange(10.0), kappa_bounds=(-4.0, 0.0))
+
+
+class TestEstimateVelocityMLE:
+    """Fixed-window colored-noise MLE velocity (method='mle')."""
+
+    def test_sigma_inflated_over_wls(self) -> None:
+        # The honest colored-noise sigma_v must exceed the optimistic WLS
+        # formal error for a flicker-dominated series (Williams et al. 2004).
+        n = 1461
+        t, y = _synthetic_colored(n, 1.0, 4.0, -1.0, -3.5, seed=6)
+        mle = estimate_velocity_mle(t, y, model="lineperiodic")
+        wls = estimate_velocity(t, y, model="lineperiodic")
+        assert isinstance(mle, VelocityEstimateMLE)
+        assert mle.method == "mle"
+        inflation = float(mle.sigmas[0] / wls.sigmas[0])
+        assert inflation > 3.0  # several-x inflation for flicker (n=4 yr daily)
+        # Rate agrees with the truth within a few honest sigma.
+        assert mle.rates[0] == pytest.approx(-3.5, abs=3.0 * float(mle.sigmas[0]))
+        # Noise model is attached and flicker-like.
+        assert mle.noise[0].spectral_index == pytest.approx(-1.0, abs=0.4)
+
+    def test_honest_sigma_covers_empirical_scatter(self) -> None:
+        # Across seeds the MLE sigma_v should be the right order as the true
+        # GLS rate uncertainty (the empirical rate scatter), unlike WLS which
+        # is ~7x too small. Compare mean MLE sigma to the dense-GLS truth.
+        n = 1461
+        rates, mle_sigmas, wls_sigmas = [], [], []
+        for seed in range(1, 7):
+            t, y = _synthetic_colored(n, 1.0, 4.0, -1.0, -3.5, seed=seed)
+            mle = estimate_velocity_mle(t, y, model="lineperiodic")
+            wls = estimate_velocity(t, y, model="lineperiodic")
+            rates.append(float(mle.rates[0]))
+            mle_sigmas.append(float(mle.sigmas[0]))
+            wls_sigmas.append(float(wls.sigmas[0]))
+        scatter = float(np.std(rates, ddof=1))
+        mean_mle = float(np.mean(mle_sigmas))
+        mean_wls = float(np.mean(wls_sigmas))
+        # MLE sigma is within a factor ~2 of the empirical scatter ...
+        assert 0.4 * scatter < mean_mle < 2.5 * scatter
+        # ... while WLS underestimates it by a large factor.
+        assert mean_wls < 0.3 * scatter
+
+    def test_horizontal_products_and_provenance(self) -> None:
+        n = 900
+        t, ye = _synthetic_colored(n, 1.0, 3.0, -1.0, 2.0, seed=11, seasonal=False)
+        _, yn = _synthetic_colored(n, 1.0, 3.0, -1.0, 5.0, seed=12, seasonal=False)
+        y = np.vstack((yn, ye))
+        mle = estimate_velocity_mle(t, y, model="linear", names=("north", "east"))
+        assert mle.magnitude is not None and mle.azimuth is not None
+        assert mle.magnitude == pytest.approx(
+            math.hypot(mle.rates[0], mle.rates[1]), rel=1e-12
+        )
+        assert len(mle.noise) == 2
+        assert mle.n_obs == n
+
+    def test_rejects_nonlinear_model(self) -> None:
+        from gps_analysis.models import exp_linear
+
+        n = 500
+        t, y = _synthetic_colored(n, 1.0, 2.0, -1.0, 1.0, seed=1, seasonal=False)
+        with pytest.raises(ValueError, match="linear-in-parameters"):
+            estimate_velocity_mle(t, y, model=exp_linear)
+
+    def test_does_not_mutate_inputs(self) -> None:
+        n = 500
+        t, y = _synthetic_colored(n, 1.0, 2.0, -1.0, 1.0, seed=2, seasonal=False)
+        t0, y0 = t.copy(), y.copy()
+        estimate_velocity_mle(t, y, model="linear")
+        np.testing.assert_array_equal(t, t0)
+        np.testing.assert_array_equal(y, y0)
+
+
 class TestDetectabilityFloor:
-    def test_is_a_documented_stub(self) -> None:
-        with pytest.raises(NotImplementedError, match="GBIS4TS"):
-            detectability_floor(1.0, 1.0, -1.0, 2.0)
+    """Minimum detectable velocity change under colored noise (Williams 2003)."""
+
+    def test_hand_computed_flicker_case(self) -> None:
+        # Hand check: T = 4 yr daily (n = 4*365+1 = 1461), flicker kappa=-1,
+        # beta=4 mm/yr^0.25, no white noise, 95% two-sided => z=1.959964.
+        # Dv_min = z*sqrt(2)*sigma_v with sigma_v the exact GLS rate error.
+        sigma_v = powerlaw_rate_sigma(0.0, 4.0, -1.0, 1461)
+        z = float(stats.norm.ppf(0.975))
+        expected = z * math.sqrt(2.0) * sigma_v
+        got = detectability_floor(0.0, 4.0, -1.0, 4.0)
+        assert got == pytest.approx(expected, rel=1e-9)
+        # And cross-check sigma_v itself against the dense GLS covariance.
+        n = 1461
+        c = noise_covariance(n, 0.0, -1.0, 4.0)
+        t = _DELTA_T_YR * (np.arange(n) - (n - 1) / 2.0)
+        a = np.column_stack((np.ones_like(t), t))
+        cov = np.linalg.inv(a.T @ np.linalg.solve(c, a))
+        assert sigma_v == pytest.approx(math.sqrt(cov[1, 1]), rel=1e-8)
+
+    def test_single_window_drops_sqrt2(self) -> None:
+        two = detectability_floor(1.0, 4.0, -1.0, 3.0)
+        one = detectability_floor(1.0, 4.0, -1.0, 3.0, single_window=True)
+        assert two / one == pytest.approx(math.sqrt(2.0), rel=1e-12)
+
+    def test_confidence_scales_the_z_quantile(self) -> None:
+        d95 = detectability_floor(1.0, 4.0, -1.0, 3.0, confidence=0.95)
+        d99 = detectability_floor(1.0, 4.0, -1.0, 3.0, confidence=0.99)
+        ratio = float(stats.norm.ppf(0.995) / stats.norm.ppf(0.975))
+        assert d99 / d95 == pytest.approx(ratio, rel=1e-9)
+
+    def test_longer_window_lowers_floor(self) -> None:
+        # More data => tighter rate => smaller detectable change.
+        assert detectability_floor(1.0, 4.0, -1.0, 6.0) < detectability_floor(
+            1.0, 4.0, -1.0, 3.0
+        )
+
+    def test_guards(self) -> None:
+        with pytest.raises(ValueError, match="confidence"):
+            detectability_floor(1.0, 4.0, -1.0, 3.0, confidence=1.0)
+        with pytest.raises(ValueError, match="window_years"):
+            detectability_floor(1.0, 4.0, -1.0, 0.0)
+        with pytest.raises(ValueError, match="3 epochs"):
+            detectability_floor(1.0, 4.0, -1.0, 0.001)
