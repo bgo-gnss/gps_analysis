@@ -19,9 +19,19 @@ Derivation chain
 3. Inversion — :func:`mogi_invert` / :func:`okada_invert` (weighted
    nonlinear least squares, scipy trust-region-reflective, optional robust
    loss; formal covariance from the Jacobian) and :func:`mogi_invert_bayes`
-   (Metropolis MCMC with the GBIS annealing/adaptive-step scheme reused
-   from :mod:`gps_analysis.transient`; Bagnardi & Hooper 2018 §3).
-4. Physical products — :func:`pressure_from_volume` /
+   (Metropolis MCMC with the GBIS annealing/adaptive-step scheme shared
+   with the transient lane via :mod:`gps_analysis._mcmc`; Bagnardi &
+   Hooper 2018 §3).
+4. Distributed slip — :func:`discretize_fault` tiles a fixed fault plane
+   into patches, :func:`okada_greens` assembles the unit-slip
+   Green's-function matrix ``d = G·s``, :func:`patch_laplacian` the
+   roughness operator ∇², and :func:`okada_invert_slip` solves the
+   Laplacian-regularized (optionally non-negative) linear inversion for the
+   slip/opening distribution, with :func:`slip_lcurve` /
+   :func:`lcurve_corner` for the λ trade-off (Okada 1985; Harris & Segall
+   1987; Jónsson et al. 2002; Aster, Borchers & Thurber 2018 ch. 4;
+   Hansen 1992).
+5. Physical products — :func:`pressure_from_volume` /
    :func:`volume_from_pressure` (ΔV ↔ ΔP through the spherical-cavity
    relation ΔV = π a³ ΔP / μ; Segall 2010 §7.2), plus the volume-rate unit
    helpers :func:`rate_to_m3s` / :func:`rate_from_m3s` /
@@ -59,15 +69,10 @@ from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike
-from scipy.optimize import least_squares
+from scipy.optimize import least_squares, lsq_linear
 
+from gps_analysis._mcmc import InversionConfig, PriorBounds, metropolis
 from gps_analysis.models import FloatArray
-from gps_analysis.transient import (
-    _T_SCHEDULE,
-    InversionConfig,
-    PriorBounds,
-    _sensitivity_schedule,
-)
 
 __all__ = [
     "MogiSource",
@@ -75,6 +80,8 @@ __all__ = [
     "MogiFit",
     "OkadaFit",
     "MogiPosterior",
+    "FaultPatches",
+    "SlipDistribution",
     "local_coordinates",
     "mogi_forward",
     "mogi_mctigue",
@@ -82,6 +89,12 @@ __all__ = [
     "mogi_invert",
     "mogi_invert_bayes",
     "okada_invert",
+    "discretize_fault",
+    "okada_greens",
+    "patch_laplacian",
+    "okada_invert_slip",
+    "slip_lcurve",
+    "lcurve_corner",
     "pressure_from_volume",
     "volume_from_pressure",
     "rate_to_m3s",
@@ -1407,6 +1420,641 @@ def okada_invert(
 
 
 # =====================================================================
+# Distributed slip — fault discretization, Green's functions, and the
+# regularized linear inversion (Harris & Segall 1987; Jónsson et al. 2002)
+# =====================================================================
+
+#: Slip components an Okada patch can carry (OkadaSource field names).
+_SLIP_COMPONENTS = ("strike_slip", "dip_slip", "opening")
+
+
+@dataclass(frozen=True)
+class FaultPatches:
+    """A fault plane discretized into an ``n_down × n_along`` grid of patches.
+
+    Produced by :func:`discretize_fault`; consumed by :func:`okada_greens`,
+    :func:`patch_laplacian` and :func:`okada_invert_slip`. Patch ``k`` sits
+    at grid position ``(i, j) = (k % n_along, k // n_along)`` — row-major,
+    ``i`` along strike (in the strike direction), ``j`` down dip (j = 0 is
+    the shallowest row).
+
+    Attributes:
+        plane: The parent :class:`OkadaSource` geometry (its slip fields are
+            ignored — patches carry their own slip in the inversion).
+        n_along: Number of patches along strike, ≥ 1.
+        n_down: Number of patches down dip, ≥ 1.
+        patch_length: Along-strike patch size ``L/n_along`` [L].
+        patch_width: Down-dip patch size ``W/n_down`` [L].
+        centers: ``(n_patches, 3)`` float64 patch-centroid coordinates
+            ``(east, north, depth)`` [L], depth positive down, row-major as
+            above.
+    """
+
+    plane: OkadaSource
+    n_along: int
+    n_down: int
+    patch_length: float
+    patch_width: float
+    centers: FloatArray
+
+    @property
+    def n_patches(self) -> int:
+        """Total number of patches ``n_along · n_down``."""
+        return self.n_along * self.n_down
+
+    @property
+    def patch_area(self) -> float:
+        """Area of one patch ``patch_length · patch_width`` [L²]."""
+        return self.patch_length * self.patch_width
+
+    def patch_source(
+        self,
+        k: int,
+        *,
+        strike_slip: float = 0.0,
+        dip_slip: float = 0.0,
+        opening: float = 0.0,
+    ) -> OkadaSource:
+        """The k-th patch as an :class:`OkadaSource` with the given slip.
+
+        Geometry (patch centroid, strike/dip inherited from the plane):
+            ``(x_k, y_k, d_k) = centers[k]``, ``L = patch_length``,
+            ``W = patch_width``.
+
+        Symbols → args: ``k``: row-major patch index (0 ≤ k < n_patches);
+        slips ``U₁, U₂, U₃`` → ``strike_slip``, ``dip_slip``, ``opening`` [L].
+
+        Reference:
+            Okada 1985 (the rectangular element); the tiling itself is the
+            standard planar-fault discretization of distributed-slip
+            inversion (Harris & Segall 1987, JGR 92(B8), §"Inversion
+            procedure"; Jónsson et al. 2002, BSSA 92(4), p. 1382).
+
+        Numerical notes:
+            Superposition over the tiles reproduces the uniform-slip parent
+            plane to machine precision (linear elasticity; test-pinned at
+            rtol 1e-12) — the patch grid introduces no geometric
+            approximation, only a piecewise-constant slip representation.
+        """
+        if not 0 <= k < self.n_patches:
+            raise ValueError(f"patch index {k} outside [0, {self.n_patches})")
+        cx, cy, cd = (float(v) for v in self.centers[k])
+        return OkadaSource(
+            x=cx,
+            y=cy,
+            depth=cd,
+            strike=self.plane.strike,
+            dip=self.plane.dip,
+            length=self.patch_length,
+            width=self.patch_width,
+            strike_slip=strike_slip,
+            dip_slip=dip_slip,
+            opening=opening,
+        )
+
+
+def discretize_fault(plane: OkadaSource, n_along: int, n_down: int) -> FaultPatches:
+    """Tile a rectangular fault plane into an ``n_down × n_along`` patch grid.
+
+    Equation (patch centroids in the plane's local frame; centroid
+    convention of :class:`OkadaSource`):
+        ``c_k = c₀ + u_i·ŝ + v_j·d̂`` with in-plane offsets
+        ``u_i = (i + ½)·L/n_along − L/2``, ``v_j = (j + ½)·W/n_down − W/2``
+        and the unit vectors (φ = strike, δ = dip; e, n, depth-down frame)
+        ``ŝ = (sin φ, cos φ, 0)`` (along strike),
+        ``d̂ = (cos φ·cos δ, −sin φ·cos δ, sin δ)`` (down dip — the plane
+        dips to the right of the strike direction).
+
+    Symbols → args:
+        - ``c₀, L, W, φ, δ`` → ``plane``: parent geometry (slip ignored)
+        - ``n_along``, ``n_down``: grid dimensions, ≥ 1
+
+    Returns:
+        :class:`FaultPatches` (row-major: ``k = j·n_along + i``, j = 0 the
+        shallowest row, i increasing along strike).
+
+    Reference:
+        Okada 1985 (element geometry); standard fault discretization for
+        distributed-slip inversion: Harris & Segall 1987, JGR 92(B8),
+        7945–7962 (Parkfield, rectangular sub-fault grid); Jónsson et al.
+        2002, BSSA 92(4), 1377–1389 (Hector Mine, 2 × 2.5 km patches).
+
+    Numerical notes:
+        ``d̂`` is derived from the same centroid → bottom-edge transform as
+        :func:`okada_forward` (``okada85.m`` convention), so tiled patches
+        with uniform slip superpose to the parent plane's field to machine
+        precision (test-pinned ≤ 1e-12 relative). The parent's
+        surface-breach guard ``depth ≥ sin δ·W/2`` guarantees every patch
+        satisfies its own guard (equality at the top row's up-dip edge).
+    """
+    if n_along < 1 or n_down < 1:
+        raise ValueError(f"grid must be >= 1x1, got {n_along}x{n_down}")
+    if not 0.0 < plane.dip <= 90.0:
+        raise ValueError(f"dip must be in (0, 90] degrees, got {plane.dip}")
+    if plane.length <= 0.0 or plane.width <= 0.0:
+        raise ValueError("fault length and width must be > 0")
+    dip = math.radians(plane.dip)
+    if plane.depth - math.sin(dip) * plane.width / 2.0 < -1.0e-9:
+        raise ValueError(
+            "fault breaches the surface: depth must be >= sin(dip)*width/2"
+        )
+    strike = math.radians(plane.strike)
+    cs, ss = math.cos(strike), math.sin(strike)
+    cd, sd = math.cos(dip), math.sin(dip)
+    dl = plane.length / n_along
+    dw = plane.width / n_down
+    u = (np.arange(n_along, dtype=np.float64) + 0.5) * dl - plane.length / 2.0
+    v = (np.arange(n_down, dtype=np.float64) + 0.5) * dw - plane.width / 2.0
+    vv, uu = np.meshgrid(v, u, indexing="ij")  # row-major (j, i)
+    centers = np.column_stack(
+        (
+            (plane.x + uu * ss + vv * cs * cd).ravel(),
+            (plane.y + uu * cs - vv * ss * cd).ravel(),
+            (plane.depth + vv * sd).ravel(),
+        )
+    )
+    return FaultPatches(
+        plane=plane,
+        n_along=n_along,
+        n_down=n_down,
+        patch_length=dl,
+        patch_width=dw,
+        centers=centers,
+    )
+
+
+def okada_greens(
+    e: ArrayLike,
+    n: ArrayLike,
+    patches: FaultPatches,
+    components: tuple[str, ...] = ("opening",),
+    nu: float = DEFAULT_NU,
+) -> FloatArray:
+    """Green's-function matrix G of unit patch slip → surface ENU displacement.
+
+    Equation (columns are unit-slip Okada solutions; linear superposition):
+        ``d = G·s``, ``G[:, c·n_p + k] = vec(u(e, n; patch_k, U_c = 1))``
+    where ``u`` is :func:`okada_forward` of patch ``k`` carrying unit slip in
+    component ``c`` (all other components zero), ``vec`` stacks the rows
+    (all-east, all-north, all-up) — matching ``obs.ravel()`` ordering — and
+    ``s`` is the slip vector in the same component-major layout.
+
+    Symbols → args:
+        - ``e, n``: observation east/north coordinates [L]
+        - ``patches`` → :class:`FaultPatches` (n_p = ``patches.n_patches``)
+        - ``components``: subset of ``("strike_slip", "dip_slip",
+          "opening")`` — the slip directions to be estimated
+        - ``ν`` → ``nu``: Poisson's ratio [-]
+
+    Returns:
+        G, shape ``(3·N, len(components)·n_p)``, float64. Unit: displacement
+        [L] per unit slip [L] (dimensionless kernel).
+
+    Reference:
+        Okada 1985 (the kernel); G-matrix assembly for distributed slip:
+        Harris & Segall 1987, JGR 92(B8), eq. (1) (``d = G·s + ε``);
+        Jónsson et al. 2002, BSSA 92(4), eq. (1).
+
+    Numerical notes:
+        One :func:`okada_forward` call per column — O(N) each, n_comp·n_p
+        total. Columns of distant/deep patches have small norms; the
+        regularized inversion (:func:`okada_invert_slip`) handles the
+        resulting ill-conditioning — do NOT invert G unregularized
+        (Aster, Borchers & Thurber 2018, ch. 4: discrete ill-posed problem).
+    """
+    _validate_components(components)
+    ee = np.atleast_1d(np.asarray(e, dtype=np.float64))
+    nn = np.atleast_1d(np.asarray(n, dtype=np.float64))
+    if ee.ndim != 1 or ee.shape != nn.shape:
+        raise ValueError(f"e/n must be equal-length 1-D, got {ee.shape}/{nn.shape}")
+    cols: list[FloatArray] = []
+    for comp in components:
+        for k in range(patches.n_patches):
+            src = patches.patch_source(k, **{comp: 1.0})
+            cols.append(okada_forward(ee, nn, src, nu).ravel())
+    return np.column_stack(cols)
+
+
+def patch_laplacian(patches: FaultPatches, edge: str = "zero") -> FloatArray:
+    """Discrete Laplacian ∇² over the patch grid (slip-roughness operator).
+
+    Equation (5-point stencil on the fault plane, grid spacings
+    ``h_l = patch_length`` along strike and ``h_w = patch_width`` down dip):
+        ``(∇²s)_{ij} = (s_{i−1,j} − 2s_{ij} + s_{i+1,j})/h_l²
+                     + (s_{i,j−1} − 2s_{ij} + s_{i,j+1})/h_w²``
+    assembled as the matrix L with ``(∇²s) = L·s`` over the row-major patch
+    vector. Edge treatment:
+        - ``edge="zero"``: phantom zero-slip cells outside the fault
+          (Dirichlet) — slip is penalized toward zero at the fault edges,
+          the choice of Jónsson et al. 2002 (slip tapers to the perimeter).
+        - ``edge="free"``: missing neighbors are dropped from the stencil
+          (the center coefficient shrinks accordingly), so a constant slip
+          field has exactly zero roughness (Neumann-like).
+
+    Symbols → args:
+        - ``s`` → the slip vector the operator will act on [L]
+        - ``patches`` → :class:`FaultPatches` (grid shape + spacings)
+        - ``edge``: ``"zero"`` | ``"free"`` boundary treatment
+
+    Returns:
+        L, shape ``(n_p, n_p)``, float64, symmetric, unit [1/L²].
+
+    Reference:
+        Harris & Segall 1987, JGR 92(B8) (smoothing operator D on the slip
+        grid, their eq. (4)-(5) region); Jónsson et al. 2002, BSSA 92(4),
+        p. 1382 (Laplacian smoothing with zero-slip edge condition);
+        Aster, Borchers & Thurber 2018, ch. 4 (second-order Tikhonov: L as
+        the roughening operator).
+
+    Numerical notes:
+        Symmetric by construction (equal spacing per axis); negative
+        semi-definite. With ``edge="free"`` the constant vector spans the
+        null space — pair it with data that constrain the mean slip, or use
+        ``edge="zero"`` (strictly negative definite, unique minimizer).
+        Dense (n_p²) assembly — fine for the ≤ O(10³) patches of GNSS-scale
+        problems.
+    """
+    if edge not in ("zero", "free"):
+        raise ValueError(f'edge must be "zero" or "free", got {edge!r}')
+    na, nd = patches.n_along, patches.n_down
+    inv_l2 = 1.0 / (patches.patch_length * patches.patch_length)
+    inv_w2 = 1.0 / (patches.patch_width * patches.patch_width)
+    n_p = na * nd
+    lap = np.zeros((n_p, n_p), dtype=np.float64)
+    for j in range(nd):
+        for i in range(na):
+            k = j * na + i
+            diag = 0.0
+            for ii, jj, w in (
+                (i - 1, j, inv_l2),
+                (i + 1, j, inv_l2),
+                (i, j - 1, inv_w2),
+                (i, j + 1, inv_w2),
+            ):
+                if 0 <= ii < na and 0 <= jj < nd:
+                    lap[k, jj * na + ii] = w
+                    diag -= w
+                elif edge == "zero":
+                    diag -= w  # phantom zero-slip neighbor keeps the stencil
+            lap[k, k] = diag
+    return lap
+
+
+@dataclass(frozen=True)
+class SlipDistribution:
+    """Distributed-slip inversion result (:func:`okada_invert_slip`).
+
+    Attributes:
+        patches: The :class:`FaultPatches` grid the slip lives on.
+        components: Estimated slip components, matching ``slip``'s first axis.
+        slip: ``(n_comp, n_down, n_along)`` slip/opening values [L] on the
+            grid (row j = 0 is the shallowest; i increases along strike).
+        smoothing: Regularization weight λ used [L³ — see
+            :func:`okada_invert_slip`].
+        nonnegative: Whether the positivity constraint was imposed.
+        predicted: ``(3, N)`` model displacements at the stations [L], rows
+            (east, north, up).
+        residual_norm: ``‖(d − G·s)/σ‖₂`` — σ-weighted misfit norm
+            (dimensionless).
+        roughness_norm: ``‖L_∇·s‖₂`` — unscaled Laplacian roughness of the
+            solution [1/L]. (residual_norm, roughness_norm) is one point of
+            the trade-off (L-)curve.
+        rms: Unweighted RMS of the displacement residuals [L].
+        n_obs: Number of scalar observations (3 × stations).
+    """
+
+    patches: FaultPatches
+    components: tuple[str, ...]
+    slip: FloatArray
+    smoothing: float
+    nonnegative: bool
+    predicted: FloatArray
+    residual_norm: float
+    roughness_norm: float
+    rms: float
+    n_obs: int
+
+    def potency(self) -> FloatArray:
+        """Per-component geometric potency ``P_c = Σ_k s_ck·A_patch``.
+
+        Equation:
+            ``P_c = A_p · Σ_k s_{ck}``  [L³] — the surface integral of slip
+            over the fault. The scalar seismic moment of a shear component
+            is ``M₀ = μ·P`` (Aki & Richards 2002, *Quantitative Seismology*
+            2nd ed., §3.2, eq. 3.16); for an opening component P is the
+            cavity/dike volume change.
+
+        Returns:
+            ``(n_comp,)`` float64, ordered as ``components``.
+
+        Numerical notes:
+            Exact sum over the piecewise-constant slip representation.
+        """
+        return np.asarray(
+            self.slip.reshape(len(self.components), -1).sum(axis=1)
+            * self.patches.patch_area,
+            dtype=np.float64,
+        )
+
+
+def _validate_components(components: tuple[str, ...]) -> None:
+    """Reject empty/unknown/duplicated slip-component tuples."""
+    if not components:
+        raise ValueError("components must name at least one slip direction")
+    unknown = set(components) - set(_SLIP_COMPONENTS)
+    if unknown:
+        raise ValueError(
+            f"unknown slip components {sorted(unknown)}; choose from {_SLIP_COMPONENTS}"
+        )
+    if len(set(components)) != len(components):
+        raise ValueError(f"duplicate slip components in {components}")
+
+
+def _solve_regularized(
+    g_w: FloatArray,
+    d_w: FloatArray,
+    reg: FloatArray,
+    smoothing: float,
+    nonnegative: bool,
+) -> FloatArray:
+    """Solve the damped LSQ system ``min ‖G_w·s − d_w‖² + λ²‖L_∇·s‖²`` (+ s ≥ 0).
+
+    Equation (Tikhonov form via the augmented system):
+        ``s* = argmin ‖ [G_w; λ·L_∇]·s − [d_w; 0] ‖²``  (Aster, Borchers &
+        Thurber 2018, ch. 4, eq. 4.4-form with L = ∇²), optionally subject
+        to ``s ≥ 0`` (bounded-variable least squares; the NNLS of Jónsson
+        et al. 2002).
+
+    Symbols → args:
+        - ``G_w`` → ``g_w``: σ-weighted Green's matrix ``(m, p)``
+        - ``d_w`` → ``d_w``: σ-weighted data ``(m,)``
+        - ``L_∇`` → ``reg``: unscaled roughness operator ``(r, p)``
+        - ``λ`` → ``smoothing``: regularization weight ≥ 0
+        - ``nonnegative``: impose ``s ≥ 0`` elementwise
+
+    Returns:
+        ``s*`` ``(p,)`` float64.
+
+    Reference:
+        Aster, Borchers & Thurber 2018, *Parameter Estimation and Inverse
+        Problems* (3rd ed.), ch. 4 (Tikhonov; augmented-matrix solution);
+        Lawson & Hanson 1974 (NNLS, as wrapped by scipy ``lsq_linear``);
+        Jónsson et al. 2002, BSSA 92(4) (NNLS + Laplacian for slip).
+
+    Numerical notes:
+        Unconstrained: LAPACK ``gelsd`` (SVD) via ``numpy.linalg.lstsq`` —
+        rank-revealing, stable for the ill-conditioned G. Constrained:
+        scipy ``lsq_linear`` (bounded-variable TRF), warm default tolerances;
+        raises RuntimeError if it reports failure. The augmented system is
+        dense ``(m + r, p)`` — fine at GNSS problem sizes.
+    """
+    a = np.vstack((g_w, smoothing * reg))
+    b = np.concatenate((d_w, np.zeros(reg.shape[0], dtype=np.float64)))
+    if nonnegative:
+        res: Any = lsq_linear(a, b, bounds=(0.0, np.inf))
+        if not res.success:
+            raise RuntimeError(f"non-negative slip solve failed: {res.message}")
+        return np.asarray(res.x, dtype=np.float64)
+    sol, _, _, _ = np.linalg.lstsq(a, b, rcond=None)
+    return np.asarray(sol, dtype=np.float64)
+
+
+def okada_invert_slip(
+    e: ArrayLike,
+    n: ArrayLike,
+    obs: ArrayLike,
+    sigma: ArrayLike | None = None,
+    *,
+    patches: FaultPatches,
+    components: tuple[str, ...] = ("opening",),
+    smoothing: float,
+    nonnegative: bool = False,
+    edge: str = "zero",
+    nu: float = DEFAULT_NU,
+) -> SlipDistribution:
+    """GPS-only distributed-slip inversion with Laplacian regularization.
+
+    Estimator (second-order Tikhonov / smoothed slip):
+        ``s* = argmin_s ‖(d − G·s)/σ‖² + λ²·‖L_∇·s‖²``, optionally s ≥ 0,
+    with G = :func:`okada_greens` (unit-slip Okada patch responses),
+    L_∇ = :func:`patch_laplacian` applied per component (block-diagonal for
+    multi-component slip), λ = ``smoothing``. The fault **geometry is fixed**
+    (given by ``patches``) — the problem is linear in s; geometry search
+    belongs to :func:`okada_invert` / the Bayesian lane.
+
+    Symbols → args:
+        - ``d`` → ``obs``: ``(3, N)`` station displacements [L], rows
+          **(east, north, up)**; ``σ`` → ``sigma``: ``(3, N)`` 1-σ [L] or
+          ``None`` for unit weights
+        - ``e, n``: station coordinates [L] (e.g. :func:`local_coordinates`)
+        - ``patches``: fixed fault discretization (:func:`discretize_fault`)
+        - ``components``: slip directions to estimate (default pure opening
+          — dike/sill; use ``("strike_slip",)`` etc. for faulting)
+        - ``λ`` → ``smoothing``: regularization weight ≥ 0. Units [L³]
+          (G dimensionless kernel, L_∇ in 1/L²) — pick by
+          :func:`slip_lcurve` (L-curve corner) or fix from experience;
+          λ = 0 is the unregularized LSQ (requires ``3N ≥ n_params`` and is
+          usually wildly oscillatory — Aster et al. 2018 ch. 4).
+        - ``nonnegative``: impose s ≥ 0 on every component (physical
+          one-signed slip/opening — Jónsson et al. 2002 use NNLS; flip the
+          expected-negative component's sign convention at the call site
+          if needed).
+        - ``edge``: Laplacian boundary treatment (see
+          :func:`patch_laplacian`; default ``"zero"`` tapers slip to the
+          fault perimeter).
+        - ``ν`` → ``nu``: Poisson's ratio [-].
+
+    Returns:
+        :class:`SlipDistribution` — slip grid, predicted field, misfit and
+        roughness norms (one L-curve point), RMS.
+
+    Reference:
+        Okada 1985 (kernel); Harris & Segall 1987, JGR 92(B8), 7945–7962
+        (regularized slip inversion from geodetic data — smoothing +
+        positivity); Jónsson et al. 2002, BSSA 92(4), 1377–1389 (Laplacian
+        smoothing + NNLS, distributed slip from InSAR/GPS); Aster, Borchers
+        & Thurber 2018, ch. 4 (Tikhonov regularization, L-curve).
+
+    Numerical notes:
+        - SVD solve of the augmented system (see :func:`_solve_regularized`)
+          — never normal equations (condition number would square).
+        - The checkerboard/oscillation null-space of the pure LSQ is
+          suppressed by λ‖L_∇s‖: resolution is *smoothing-limited*, so
+          report recovered patterns together with λ (or the L-curve).
+        - Requires ``3N > 0`` finite observations; λ = 0 additionally
+          requires ``3N ≥ len(components)·n_patches``.
+    """
+    ee, nn, dd, ss = _as_obs_arrays(e, n, obs, sigma)
+    _validate_components(components)
+    if smoothing < 0.0:
+        raise ValueError(f"smoothing must be >= 0, got {smoothing}")
+    n_comp = len(components)
+    n_params = n_comp * patches.n_patches
+    n_obs = 3 * ee.size
+    if smoothing == 0.0 and n_obs < n_params:
+        raise ValueError(
+            f"underdetermined without smoothing: {n_obs} observations for "
+            f"{n_params} slip parameters — set smoothing > 0"
+        )
+    g = okada_greens(ee, nn, patches, components, nu)
+    w = 1.0 / ss.ravel()
+    g_w = g * w[:, None]
+    d_w = dd.ravel() * w
+    lap = patch_laplacian(patches, edge)
+    reg = (
+        np.asarray(np.kron(np.eye(n_comp), lap), dtype=np.float64)
+        if n_comp > 1
+        else lap
+    )
+    sol = _solve_regularized(g_w, d_w, reg, smoothing, nonnegative)
+    predicted = np.asarray(g @ sol, dtype=np.float64).reshape(3, ee.size)
+    residual_norm = float(np.linalg.norm(d_w - g_w @ sol))
+    roughness_norm = float(np.linalg.norm(reg @ sol))
+    rms = float(np.sqrt(np.mean((dd - predicted) ** 2)))
+    return SlipDistribution(
+        patches=patches,
+        components=tuple(components),
+        slip=sol.reshape(n_comp, patches.n_down, patches.n_along),
+        smoothing=float(smoothing),
+        nonnegative=nonnegative,
+        predicted=predicted,
+        residual_norm=residual_norm,
+        roughness_norm=roughness_norm,
+        rms=rms,
+        n_obs=n_obs,
+    )
+
+
+def lcurve_corner(residual_norms: ArrayLike, roughness_norms: ArrayLike) -> int:
+    """Index of the L-curve corner (maximum curvature in log-log space).
+
+    Equation (Menger three-point curvature on the log-log trade-off curve):
+        for consecutive points ``P_i = (ln ρ_i, ln η_i)`` (ρ misfit norm,
+        η roughness norm),
+        ``κ_i = 4·Area(P_{i−1}, P_i, P_{i+1}) /
+        (|P_{i−1}P_i|·|P_iP_{i+1}|·|P_{i−1}P_{i+1}|)``
+        and the corner is ``argmax_i |κ_i|`` over the interior points — the
+        point of maximum bending between the steep (under-smoothed) and flat
+        (over-smoothed) branches.
+
+    Symbols → args:
+        - ``ρ_i`` → ``residual_norms``: weighted misfit per λ, ascending-λ order
+        - ``η_i`` → ``roughness_norms``: solution roughness per λ, same order
+
+    Returns:
+        Corner index into the input arrays (1 ≤ index ≤ len − 2).
+
+    Reference:
+        Hansen 1992, SIAM Review 34(4), 561–580 (the L-curve criterion);
+        Aster, Borchers & Thurber 2018, ch. 4 (L-curve for Tikhonov λ
+        selection). Menger curvature: standard circumradius identity
+        (used e.g. by Cultrera & Callegaro 2020, IOP SciNotes 1).
+
+    Numerical notes:
+        Sign-free (area-based) curvature — robust to the curve's traversal
+        direction. Zero norms are floored at the float64 tiny value before
+        the log. Requires ≥ 3 points; degenerate collinear segments give
+        κ = 0 and cannot win unless all are collinear (then index 1).
+    """
+    rho = np.asarray(residual_norms, dtype=np.float64)
+    eta = np.asarray(roughness_norms, dtype=np.float64)
+    if rho.ndim != 1 or rho.shape != eta.shape:
+        raise ValueError("residual_norms and roughness_norms must be equal 1-D")
+    if rho.size < 3:
+        raise ValueError(f"need >= 3 L-curve points, got {rho.size}")
+    tiny = np.finfo(np.float64).tiny
+    x = np.log(np.maximum(rho, tiny))
+    y = np.log(np.maximum(eta, tiny))
+    best_idx = 1
+    best_kappa = -1.0
+    for i in range(1, rho.size - 1):
+        ax, ay = x[i] - x[i - 1], y[i] - y[i - 1]
+        bx, by = x[i + 1] - x[i], y[i + 1] - y[i]
+        cx_, cy_ = x[i + 1] - x[i - 1], y[i + 1] - y[i - 1]
+        area2 = abs(ax * by - ay * bx)  # 2·triangle area
+        denom = math.hypot(ax, ay) * math.hypot(bx, by) * math.hypot(cx_, cy_)
+        kappa = 2.0 * area2 / denom if denom > 0.0 else 0.0
+        if kappa > best_kappa:
+            best_kappa = kappa
+            best_idx = i
+    return best_idx
+
+
+def slip_lcurve(
+    e: ArrayLike,
+    n: ArrayLike,
+    obs: ArrayLike,
+    sigma: ArrayLike | None = None,
+    *,
+    patches: FaultPatches,
+    smoothings: ArrayLike,
+    components: tuple[str, ...] = ("opening",),
+    nonnegative: bool = False,
+    edge: str = "zero",
+    nu: float = DEFAULT_NU,
+) -> tuple[FloatArray, FloatArray, int]:
+    """Trade-off (L-)curve of the distributed-slip inversion over λ values.
+
+    Computes one :func:`okada_invert_slip` solve per λ (Green's matrix and
+    Laplacian built once) and returns the misfit/roughness norms plus the
+    corner index of :func:`lcurve_corner` — the standard Tikhonov
+    λ-selection diagnostic:
+
+        ``(ρ(λ), η(λ)) = (‖(d − G·s_λ)/σ‖, ‖L_∇·s_λ‖)``
+
+    Symbols → args:
+        - ``λ`` → ``smoothings``: 1-D array of trial weights, > 0, sorted
+          ascending (a log-spaced decade scan is the usual choice)
+        - others as :func:`okada_invert_slip`
+
+    Returns:
+        ``(residual_norms, roughness_norms, corner_index)`` — norms per λ
+        (same order), and the recommended λ's index.
+
+    Reference:
+        Hansen 1992, SIAM Review 34(4) (L-curve criterion); Aster, Borchers
+        & Thurber 2018, ch. 4; applied to slip inversion: Jónsson et al.
+        2002, BSSA 92(4) (smoothing chosen from the misfit/roughness
+        trade-off, their fig. 6).
+
+    Numerical notes:
+        With ``nonnegative=True`` the curve is that of the *constrained*
+        estimator (norms need not be monotone in λ near active constraints);
+        the corner heuristic still applies. Cost: one regularized solve per
+        λ on the shared G — the G build (n_comp·n_p Okada evaluations)
+        dominates and is done once.
+    """
+    ee, nn, dd, ss = _as_obs_arrays(e, n, obs, sigma)
+    _validate_components(components)
+    lams = np.asarray(smoothings, dtype=np.float64)
+    if lams.ndim != 1 or lams.size < 3:
+        raise ValueError("smoothings must be 1-D with >= 3 values")
+    if not bool(np.all(lams > 0.0)):
+        raise ValueError("smoothings must be strictly positive")
+    if bool(np.any(np.diff(lams) <= 0.0)):
+        raise ValueError("smoothings must be sorted strictly ascending")
+    n_comp = len(components)
+    g = okada_greens(ee, nn, patches, components, nu)
+    w = 1.0 / ss.ravel()
+    g_w = g * w[:, None]
+    d_w = dd.ravel() * w
+    lap = patch_laplacian(patches, edge)
+    reg = (
+        np.asarray(np.kron(np.eye(n_comp), lap), dtype=np.float64)
+        if n_comp > 1
+        else lap
+    )
+    residual_norms = np.empty(lams.size, dtype=np.float64)
+    roughness_norms = np.empty(lams.size, dtype=np.float64)
+    for idx, lam in enumerate(lams):
+        sol = _solve_regularized(g_w, d_w, reg, float(lam), nonnegative)
+        residual_norms[idx] = float(np.linalg.norm(d_w - g_w @ sol))
+        roughness_norms[idx] = float(np.linalg.norm(reg @ sol))
+    corner = lcurve_corner(residual_norms, roughness_norms)
+    return residual_norms, roughness_norms, corner
+
+
+# =====================================================================
 # Inversion — Bayesian (GBIS Metropolis, reused from transient)
 # =====================================================================
 
@@ -1431,158 +2079,6 @@ class MogiPosterior:
     p_opt: float
 
 
-def _gbis_metropolis(
-    log_post: Callable[[FloatArray], float],
-    bounds: PriorBounds,
-    config: InversionConfig,
-) -> tuple[FloatArray, FloatArray, FloatArray, float]:
-    """Metropolis–Hastings sampler with the GBIS annealing/step adaptation.
-
-    The generic core of the GBIS4TS sampler in
-    :mod:`gps_analysis.transient` (``runInversion_ts.m``), reused here for
-    arbitrary forward models — same scheme, none of the BPD-specific quirks
-    (no inert hyperparameter slot, no break-point step floor, no BPD2
-    ordering guard):
-
-    - **Accept rule**: ``exp((lnP − lnP_prev)/T) ≥ U(0, 1)``.
-    - **Annealing**: ``T = 10^{3, 2.8, …, 0}`` (module ``_T_SCHEDULE``),
-      advanced every ``config.t_runs`` kept iterations, chain restarting
-      from the running optimum on each advance.
-    - **Adaptive steps**: on the ``_sensitivity_schedule`` counts each
-      parameter is perturbed alone by ±step/2; its acceptance probability
-      is compared to a target ``0.5^{1/n}`` retuned toward
-      ``config.rejection_target``; steps shrink/grow by ``exp(∓2Δ/·)`` and
-      cap at the prior range. Sensitivity trials are never kept.
-    - **Bounds**: uniform priors; proposals reflect at both limits.
-
-    Symbols → args:
-        - ``lnP`` → ``log_post``: callable m ↦ log-posterior (flat priors ⇒
-          log-likelihood up to a constant)
-        - ``bounds``: :class:`~gps_analysis.transient.PriorBounds`
-          (start/lower/upper/step, length n)
-        - ``config``: :class:`~gps_analysis.transient.InversionConfig`
-          (``breakpoint_step_floor`` and ``n_save`` are inert here)
-
-    Returns:
-        ``(m_keep (n, n_runs), p_keep (n_runs,), optimal (n,), p_opt)``.
-
-    Reference:
-        Bagnardi & Hooper 2018, G³ 19, 2194–2211
-        (doi:10.1029/2018GC007585), §3.2–3.3 (sampler, adaptive steps,
-        annealed burn-in); implementation mirrored from the verified
-        GBIS4TS port (``gps_analysis.transient.run_inversion``).
-
-    Numerical notes:
-        ``exp`` argument capped at 700 against float64 overflow; results
-        reproducible only for fixed ``config.seed``. MCMC convergence is
-        the caller's to assess (chain length vs. posterior complexity).
-    """
-    m = bounds.start.copy()
-    lower = bounds.lower.copy()
-    upper = bounds.upper.copy()
-    step = bounds.step.copy()
-    if bool(np.any(m > upper)) or bool(np.any(m < lower)):
-        bad = np.nonzero((m > upper) | (m < lower))[0]
-        raise ValueError(f"starting model out of bounds at indices {bad.tolist()}")
-
-    n_model = m.size
-    prm_range = upper - lower
-    prob_target = 0.5 ** (1.0 / n_model)
-    prob_sens = np.zeros(n_model, dtype=np.float64)
-    sens_schedule = _sensitivity_schedule(config.n_runs)
-    rng = np.random.default_rng(config.seed)
-
-    m_keep = np.zeros((n_model, config.n_runs), dtype=np.float64)
-    p_keep = np.zeros(config.n_runs, dtype=np.float64)
-
-    i_keep = 0
-    i_reject = 0
-    i_keep_save = 0
-    i_reject_save = 0
-    p_opt = -1.0e99
-    p_prev = -np.inf
-    optimal = m.copy()
-    i_temp = 0
-    n_temp = _T_SCHEDULE.size
-    temperature = float(_T_SCHEDULE[0])
-    sensitivity_test = 0
-    trial = m.copy()
-
-    while i_keep < config.n_runs:
-        if i_keep % config.t_runs == 0 and i_temp < n_temp:
-            temperature = float(_T_SCHEDULE[i_temp])
-            i_temp += 1
-            if i_keep > 0:
-                trial = optimal.copy()
-        if i_keep in sens_schedule:
-            sensitivity_test = 1
-
-        log_p = log_post(trial)
-        if i_keep > 0:
-            p_ratio = math.exp(min((log_p - p_prev) / temperature, 700.0))
-        else:
-            p_ratio = 1.0
-
-        if sensitivity_test > 1:
-            idx = sensitivity_test - 2
-            if idx < n_model:
-                prob_sens[idx] = p_ratio
-            if sensitivity_test > n_model:
-                if i_keep_save > 0:
-                    rejection_ratio = (i_reject - i_reject_save) / (
-                        i_keep - i_keep_save
-                    )
-                    prob_target = max(
-                        prob_target * rejection_ratio / config.rejection_target,
-                        1.0e-6,
-                    )
-                sensitivity_test = 0
-                ps = prob_sens.copy()
-                above = ps > 1.0
-                ps[above] = 1.0 / ps[above]
-                p_diff = prob_target - ps
-                shrink = p_diff > 0.0
-                step[shrink] *= np.exp(-p_diff[shrink] / prob_target * 2.0)
-                grow = p_diff < 0.0
-                step[grow] *= np.exp(-p_diff[grow] / (1.0 - prob_target) * 2.0)
-                too_big = step > prm_range
-                step[too_big] = prm_range[too_big]
-                i_keep_save = i_keep
-                i_reject_save = i_reject
-        else:
-            i_keep += 1
-            if p_ratio >= rng.random():
-                m = trial.copy()
-                m_keep[:, i_keep - 1] = m
-                p_keep[i_keep - 1] = log_p
-                p_prev = log_p
-                if log_p > p_opt:
-                    optimal = m.copy()
-                    p_opt = log_p
-            else:
-                i_reject += 1
-                m_keep[:, i_keep - 1] = m_keep[:, i_keep - 2]
-                p_keep[i_keep - 1] = p_keep[i_keep - 2]
-
-        if sensitivity_test > 0:
-            k = sensitivity_test - 1
-            trial = m.copy()
-            if k < n_model:
-                trial[k] += step[k] * float(np.sign(rng.standard_normal())) / 2.0
-                if trial[k] > upper[k]:
-                    trial[k] -= step[k]
-            sensitivity_test += 1
-        else:
-            random_step = step * (rng.random(n_model) - 0.5) * 2.0
-            trial = m + random_step
-            over = trial > upper
-            trial[over] = 2.0 * upper[over] - trial[over]
-            under = trial < lower
-            trial[under] = 2.0 * lower[under] - trial[under]
-
-    return m_keep, p_keep, optimal, p_opt
-
-
 def mogi_invert_bayes(
     e: ArrayLike,
     n: ArrayLike,
@@ -1599,8 +2095,10 @@ def mogi_invert_bayes(
         ``ln P(m | d) = −½ Σᵢ ((dᵢ − Gᵢ(m))/σᵢ)² + const`` (constant
         dropped — only differences enter Metropolis ratios), with
         G = :func:`mogi_forward` over ``m = [x_s, y_s, d, ΔV]``, sampled by
-        :func:`_gbis_metropolis` (annealed adaptive Metropolis; Bagnardi &
-        Hooper 2018 §3).
+        the shared GBIS sampler :func:`gps_analysis._mcmc.metropolis`
+        (annealed adaptive Metropolis; Bagnardi & Hooper 2018 §3) — the same
+        engine as the transient lane, hook-free here (no hyperparameter
+        slot, no break-point step floor, no ordering guard).
 
     Symbols → args:
         - ``dᵢ`` → ``obs``: ``(3, N)`` displacements [L], rows (east, north,
@@ -1657,10 +2155,10 @@ def mogi_invert_bayes(
         r = (dflat - model.ravel()) / sflat
         return -0.5 * float(r @ r)
 
-    m_keep, p_keep, optimal, p_opt = _gbis_metropolis(log_post, bounds, config)
+    result = metropolis(log_post, bounds, config)
     return MogiPosterior(
-        m_keep=m_keep,
-        p_keep=p_keep,
-        optimal=MogiSource.from_array(optimal),
-        p_opt=p_opt,
+        m_keep=result.m_keep,
+        p_keep=result.p_keep,
+        optimal=MogiSource.from_array(result.optimal),
+        p_opt=result.p_opt,
     )
