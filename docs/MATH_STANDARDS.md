@@ -93,6 +93,25 @@ into the estimator — so the reader can follow the flow top-down before reading
   covariance). (`_solve_regularized`, `_lsq_covariance`.)
 - **Hansen 1992** — *Analysis of discrete ill-posed problems by means of the L-curve*,
   SIAM Review 34(4), 561–580. (L-curve corner criterion — `lcurve_corner`.)
+- **Hanssen 2001** — *Radar Interferometry: Data Interpretation and Error Analysis*
+  (Kluwer), ch. 2. (SAR imaging geometry — `los_unit_vector`.)
+- **Fialko, Simons & Agnew 2001** — *The complete (3-D) surface displacement field in
+  the epicentral area of the 1999 Mw 7.1 Hector Mine earthquake …*, GRL 28(16),
+  3063–3066, eq. (1). (LOS decomposition of an ENU displacement — `los_project`.)
+- **Wright, Parsons & Lu 2004** — *Toward mapping surface deformation in three
+  dimensions using InSAR*, GRL 31, L01607. (multi-viewing-geometry 3-D retrieval —
+  why a second track approaches full 3-D in `mogi_invert_joint`.)
+- **Lohman & Simons 2005** — *Some thoughts on the use of InSAR data to constrain
+  models of surface deformation: Noise structure and data downsampling*, G³ 6,
+  Q01007. (quadtree downsampling + data covariance — the `InsarLos` input contract;
+  downsampling itself is the reader's job, NOT the leaf's.)
+- **Sudhaus & Jónsson 2009** — *Improved source modelling through combined use of
+  InSAR and GPS under consideration of correlated data errors: application to the
+  June 2000 Kleifarvatn earthquake*, GJI 176(2), 389–404. (joint InSAR+GPS NLLS with
+  variance-component-estimated dataset weights — `mogi_invert_joint`.)
+- **Koch 1999** — *Parameter Estimation and Hypothesis Testing in Linear Models*
+  (2nd ed., Springer), ch. 3. (Helmert variance component estimation, partial
+  redundancies — `variance_components`.)
 - Add domain refs (Hackl et al., Bevis & Brown trajectory model, Hector) as used —
   always with the specific equation/section.
 

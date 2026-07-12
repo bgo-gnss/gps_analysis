@@ -8,6 +8,7 @@ EXPECTED_MODULES = [
     "baseline",
     "deformation",
     "fitting",
+    "joint",
     "models",
     "noise",
     "preprocess",

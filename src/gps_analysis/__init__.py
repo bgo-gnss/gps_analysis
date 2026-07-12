@@ -58,6 +58,16 @@ from gps_analysis.fitting import (
     reject_outliers,
     remove_trend,
 )
+from gps_analysis.joint import (
+    InsarLos,
+    JointFit,
+    los_project,
+    los_unit_vector,
+    mogi_invert_joint,
+    param_correlation,
+    ramp_design,
+    variance_components,
+)
 from gps_analysis.models import (
     FloatArray,
     TrajectoryParams,
@@ -197,4 +207,13 @@ __all__ = [
     "rate_from_m3s",
     "time_for_rate",
     "halflife_days",
+    # joint GPS + InSAR (LOS projection, VCE, joint Mogi)
+    "InsarLos",
+    "JointFit",
+    "los_unit_vector",
+    "los_project",
+    "ramp_design",
+    "param_correlation",
+    "variance_components",
+    "mogi_invert_joint",
 ]
