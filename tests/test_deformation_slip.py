@@ -237,9 +237,9 @@ def test_patch_laplacian_rejects_unknown_edge() -> None:
 # =====================================================================
 
 
-def _roundtrip_setup() -> tuple[
-    FaultPatches, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray
-]:
+def _roundtrip_setup() -> (
+    tuple[FaultPatches, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]
+):
     """Gaussian strike-slip patch on a 12×6 grid; 81 stations; 2 mm noise."""
     patches = discretize_fault(_plane(), n_along=12, n_down=6)
     ii, jj = np.meshgrid(np.arange(12), np.arange(6), indexing="xy")

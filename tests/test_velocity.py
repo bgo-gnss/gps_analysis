@@ -398,9 +398,24 @@ class TestSlidingVelocity:
                 tt, offset, rate, cos_annual, sin_annual, cos_semiannual, sin_semiannual
             )
 
-        kwargs = dict(sigma=sigma, window_years=2.0, step_years=0.25, p0=np.zeros(6))
-        fast = sliding_velocity(t, y, model="lineperiodic", **kwargs)
-        slow = sliding_velocity(t, y, model=lineperiodic_wrapper, **kwargs)
+        fast = sliding_velocity(
+            t,
+            y,
+            sigma=sigma,
+            model="lineperiodic",
+            window_years=2.0,
+            step_years=0.25,
+            p0=np.zeros(6),
+        )
+        slow = sliding_velocity(
+            t,
+            y,
+            sigma=sigma,
+            model=lineperiodic_wrapper,
+            window_years=2.0,
+            step_years=0.25,
+            p0=np.zeros(6),
+        )
         np.testing.assert_array_equal(fast.centers, slow.centers)
         np.testing.assert_array_equal(fast.counts, slow.counts)
         np.testing.assert_array_equal(np.isnan(fast.rates), np.isnan(slow.rates))
