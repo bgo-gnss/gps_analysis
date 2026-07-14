@@ -11,6 +11,7 @@ EXPECTED_MODULES = [
     "joint",
     "models",
     "noise",
+    "outliers",
     "preprocess",
     "transient",
     "velocity",

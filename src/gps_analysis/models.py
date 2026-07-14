@@ -30,6 +30,11 @@ The standard GNSS trajectory model (Bevis & Brown 2014, J. Geodesy 88,
 5. :func:`poly2` (+ :func:`poly2_rate`, :func:`poly2_peak_time`,
    :func:`poly2_peak_value`) — degree-2 polynomial transient (empirical
    viscoelastic relaxation proxy used for the Sundhnúkur intrusions).
+6. :func:`heaviside_steps` — the known-step (Heaviside jump) term
+   Σₖ aₖ·H(t − tₖ), H(0) = 1; composed with any of the above by
+   :func:`gps_analysis.fitting.with_steps` for the step-augmented
+   trajectory used in outlier detection
+   (:mod:`gps_analysis.outliers`).
 
 Fitted parameters and their covariance travel in the typed
 :class:`TrajectoryParams` container (descendant of the svartsengi-model
@@ -61,6 +66,7 @@ __all__ = [
     "TrajectoryParams",
     "exp_linear",
     "exp_linear_rate",
+    "heaviside_steps",
     "linear",
     "lineperiodic",
     "periodic",
@@ -463,6 +469,66 @@ def poly2_peak_value(offset: float, rate: float, curvature: float) -> float:
     if np.isclose(curvature, 0.0):
         raise ValueError("curvature is zero - poly2 has no stationary point")
     return offset - rate**2 / (4.0 * curvature)
+
+
+def heaviside_steps(
+    t: ArrayLike, epochs: ArrayLike, amplitudes: ArrayLike
+) -> FloatArray:
+    """Evaluate the sum of Heaviside step terms x_step(t).
+
+    Equation:
+        ``x_step(t) = Σ_{k=1}^{K} a_k·H(t − t_k)``  with  ``H(0) = 1``
+
+    — the step epoch t_k belongs to the **post-step side** (the daily
+    solution of the step day already contains the offset). Convention
+    documented here and pinned by test.
+
+    Symbols → args:
+        - ``t``   → ``t``: epochs, fractional years (``yearf``) [yr]
+        - ``t_k`` → ``epochs``: known step epochs, shape (K,) [yr] —
+          fixed data, e.g. equipment changes from TOS or coseismic
+          offsets from the deployed ``steps.csv`` (caller's business)
+        - ``a_k`` → ``amplitudes``: step amplitudes, shape (K,) [L]
+
+    Args:
+        t: Epochs at which to evaluate the model [yr].
+        epochs: Step epochs t_k, shape (K,) [yr]; K = 0 yields zeros.
+        amplitudes: Step amplitudes a_k, shape (K,) [L].
+
+    Returns:
+        Step displacement x_step(t) [L], float64, same shape as ``t``
+        (0-d for scalar ``t``).
+
+    Raises:
+        ValueError: If ``epochs`` is not 1-D, ``amplitudes`` does not
+            match its shape, or either is non-finite.
+
+    Reference:
+        Bevis & Brown 2014, J. Geodesy 88, eq. (1) (the Heaviside jump
+        term of the standard trajectory model); Gazeaux et al. 2013,
+        JGR 118 (why *known-step tables* beat automated detection).
+
+    Numerical notes:
+        Exact comparison ``t ≥ t_k`` — no tolerance; callers must supply
+        step epochs on the same ``yearf`` grid convention as ``t`` when
+        an exact epoch match matters. Evaluated as the (N, K) indicator
+        matrix times a: O(N·K), no stability concerns.
+    """
+    tt = _as_float_array(t)
+    ep = np.asarray(epochs, dtype=np.float64)
+    am = np.asarray(amplitudes, dtype=np.float64)
+    if ep.ndim != 1:
+        raise ValueError(f"epochs must be 1-D, got shape {ep.shape}")
+    if am.shape != ep.shape:
+        raise ValueError(
+            f"amplitudes shape {am.shape} does not match epochs shape {ep.shape}"
+        )
+    if not (np.all(np.isfinite(ep)) and np.all(np.isfinite(am))):
+        raise ValueError("epochs and amplitudes must be finite")
+    if ep.size == 0:
+        return np.zeros(tt.shape, dtype=np.float64)
+    indicator = (tt[..., np.newaxis] >= ep).astype(np.float64)
+    return np.asarray((indicator @ am).reshape(tt.shape), dtype=np.float64)
 
 
 @dataclasses.dataclass(frozen=True)

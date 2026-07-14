@@ -495,17 +495,17 @@ def test_joint_breaks_depth_dv_tradeoff_formal() -> None:
     # the trade-off is REAL in the GPS-only fit ...
     assert corr_gps > 0.95, f"GPS-only depth-dv corr {corr_gps:.3f}"
     # ... and the joint fit breaks it: σ_depth shrinks markedly,
-    assert sd_joint < 0.5 * sd_gps, (
-        f"sigma_depth joint {sd_joint:.0f} m vs GPS-only {sd_gps:.0f} m"
-    )
+    assert (
+        sd_joint < 0.5 * sd_gps
+    ), f"sigma_depth joint {sd_joint:.0f} m vs GPS-only {sd_gps:.0f} m"
     # the depth–ΔV covariance collapses,
-    assert abs(cov_joint) < 0.20 * abs(cov_gps), (
-        f"cov(depth,dv) joint {cov_joint:.3g} vs GPS-only {cov_gps:.3g}"
-    )
+    assert abs(cov_joint) < 0.20 * abs(
+        cov_gps
+    ), f"cov(depth,dv) joint {cov_joint:.3g} vs GPS-only {cov_gps:.3g}"
     # and the correlation itself decreases.
-    assert corr_joint < corr_gps - 0.04, (
-        f"corr joint {corr_joint:.3f} vs GPS-only {corr_gps:.3f}"
-    )
+    assert (
+        corr_joint < corr_gps - 0.04
+    ), f"corr joint {corr_joint:.3f} vs GPS-only {corr_gps:.3f}"
     # the joint solution is also closer to (and consistent with) the truth
     assert abs(fit_joint.source.depth - TRUE.depth) < 3.0 * sd_joint
 
@@ -546,9 +546,9 @@ def test_joint_breaks_depth_dv_tradeoff_ensemble() -> None:
     sd_gps = float(np.std(depth_gps, ddof=1))
     sd_joint = float(np.std(depth_joint, ddof=1))
     # the joint estimator's depth scatter collapses (the trade-off break) ...
-    assert sd_joint < 0.45 * sd_gps, (
-        f"empirical sigma_depth joint {sd_joint:.0f} m vs GPS-only {sd_gps:.0f} m"
-    )
+    assert (
+        sd_joint < 0.45 * sd_gps
+    ), f"empirical sigma_depth joint {sd_joint:.0f} m vs GPS-only {sd_gps:.0f} m"
     # ... without bias (both means consistent with the truth)
     assert abs(float(np.mean(depth_joint)) - TRUE.depth) < 3.0 * sd_joint / math.sqrt(
         30.0
@@ -558,9 +558,9 @@ def test_joint_breaks_depth_dv_tradeoff_ensemble() -> None:
     corr_gps = float(np.corrcoef(depth_gps, dv_gps)[0, 1])
     corr_joint = float(np.corrcoef(depth_joint, dv_joint)[0, 1])
     assert corr_gps > 0.9, f"ensemble GPS-only corr {corr_gps:.3f}"
-    assert corr_joint < corr_gps, (
-        f"ensemble corr joint {corr_joint:.3f} vs GPS-only {corr_gps:.3f}"
-    )
+    assert (
+        corr_joint < corr_gps
+    ), f"ensemble corr joint {corr_joint:.3f} vs GPS-only {corr_gps:.3f}"
 
 
 def test_joint_two_geometries_near_full_3d() -> None:

@@ -40,7 +40,12 @@ f(t; p) from :mod:`gps_analysis.models` with parameters p ∈ ℝᴾ:
    ``r = y − f(t; p̂)`` — the detrended series / residuals.
 3. :func:`detrend_fit` composes 1 → 2 (the legacy ``detrend`` behavior,
    made pure).
-4. :func:`reject_outliers` iterates a **robust** fit — the M-estimator
+4. :func:`with_steps` augments any trajectory model with known Heaviside
+   step terms, ``f(t; p, a) = f_traj(t; p) + Σ_k a_k·H(t − t_k)``
+   (epochs fixed, amplitudes estimated); linear-in-parameters models
+   stay on the closed-form path (the design gains K indicator columns).
+   This is the fit backbone of :mod:`gps_analysis.outliers`.
+5. :func:`reject_outliers` iterates a **robust** fit — the M-estimator
 
        ``p̂ = argmin_p Σᵢ ρ( (yᵢ − f(tᵢ; p)) / (σᵢ·f_scale) )``
 
@@ -78,6 +83,7 @@ __all__ = [
     "fit_components",
     "reject_outliers",
     "remove_trend",
+    "with_steps",
 ]
 
 ModelFunc = Callable[..., FloatArray]
@@ -271,6 +277,127 @@ _LINEAR_DESIGNS: dict[ModelFunc, _LinearDesign] = {
 Dispatch is by callable identity — only the house models listed here take
 the closed-form path; every other callable (``exp_linear``, ``poly2``,
 custom models) keeps the iterative ``curve_fit`` path."""
+
+_LINEAR_DESIGN_ATTR = "_gps_analysis_linear_design"
+"""Attribute name under which factory-built models (:func:`with_steps`)
+carry their own :class:`_LinearDesign` — checked by
+:func:`_resolve_linear_design` after the identity registry, so derived
+models keep the closed-form WLS path without mutating the global
+``_LINEAR_DESIGNS`` dict."""
+
+
+def _resolve_linear_design(model: ModelFunc) -> _LinearDesign | None:
+    """Look up the linear design of a model: registry, then attribute."""
+    design = _LINEAR_DESIGNS.get(model)
+    if design is not None:
+        return design
+    attr = getattr(model, _LINEAR_DESIGN_ATTR, None)
+    return attr if isinstance(attr, _LinearDesign) else None
+
+
+def with_steps(model: ModelFunc, step_epochs: ArrayLike) -> ModelFunc:
+    """Build the step-augmented trajectory model f(t; p, a).
+
+    Equation:
+        ``f(t; p, a) = f_traj(t; p) + Σ_{k=1}^{K} a_k·H(t − t_k)``,
+        ``H(0) = 1``
+
+    (:func:`gps_analysis.models.heaviside_steps` for the jump term).
+    The step epochs t_k are **fixed data**; only the amplitudes a_k are
+    fit parameters, appended *after* the base model's parameters, in the
+    order of ``step_epochs``.
+
+    Symbols → args:
+        - ``f_traj`` → ``model``: base trajectory model ``f(t, *p)``
+          with named parameters (units per model)
+        - ``t_k``    → ``step_epochs``: known step epochs, shape (K,)
+          [yr] — from the caller's per-station step table; the leaf
+          never reads config
+
+    Args:
+        model: Base model callable ``f(t, *params) -> ndarray`` with
+            explicitly named parameters (no ``*args`` — the parameter
+            count is read from the signature).
+        step_epochs: Step epochs t_k, shape (K,), K ≥ 1 [yr].
+
+    Returns:
+        Callable ``f(t, *p, *a) -> ndarray`` taking P + K parameters
+        (P = base parameters, then ``step_amp_1 … step_amp_K`` [L]).
+        When ``model`` has a closed-form design
+        (``_LINEAR_DESIGNS`` or a previous :func:`with_steps`
+        augmentation), the returned callable carries an augmented design
+        too — the design gains K Heaviside indicator columns
+        ``H(t − t_k)``, still linear in the parameters, so
+        :func:`fit_components` keeps the exact closed-form WLS path.
+
+    Raises:
+        ValueError: If ``step_epochs`` is empty, not 1-D, or non-finite.
+
+    Reference:
+        Bevis & Brown 2014, J. Geodesy 88, eq. (1) (Heaviside jump term
+        of the extended trajectory model); design spec
+        ``docs/DESIGN_outlier_detection.md`` §3.1/§4.2.
+
+    Numerical notes:
+        A step column with no observations on one side of t_k is
+        rank-deficient — the existing :func:`_wls_solve` inf-covariance
+        + ``OptimizeWarning`` path applies. Heaviside columns are 0/1:
+        bounded, no conditioning interaction with the re-centered trend
+        column. Nesting :func:`with_steps` twice is supported only with
+        the amplitude-name collision caveat (``step_amp_i`` names must
+        stay unique) — pass all epochs in one call instead.
+    """
+    epochs = np.asarray(step_epochs, dtype=np.float64)
+    if epochs.ndim != 1 or epochs.size == 0:
+        raise ValueError(
+            f"step_epochs must be a non-empty 1-D array, got shape {epochs.shape}"
+        )
+    if not np.all(np.isfinite(epochs)):
+        raise ValueError("step_epochs must be finite")
+    n_base = _n_model_params(model)
+    n_steps = int(epochs.size)
+
+    def stepped(t: ArrayLike, *params: float) -> FloatArray:
+        if len(params) != n_base + n_steps:
+            raise ValueError(
+                f"expected {n_base + n_steps} parameters ({n_base} model "
+                f"+ {n_steps} step amplitudes), got {len(params)}"
+            )
+        base = np.asarray(model(t, *params[:n_base]), dtype=np.float64)
+        steps = models.heaviside_steps(
+            t, epochs, np.asarray(params[n_base:], dtype=np.float64)
+        )
+        return np.asarray(base + steps, dtype=np.float64)
+
+    base_sig = inspect.signature(model)
+    amp_params = [
+        inspect.Parameter(f"step_amp_{k + 1}", inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        for k in range(n_steps)
+    ]
+    stepped.__signature__ = base_sig.replace(  # type: ignore[attr-defined]
+        parameters=[*base_sig.parameters.values(), *amp_params]
+    )
+    stepped.__name__ = f"{getattr(model, '__name__', 'model')}_with_steps"
+
+    base_design = _resolve_linear_design(model)
+    if base_design is not None:
+        bd: _LinearDesign = base_design
+
+        def build(tt: FloatArray) -> FloatArray:
+            columns = (tt[:, np.newaxis] >= epochs[np.newaxis, :]).astype(np.float64)
+            return np.column_stack((bd.build(tt), columns))
+
+        setattr(  # noqa: B010 — dynamic attr on a function needs setattr for mypy
+            stepped,
+            _LINEAR_DESIGN_ATTR,
+            _LinearDesign(
+                build,
+                trend_column=bd.trend_column,
+                intercept_column=bd.intercept_column,
+            ),
+        )
+    return stepped
+
 
 _COV_WARNING = "Covariance of the parameters could not be estimated"
 """``curve_fit``-compatible OptimizeWarning message (singular design or
@@ -524,7 +651,7 @@ def fit_components(
     if names is not None and len(names) != yy.shape[0]:
         raise ValueError(f"names has {len(names)} entries for {yy.shape[0]} components")
 
-    design = _LINEAR_DESIGNS.get(model)
+    design = _resolve_linear_design(model)
     if design is not None:
         # Closed-form WLS fast path — mirror curve_fit's check_finite
         # guard (lstsq would silently propagate NaN otherwise).
@@ -733,6 +860,13 @@ def reject_outliers(
     names: Sequence[str] | None = None,
 ) -> OutlierRejection:
     """Iteratively flag outliers against a robustly fitted trajectory model.
+
+    .. note::
+        This is the **lightweight exploratory** clip (global scale only,
+        no signal protection, no diagnostics). The production outlier
+        path is :func:`gps_analysis.outliers.detect_outliers` — known
+        steps, windowed Hampel identifier, signal-protection stage,
+        reason-coded flags (``docs/DESIGN_outlier_detection.md``).
 
     Per component and per sweep:
 
