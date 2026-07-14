@@ -156,7 +156,16 @@ t_end + W_post]}`,
 
 3. **Protected event windows.** The caller may pass intervals
     `[t_a, t_b]` (eruption onsets, dike intrusions, configured
-    `outliers.protect_windows`) inside which flagging is disabled outright.
+    `outliers.protect_windows`) which are treated as an operator-declared
+    anomalous-signal interval and are excluded from **three** stages:
+    (i) flagging is disabled outright inside the window; (ii) the window's
+    epochs are excluded from the robust trajectory **fit** (so a meter-scale
+    transient does not distort the background model, keeping quiet-region
+    detection sane — the SENG/Svartsengi lesson, 2026-07-14); and (iii) the
+    window's candidates are excluded from the §3.5 abort numerator. Only
+    operator-declared `protect_windows` get this treatment — the auto
+    protections (FLOOR/RUN/STEP) do NOT, since a series the leaf must
+    auto-protect wholesale still signals a wrong model and should still abort.
 4. **Cross-component policy** (`epoch_policy`):
     - `per_component` (default): each component keeps its own flags. N/E/U noise
       levels differ by ~3× and snow/multipath can hit U alone.
@@ -177,7 +186,8 @@ GBIS4TS break-detection lane, never silent.
 sweep:  robust fit (Huber, step-augmented) on current inliers
         → residuals on ALL epochs → §3.3 candidates → §3.4 protection → new flags
 until:  flags unchanged (fixed point)  OR  max_iterations (default 3)
-guard:  if flagged fraction > f_max (default 0.05) at any sweep →
+guard:  if (candidate fraction OUTSIDE protect_windows) > f_max (default 0.05)
+        at any sweep →
         ABORT MASKING: return flags = all-False, excess_flag_abort = True,
         diagnostics (candidates, reasons, suspected events) fully populated
 finish: plain WLS refit on final inliers (reported fits + Gauss–Markov cov)
@@ -189,6 +199,16 @@ finish: plain WLS refit on final inliers (reported fits + Gauss–Markov cov)
   of epochs look like outliers almost certainly contains _unmodeled signal_
   (missed step, transient) — masking there deletes signal. The abort is loud
   (provenance-stamped, logged), never a silent cap.
+- **Protect-window exemption (2026-07-14):** epochs inside an operator-declared
+  `protect_windows` interval are excluded from the abort numerator (denominator
+  stays N) — the operator has already declared *this is signal here*, so those
+  candidates are expected and must not trip the abort. An active-unrest station
+  (SENG) whose unrest interval is declared thus **cleans** (blunders outside the
+  window removed, signal inside preserved) instead of degrading. The window is
+  also excluded from the fit (§3.4.3), so the background model stays sane and the
+  quiet region cleans correctly. Blunders *inside* the window are left uncleaned
+  (flagging is off there) — the future local-identifier-inside-window refinement
+  addresses that; plain suppression is the conservative first step.
 - Idempotence requirement: running detection on a series with its flags applied
   must reproduce the same mask (test-pinned, §8).
 
@@ -534,6 +554,8 @@ Injectors (composable, each returns truth bookkeeping):
 | `test_spike_on_transient_caught` | transient + 25 mm single-epoch spike inside it | the spike IS flagged; no other epoch of the transient is (the compound case that kills global-only schemes) |
 | `test_protect_window`            | spike inside a configured protect window       | not flagged; `PROTECT_WINDOW` bit set                                                                       |
 | `test_excess_abort`              | undeclared 100 mm step → > f_max candidates    | `excess_flag_abort=True`, `flags` all-False, candidates populated                                           |
+| `test_protect_window_clears_abort` | same step, unrest declared `protect_windows` | `excess_flag_abort=False`, converged, nothing flagged inside, `PROTECT_WINDOW` set                          |
+| `test_protect_window_excluded_from_fit` | 500 mm ramp in a protect window + quiet blunder | no abort; quiet blunder flagged; quiet region otherwise clean (fit not distorted)                    |
 | `test_floor_protection`          | quiet series (ŝ → 1 mm), 3 mm wiggles          | zero flags (`PROTECT_FLOOR` recorded on candidates)                                                         |
 
 ### 8.4 Contract & property tests

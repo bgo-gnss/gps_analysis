@@ -678,6 +678,44 @@ class TestSignalProtection:
         assert int(res.candidates.sum()) > 0.05 * n
         assert np.any(res.reasons > 0)
 
+    def test_protect_window_clears_abort(self) -> None:
+        # the excess-abort scenario, but the unrest interval is declared a
+        # protect window: its candidates are excluded from the abort
+        # numerator, so masking is NOT aborted and the rest of the series is
+        # still cleaned (§3.5 — operator-declared signal, not pathology).
+        n = 2000
+        t, y = _white_series(n, 3)
+        y2 = _inject_step(t, y, float(t[1700]), 100.0)
+        window = (float(t[1699]), float(t[-1]) + 1.0)
+        res = detect_outliers(lineperiodic, t, y2, protect_windows=[window])
+        assert not res.excess_flag_abort
+        assert res.converged
+        inside = t >= t[1699]
+        assert not np.any(res.flags[inside])  # nothing flagged in the window
+        assert res.protected[1850] & PROTECT_WINDOW  # mid-window epoch marked
+
+    def test_protect_window_excluded_from_fit(self) -> None:
+        # a large transient inside a protect window must not distort the
+        # background fit: with the window excluded from the fit the quiet
+        # region has a sane model, so an isolated blunder there is caught and
+        # the run does not abort. (Without fit-exclusion the transient warps
+        # the whole-series fit and the quiet region over-flags.)
+        n = 2000
+        t, y = _white_series(n, 7)
+        ramp_start = 1400
+        y2 = y.copy()
+        y2[ramp_start:] += np.linspace(0.0, 500.0, n - ramp_start)  # unrest ramp
+        y2 = _inject_spikes(y2, np.array([500], dtype=np.intp), np.array([25.0]))
+        window = (float(t[ramp_start - 1]), float(t[-1]) + 1.0)
+        res = detect_outliers(lineperiodic, t, y2, protect_windows=[window])
+        assert not res.excess_flag_abort
+        assert bool(res.flags[500])  # quiet-region blunder caught
+        # quiet region (excluding the injected blunder) stays clean
+        quiet = np.zeros(n, dtype=bool)
+        quiet[:ramp_start] = True
+        quiet[500] = False
+        assert int(res.flags[quiet].sum()) <= 2
+
     def test_floor_protection(self) -> None:
         # quiet station (s -> 0.5 mm): 3 mm wiggles exceed 5*s but stay
         # below the physical floor -> candidates, PROTECT_FLOOR, no flags
