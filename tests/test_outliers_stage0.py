@@ -361,16 +361,33 @@ class TestStage0Despike:
         assert y.tobytes() == y_bytes
         assert t.tobytes() == t_bytes
 
-    def test_despiked_not_a_candidate(self) -> None:
-        # a despiked epoch carries REASON_GROSS and is NOT in candidates
+    def test_despiked_is_candidate_but_not_protected(self) -> None:
+        # a despiked epoch carries REASON_GROSS ONLY, is IN candidates (so
+        # the §8.4 flags-subset invariant holds), is flagged, and is never
+        # protected
         t, y = _white_series(1500, 101)
         i0 = 750
         y[i0] += 150.0
         res = detect_outliers(
             lineperiodic, t, y, params=OutlierParams(despike=True), min_outlier=5.0
         )
-        assert not bool(res.candidates[i0])
+        assert bool(res.candidates[i0])  # invariant: flags ⊆ candidates
         assert bool(res.flags[i0])
+        assert int(res.reasons[i0]) == REASON_GROSS  # gross reason only
+        assert int(res.protected[i0]) == 0
+
+    def test_despike_preserves_contract_invariants(self) -> None:
+        # the §8.4 property tests must hold with despike ON:
+        # flags ⊆ candidates, reasons == 0 exactly off candidates,
+        # flags never protected
+        t, y = _white_series(1500, 101)
+        y[750] += 150.0
+        res = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(despike=True), min_outlier=5.0
+        )
+        assert bool(np.all(res.candidates[res.flags]))
+        assert bool(np.all(res.reasons[~res.candidates] == 0))
+        assert not bool(np.any(res.flags & (res.protected > 0)))
 
     def test_despike_multicomponent_counts(self) -> None:
         rng = np.random.default_rng(9)
@@ -465,6 +482,42 @@ class TestLocalPolynomialIdentifier:
             params=OutlierParams(window_order=1),
         )
         assert int(res.flags[i0 - 30 : i0 + 31].sum()) == 0
+
+    def test_order_ge1_more_sensitive_tradeoff(self) -> None:
+        # THE order>=1 caveat, pinned: the robust local polynomial is more
+        # sensitive than the order-0 local median — chiefly at one-sided
+        # (series-edge) windows where the line/parabola extrapolates. On the
+        # steep-ramp fixture order 2 flags strictly MORE epochs than order 0
+        # (which flags none), the price of its recall gain. In production the
+        # transient onset is a declared step / protect_window; enabling
+        # order >= 1 without that is the documented tradeoff.
+        t, y, spikes = self._ramp_with_spikes()
+        r0 = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(window_order=0), min_outlier=5.0
+        )
+        r2 = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(window_order=2), min_outlier=5.0
+        )
+        assert int(r0.flags.sum()) == 0
+        assert int(r2.flags.sum()) > int(r0.flags.sum())
+        # the added sensitivity buys real recall too (spikes order 0 missed)
+        assert int(r2.flags[spikes].sum()) > int(r0.flags[spikes].sum())
+
+    def test_golden_order0_fixture(self) -> None:
+        # Durable order-0 regression: pin the exact flags and global scale
+        # on a fixed seeded fixture, so any future change to the order-0
+        # windowed-identifier path is caught in CI (not just the
+        # 423-unchanged aggregate). Values captured at d636190 / this branch.
+        rng = np.random.default_rng(42)
+        n = 900
+        t = _daily_t(n, start=2015.0)
+        y = lineperiodic(t, *TRUE_LP) + rng.normal(0.0, 2.0, n)
+        idx = np.array([120, 400, 700], dtype=np.intp)
+        y[idx] += np.array([18.0, -22.0, 30.0])
+        res = detect_outliers(lineperiodic, t, y)  # pure defaults
+        np.testing.assert_array_equal(np.flatnonzero(res.flags), idx)
+        assert float(res.scale_global[0]) == pytest.approx(1.878318937520205, rel=1e-12)
+        assert res.n_iterations == 2 and res.converged
 
     def test_order1_determinism(self) -> None:
         t, y, _ = self._ramp_with_spikes()

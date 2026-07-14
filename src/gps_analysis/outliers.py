@@ -1256,12 +1256,17 @@ class OutlierDetection:
         flags: Final outlier mask — True = OUTLIER (protection-surviving
             candidates plus Stage-0 despiked epochs). All-False when
             ``excess_flag_abort`` is True (§3.5 abort rule).
-        candidates: Pre-protection identifier union G ∪ L (final sweep).
-            Stage-0 despiked epochs are decided before the identifiers
-            and are NOT candidates (they carry ``REASON_GROSS`` and are
-            flagged directly).
-        reasons: Per-epoch ``REASON_*`` bitmask (uint8; 0 on epochs that
-            are neither candidates nor despiked), final sweep.
+        candidates: Pre-protection candidate set of the final sweep —
+            the identifier union G ∪ L **plus** the Stage-0 despiked
+            epochs (so the §8.4 invariants ``flags ⊆ candidates`` and
+            ``reasons == 0 off candidates`` hold with despike on).
+            Despiked epochs carry ``REASON_GROSS`` (never
+            ``REASON_GLOBAL``/``REASON_LOCAL``), are flagged directly,
+            and are excluded from clustering, protection and the abort
+            fraction; distinguish them by the reason bit, not by
+            candidate membership.
+        reasons: Per-epoch ``REASON_*`` bitmask (uint8; 0 exactly on
+            non-candidates), final sweep.
         protected: Per-epoch ``PROTECT_*`` bitmask (uint8), final sweep.
         z: Final-sweep global detection statistic ẑ (shape of y).
         scale_global: Global robust scale ŝ per component, shape (C,)
@@ -1744,6 +1749,11 @@ def detect_outliers(
                 detection_params,
                 half_window,
             )
+            # Gross (Stage-0) epochs are decided BEFORE the identifiers:
+            # remove them from the identifier candidate set used for
+            # protection and the abort fraction (they are not "epochs that
+            # look like outliers" — they are decided blunders), and stamp
+            # their reason as REASON_GROSS only.
             cand_c &= ~gross[c]
             reasons_c = np.where(gross[c], np.uint8(REASON_GROSS), reasons_c).astype(
                 np.uint8
@@ -1763,7 +1773,12 @@ def detect_outliers(
                 c,
                 despiked=gross[c],
             )
-            candidates[c] = cand_c
+            # Returned candidate mask INCLUDES gross so the documented §8.4
+            # invariants hold with despike on: flags ⊆ candidates and
+            # reasons == 0 exactly off candidates. Gross epochs carry
+            # REASON_GROSS (never REASON_GLOBAL/LOCAL) and are never
+            # clustered/protected/abort-counted.
+            candidates[c] = cand_c | gross[c]
             reasons[c] = reasons_c
             protected[c] = prot_c
             z_stat[c] = z_c
