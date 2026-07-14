@@ -601,9 +601,85 @@ Injectors (composable, each returns truth bookkeeping):
    needed for known-pathological stations?
    - possibly we can have a per station override for this. but I think 5% is a good starting point. we can adjust it later if needed.
 
+## 10. Addendum — two upgrades (branch `outlier-prefilter-localfit`, 2026-07-14)
+
+Two **param-gated** additions to `detect_outliers`; the `OutlierParams()`
+defaults reproduce the §3 behavior bit-identically (proven: the 423 §8 tests
+pass unchanged, and a golden order-0 fixture is pinned in
+`tests/test_outliers_stage0.py::test_golden_order0_fixture`).
+
+### §3.0 — Stage-0 gross-blunder despike (pre-fit; `despike`, default off)
+
+A cheap surgical pre-filter run ONCE on the raw per-component observations
+**before** the model fit, so obvious extreme single-epoch blunders (the FAGD
+East ~150 mm case) cannot corrupt the robust fit or the MAD scale. It is NOT
+the main detector — only "obvious" isolated extremes.
+
+Spike-vs-step rule (`neighbor_differences` → `spike_mask`). With gap-aware
+first differences `δ⁻_i = y_i − y_{i−1}`, `δ⁺_i = y_{i+1} − y_i` (NaN across a
+gap wider than `despike_gap_days`, so adjacency is temporal, not index-based)
+and the robust difference scale `ŝ_Δ = mad_scale(δ⁻)`, epoch `i` is a gross
+blunder iff
+
+```
+min(|δ⁻_i|, |δ⁺_i|) > k_d·ŝ_Δ   ∧   δ⁻_i·δ⁺_i < 0   ∧   |δ⁻_i + δ⁺_i| ≤ c_r·ŝ_Δ
+```
+
+— strong deviation from BOTH neighbors, opposite directions (up-then-down),
+and the neighbors agree (`δ⁻ + δ⁺ = y_{i+1} − y_{i−1}`, the series RETURNS to
+baseline). A persistent offset (real step) has `δ⁺ ≈ 0` at the jump and fails
+the first two conditions; a linear/curved trend gives same-sign differences and
+fails the second — steps and transients are never despiked. Refs: Goring &
+Nikora 2002 (difference despiking); Pearson et al. 2016 §1 (spike returns,
+level shift persists); Gazeaux et al. 2013 (why steps must not be auto-clipped).
+
+Defaults: `k_d = despike_n_sigma = 10` (a spike of amplitude A scores ≈ A/(√2σ)
+under white noise σ, so k_d = 10 ⇒ A ≳ 14σ — deliberately conservative);
+`c_r = despike_return_sigma = 4`; `despike_gap_days = 1.5`. Despiked epochs are
+masked (never deleted), tagged `REASON_GROSS = 4`, excluded from the fit and the
+identifiers, force-flagged, counted in `OutlierDetection.n_despiked`, and
+respect `protect_windows`. They do **not** count toward the `f_max` abort
+fraction (decided blunders, not "epochs that look like outliers").
+
+### §3.3b-poly — windowed identifier: local constant → robust local polynomial
+
+The windowed (Hampel) identifier generalizes from an order-0 local constant
+(`rolling_median`/`rolling_mad`) to a **robust local polynomial** f(x) of order
+`window_order ∈ {0, 1, 2}` (`rolling_polyfit`; LOWESS — Cleveland 1979, JASA
+74:829: tricube distance weights + `window_robust_iterations` bisquare
+robustness passes). Decision unchanged: `|w_i − m_i| > k_w·max(s_i, s_floor)`
+with `m_i = f̂_i(t_i)` and `s_i` the MAD of the local fit residuals.
+`window_order = 0` (default) takes the exact `rolling_median` path.
+
+Rationale and honest scope (A/B evidence,
+`tests/verification_outlier_ab.py`): during a steep transient the order-0 local
+MAD is **inflated by the in-window signal slope**, raising the local threshold
+so genuine outliers riding the ramp are masked (0/3 spikes caught, local scale
+14.3 mm on a 3 mm/d ramp); a robust local line/parabola restores an honest local
+scale (order-2: 1.86 mm, 3/3 caught). This is the real, demonstrated benefit —
+**recall on transients**, not abort avoidance: on a strongly unmodeled
+meter-scale ramp the candidate population is ~97 % *global*-identifier, which no
+window order can change, so order ≥ 1 does NOT by itself prevent the §3.5 abort
+(that needs the transient declared as a step / transient term, or a per-station
+`max_flag_fraction`). **Caveat (test-pinned):** at an *undeclared* slope
+discontinuity the local line cannot straddle the kink → the onset epochs become
+candidates; the existing PROTECT_STEP guard still runs, and in production the
+onset is a declared step or a `protect_window`. **Decision for BGÓ:** order ≥ 1
+is safe to enable only where the transient/step is declared or protected.
+
+### §8.4 amendment — candidates includes gross
+
+To preserve the §8.4 property invariants with despike on (`flags ⊆ candidates`;
+`reasons == 0` exactly off candidates), the returned `candidates` mask includes
+the Stage-0 despiked epochs (distinguished by `REASON_GROSS`), even though they
+are excluded from clustering, protection and the abort fraction.
+
 ---
 
-_Spec created 2026-07-13 (analysis lane). No implementation in this change; the
-module lands under the usual gates: MATH_STANDARDS-conformant docstrings, ruff/
-black/mypy(strict) zero warnings, the §8 test plan green, contract A8 amendment
-in `gps_api/docs/API_CONTRACT.md` + `schemas.py` together._
+_Spec created 2026-07-13 (analysis lane). §10 addendum implemented 2026-07-14
+(branch `outlier-prefilter-localfit`): Stage-0 despike + local-polynomial
+windowed identifier, param-gated, defaults bit-identical. Module lands under the
+usual gates: MATH_STANDARDS-conformant docstrings, ruff/black/mypy(strict) zero
+warnings, the §8 test plan green (423 unchanged + new), contract A8 amendment in
+`gps_api/docs/API_CONTRACT.md` + `schemas.py` together (still pending — API not
+in this change)._
