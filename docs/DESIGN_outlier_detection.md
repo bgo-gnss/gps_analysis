@@ -154,6 +154,18 @@ t_end + W_post]}`,
                    i.e. the series _stays offset_ after the cluster — a step, not a blunder.
                    A blunder cluster has `D ≈ 0` (series returns to the model).
 
+    **Run-rule / blunder-cluster precedence (2026-07-14).** The span+sign run
+    rule is _released_ when the step-evidence conclusively marks the cluster a
+    blunder: both flanks present (`D` determinate), `D ≤ k_step`, **and** the
+    background `B = max(|r̄_pre|, |r̄_post|)/ŝ ≤ k_step` (flanks at the model).
+    Such a cluster returns to baseline with no net offset and no elevated
+    background — a decided blunder — so it is flagged rather than
+    `PROTECT_RUN`'d. A NaN/thin flank keeps `D` indeterminate → not conclusive →
+    the run rule stands (conservative). This fixed a real miss: the SENG 2016
+    −450 mm Up streak (4 consecutive days, returning to 0) was run-protected
+    purely on span+sign. Genuine transients/SSEs have an elevated or
+    indeterminate flank → never "conclusive blunder" → still protected.
+
 3. **Protected event windows.** The caller may pass intervals
     `[t_a, t_b]` (eruption onsets, dike intrusions, configured
     `outliers.protect_windows`) which are treated as an operator-declared
@@ -557,6 +569,7 @@ Injectors (composable, each returns truth bookkeeping):
 | `test_protect_window_clears_abort` | same step, unrest declared `protect_windows` | `excess_flag_abort=False`, converged, nothing flagged inside, `PROTECT_WINDOW` set                          |
 | `test_protect_window_excluded_from_fit` | 500 mm ramp in a protect window + quiet blunder | no abort; quiet blunder flagged; quiet region otherwise clean (fit not distorted)                    |
 | `test_floor_protection`          | quiet series (ŝ → 1 mm), 3 mm wiggles          | zero flags (`PROTECT_FLOOR` recorded on candidates)                                                         |
+| `test_returning_blunder_cluster_not_run_protected` | 4-day same-sign cluster that returns to baseline | flagged, NOT `PROTECT_RUN` (run-rule released; transients still protected)                        |
 
 ### 8.4 Contract & property tests
 

@@ -729,6 +729,21 @@ class TestSignalProtection:
         flagged_candidates = res.candidates[idx]
         assert np.all(res.protected[idx][flagged_candidates] & PROTECT_FLOOR)
 
+    def test_returning_blunder_cluster_not_run_protected(self) -> None:
+        # a multi-day same-sign cluster that RETURNS to baseline is a blunder,
+        # not a run: with both flanks at the model and D ≈ 0 it must be flagged,
+        # not PROTECT_RUN'd (BGÓ: the SENG 2016 −300 mm Up streak, 4 consecutive
+        # days, was run-protected purely on span+sign). A real transient (which
+        # does NOT return) stays protected — test_transient_survives.
+        n = 1500
+        t, y = _white_series(n, 5)
+        idx = np.array([600, 601, 602, 603], dtype=np.intp)  # ~3-day run > L_max
+        y2 = _inject_spikes(y, idx, np.full(4, -300.0))
+        res = detect_outliers(lineperiodic, t, y2)
+        assert not res.excess_flag_abort
+        assert np.all(res.flags[idx])  # blunder cluster flagged
+        assert not np.any(res.protected[idx] & PROTECT_RUN)  # run-rule released
+
 
 # ---------------------------------------------------------------------------
 # Contract & property tests (§8.4)

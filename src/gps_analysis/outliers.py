@@ -1483,7 +1483,10 @@ def _protect_component(
     (``PROTECT_WINDOW``), and per cluster (:func:`candidate_clusters`):
 
     - the run-length/same-sign rule (``PROTECT_RUN``): span > L_max and
-      ≥ q of the members share the residual sign;
+      ≥ q of the members share the residual sign — **unless** the cluster is
+      a conclusive blunder (both flanks present, ``D`` small AND background
+      small, i.e. it returns to the model), in which case the run-rule is
+      released and the cluster is flagged (§3.4.2);
     - the step-evidence rule (``PROTECT_STEP``):
       ``D = |r̄_post − r̄_pre|/ŝ > k_step`` or D indeterminate (NaN thin
       flank — "cannot rule out a step");
@@ -1523,7 +1526,6 @@ def _protect_component(
         dominant = 1 if n_pos >= n_neg else -1
         sign_fraction = max(n_pos, n_neg) / members.size
         span = float(tt[i_end] - tt[i_start])
-        run_rule = span > max_run and sign_fraction >= params.run_sign_fraction
         background_rule = False
         if s_global > 0.0:
             med_pre, med_post = _flank_medians(
@@ -1540,6 +1542,24 @@ def _protect_component(
         else:
             d = float("nan")
         step_rule = math.isnan(d) or d > params.step_evidence_sigma
+        # A multi-day same-sign run is protected as possible unmodeled signal
+        # UNLESS the step-evidence conclusively marks it a blunder cluster: it
+        # returns to baseline (D small AND determinate) and both flanks sit at
+        # the model (background small). Such a cluster is a decided blunder
+        # (§3.4.2 "D ≈ 0, the series returns to the model") and must be flagged,
+        # not protected. (BGÓ 2026-07-14: a 4-day −450 mm SENG Up streak that
+        # returns to 0 was run-protected purely on span+sign.) A NaN/thin flank
+        # keeps d indeterminate → not a conclusive blunder → run-rule stands.
+        conclusive_blunder = (
+            not math.isnan(d)
+            and d <= params.step_evidence_sigma
+            and not background_rule
+        )
+        run_rule = (
+            span > max_run
+            and sign_fraction >= params.run_sign_fraction
+            and not conclusive_blunder
+        )
         if run_rule or step_rule or background_rule:
             if run_rule or background_rule:
                 protected[members] |= np.uint8(PROTECT_RUN)
