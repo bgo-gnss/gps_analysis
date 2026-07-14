@@ -1685,9 +1685,11 @@ def detect_outliers(
         raise ValueError("y must be finite (no NaN/inf)")
     sigmas = _per_component_sigma(sigma, yy, was_1d)
     n_components, n = yy.shape
+    in_protect = np.zeros(n, dtype=np.bool_)
     for t_a, t_b in protect_windows:
         if t_b < t_a:
             raise ValueError(f"protect window ({t_a}, {t_b}) has t_b < t_a")
+        in_protect |= (tt >= t_a) & (tt <= t_b)
     if names is not None and len(names) != n_components:
         raise ValueError(
             f"names has {len(names)} entries for {n_components} components"
@@ -1745,7 +1747,7 @@ def detect_outliers(
                 yy[c],
                 sigmas[c],
                 guesses[c],
-                ~(flags[c] | gross[c]),
+                ~(flags[c] | gross[c] | in_protect),
                 detection_params,
                 half_window,
             )
@@ -1786,7 +1788,17 @@ def detect_outliers(
             scale_local[c] = s_loc
             events.extend(events_c)
             new_flags[c] = (cand_c & (prot_c == 0)) | gross[c]
-            if float(np.count_nonzero(cand_c)) / n > detection_params.max_flag_fraction:
+            # Operator-declared protect windows are explicit "this is signal
+            # here" intervals; their candidates are EXPECTED (by the operator's
+            # own account the model is unrepresentative there) and must NOT trip
+            # the pathological-series abort. Auto-protections (STEP/RUN/FLOOR)
+            # are NOT excluded — a series the leaf must auto-protect wholesale
+            # still signals a wrong model and should still abort. Numerator-only
+            # (denominator stays n); protected epochs are never flagged anyway
+            # (§3.5).
+            abort_candidates = cand_c & ~in_protect
+            n_abort = float(np.count_nonzero(abort_candidates))
+            if n_abort / n > detection_params.max_flag_fraction:
                 aborted = True
         if detection_params.epoch_policy == "union":
             union = np.any(new_flags, axis=0)
