@@ -24,11 +24,11 @@ Consolidates `~/work/projects/gps_data_analyses` (`svartsengi-model`,
 
 ## Module map
 
-`models` · `fitting` · `velocity` · `baseline` · `preprocess` · `outliers` · `deformation` · `joint` · `transient`
+`models` · `fitting` · `velocity` · `baseline` · `preprocess` · `outliers` · `detrend` · `deformation` · `joint` · `transient`
 — fill surfaces in place; don't rename modules without updating plan §10.2
 (`preprocess` added by refactor-B slice 2, `joint` by the GPS+InSAR slice,
-`outliers` by the outlier-detection slice — flag all three to plan §10.2 at
-next plan edit).
+`outliers` by the outlier-detection slice, `detrend` by the detrend-leaf
+slice — flag all four to plan §10.2 at next plan edit).
 All math is atomic + referenced per [`docs/MATH_STANDARDS.md`](docs/MATH_STANDARDS.md) (binding).
 Shared internal: `_mcmc` — the ONE GBIS Metropolis/annealing/adaptive-step core
 (Bagnardi & Hooper 2018 §3; `T_SCHEDULE`, `sensitivity_schedule`, `metropolis`,
@@ -38,7 +38,8 @@ Shared internal: `_mcmc` — the ONE GBIS Metropolis/annealing/adaptive-step cor
 
 | Module | Status | Contents |
 |---|---|---|
-| `models` | ✅ implemented | `linear`/`periodic`/`lineperiodic`, `exp_linear`(+rate), `poly2`(+rate/peak), `heaviside_steps` (known-step term, H(0)=1), `TrajectoryParams` |
+| `models` | ✅ implemented | `linear`/`periodic`/`lineperiodic`, `exp_linear`(+rate), `poly2`(+rate/peak), `heaviside_steps` (known-step term, H(0)=1), `TrajectoryParams` (+ `to_record`/`from_record` JSON-ready per-component serialization — full vector incl. intercept, upper-triangle covariance; the CSV 5-of-6 defect is dead) |
+| `detrend` | ✅ implemented (2026-07-14, `docs/DESIGN_live_detrending.md` §0/§2/§5, detrend-leaf slice) | **Stored-parameter detrending — estimate once, apply anywhere**: `estimate_detrend` (window + §2.2 validity gates → `with_steps` step augmentation → `detect_outliers` BEFORE the fit (BGÓ hard rule) → final clean WLS; `detrend_method` tag `"step_augmented_robust"`/`"plain_wls"`, opaque `frame` passthrough, loud abort degrade), `DetrendEstimate.to_record` (self-contained station record: model code, step epochs, `fitted_at`/`frame`/`record_version`/`borrowed`/`refs` provenance), `trajectory_from_record`/`evaluate_record`/`apply_detrend` (pure apply at ANY epoch incl. future/borrowed-station; frame-mismatch guard; exactly invertible, raw never mutated), `select_terms` (secular/periodic views by coefficient+covariance zeroing; steps stay secular). Estimation caller (precompute/config/steps.csv/staleness) + `geo_dataread` delivery = later slices |
 | `fitting` | ✅ implemented | `fit_components`, `detrend_fit`, `remove_trend`, `reject_outliers` (light exploratory clip — production path is `outliers.detect_outliers`), `with_steps` (step-augmented model factory; linear models keep the closed-form WLS path) |
 | `baseline` | ✅ implemented | `slice_window`, `estimate_offset`/`remove_offset`, `estimate_step_offset` |
 | `outliers` | ✅ implemented (2026-07-13, `docs/DESIGN_outlier_detection.md` §3–§4) | **Model-aware detection + signal protection**: atomics `mad_scale`/`qn_scale` (Qn = non-default O(N²) reference, Phase 1.5)/`whiten`/`standardize_robust`/`rolling_median`/`rolling_mad`/`hampel_mask`/`candidate_clusters`/`step_evidence`; `detect_outliers` orchestration — Huber step-augmented fit → global (k_g=5) + windowed-Hampel (k_w=4, time windows) identifiers → §3.4 protection (`PROTECT_FLOOR/RUN/STEP/WINDOW` + elevated-background arm) → conservative iteration with the >f_max **candidate**-fraction abort (all-False flags, loud). Always returns mask + `REASON_*`/`PROTECT_*` bitmasks + `SuspectedEvent` hints + fits; never filters, never mutates. `epoch_policy` per_component (default)/union. §8.3 release gate test-pinned (`tests/test_outliers.py`) |
@@ -83,4 +84,8 @@ uv run mypy src tests && uv run pytest
 - Home: **GitHub** (libs); CI: `.github/workflows/ci.yml`.
 
 ---
-*Last reviewed: 2026-07-13 (NEW `outliers` module — model-aware outlier detection with signal protection per `docs/DESIGN_outlier_detection.md`: Hampel + global identifiers on studentized residuals of a Huber step-augmented trajectory fit, PROTECT_* bitmask protection stage, candidate-fraction abort, SuspectedEvent hints; `models.heaviside_steps` + `fitting.with_steps` added, `reject_outliers` demoted to exploratory. Previous 2026-07-12: `joint` module — joint GPS+InSAR Mogi inversion, Helmert-VCE weighting, depth–ΔV trade-off break test-pinned; shared `_mcmc` core; Okada distributed slip.)*
+*Last reviewed: 2026-07-14 (NEW `detrend` module — stored-parameter detrending leaf per
+`docs/DESIGN_live_detrending.md` §0 locked decisions: `estimate_detrend` (gates → steps →
+`detect_outliers` → clean WLS, method tag + frame passthrough), record serialization
+(`TrajectoryParams.to_record`/`from_record` + self-contained station records with borrowed
+provenance), pure apply-by-record at any epoch, `select_terms`. Previous 2026-07-13: `outliers` module — model-aware outlier detection with signal protection per `docs/DESIGN_outlier_detection.md`: Hampel + global identifiers on studentized residuals of a Huber step-augmented trajectory fit, PROTECT_* bitmask protection stage, candidate-fraction abort, SuspectedEvent hints; `models.heaviside_steps` + `fitting.with_steps` added, `reject_outliers` demoted to exploratory. Previous 2026-07-12: `joint` module — joint GPS+InSAR Mogi inversion, Helmert-VCE weighting, depth–ΔV trade-off break test-pinned; shared `_mcmc` core; Okada distributed slip.)*

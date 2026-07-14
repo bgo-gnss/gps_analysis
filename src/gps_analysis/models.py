@@ -57,6 +57,8 @@ Conventions (binding, see ``docs/MATH_STANDARDS.md``)
 """
 
 import dataclasses
+from collections.abc import Mapping
+from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -598,3 +600,116 @@ class TrajectoryParams:
     def __len__(self) -> int:
         """Number of parameters P."""
         return int(self.params.size)
+
+    def to_record(self) -> dict[str, Any]:
+        """Serialize (p̂, C_p̂) to a JSON-ready per-component record.
+
+        Mapping (``docs/DESIGN_live_detrending.md`` §5.2 — the leaf owns
+        this per-component shape; the station/document schema is the
+        caller's):
+
+            ``{"params": [p̂₀ … p̂_{P−1}],``
+            `` "cov_upper": [C₀₀, C₀₁, …, C_{P−1,P−1}] | None,``
+            `` "component": str | None}``
+
+        ``cov_upper`` is the row-major **upper triangle** of C_p̂ —
+        P(P+1)/2 numbers, exact linear error propagation into any
+        derived view (JCGM 100:2008 GUM §5.1.2) at negligible cost —
+        or ``None`` when the covariance contains non-finite entries
+        (the ``inf``-filled "could not be estimated" convention of
+        :func:`gps_analysis.fitting.fit_components`; JSON has no inf).
+
+        Returns:
+            Plain dict of Python floats/lists — full ``repr`` precision
+            (17 significant digits) survives ``json.dumps``/``loads``
+            bit-exactly, so store → load → apply equals fit → apply.
+            **The full parameter vector is serialized, including the
+            intercept** — fixing the legacy ``detrend_itrf2008.csv``
+            5-of-6 defect that forced the ``vshift`` re-referencing
+            pass (design §0.1 #1). Pure: no I/O — file writing is the
+            caller's business (leaf rule R2).
+
+        Reference:
+            Design spec ``docs/DESIGN_live_detrending.md`` §3.2/§5.2.
+
+        Numerical notes:
+            Round trip via :meth:`from_record` reproduces ``params``
+            bit-exactly and the covariance exactly on and above the
+            diagonal; the lower triangle is re-mirrored from the upper
+            one, so an input asymmetric at the 1-ulp level (matrix-
+            product rounding) comes back exactly symmetric. Any
+            non-finite covariance entry collapses to ``cov_upper:
+            None`` → all-``inf`` on load (no partial-NaN paths, design
+            §3.2 rules).
+        """
+        if bool(np.all(np.isfinite(self.covariance))):
+            iu = np.triu_indices(self.params.size)
+            cov_upper: list[float] | None = [float(v) for v in self.covariance[iu]]
+        else:
+            cov_upper = None
+        return {
+            "params": [float(v) for v in self.params],
+            "cov_upper": cov_upper,
+            "component": self.component,
+        }
+
+    @classmethod
+    def from_record(cls, record: Mapping[str, Any]) -> "TrajectoryParams":
+        """Reconstruct :class:`TrajectoryParams` from a :meth:`to_record` dict.
+
+        Inverse of :meth:`to_record` — see there for the record shape.
+        ``cov_upper: None`` loads as a covariance filled with ``+inf``
+        (the "could not be estimated" convention); a **hand-pinned**
+        record (operator-edited ``params``) loads unchanged — no
+        renormalization, no re-fitting (design §0.7).
+
+        Args:
+            record: Mapping with ``"params"`` (length-P list of finite
+                floats), optional ``"cov_upper"`` (length P(P+1)/2 list
+                or ``None``) and optional ``"component"`` (str or
+                ``None``).
+
+        Returns:
+            A validated :class:`TrajectoryParams`.
+
+        Raises:
+            ValueError: If ``params`` is missing/not 1-D/empty/non-finite
+                (no silent NaN-tolerant paths — design §3.2 rules), or
+                ``cov_upper`` has the wrong length.
+
+        Reference:
+            Design spec ``docs/DESIGN_live_detrending.md`` §3.2/§5.2.
+
+        Numerical notes:
+            The covariance is rebuilt exactly symmetric from the upper
+            triangle; ``params`` round-trip bit-exactly (float64 ↔
+            17-significant-digit decimal is lossless).
+        """
+        if "params" not in record:
+            raise ValueError("record has no 'params' entry")
+        params = np.asarray(record["params"], dtype=np.float64)
+        if params.ndim != 1 or params.size == 0:
+            raise ValueError(
+                f"params must be 1-D and non-empty, got shape {params.shape}"
+            )
+        if not np.all(np.isfinite(params)):
+            raise ValueError("params must be finite (no NaN/inf)")
+        p = int(params.size)
+        cov_upper = record.get("cov_upper")
+        if cov_upper is None:
+            covariance = np.full((p, p), np.inf, dtype=np.float64)
+        else:
+            cu = np.asarray(cov_upper, dtype=np.float64)
+            expected = p * (p + 1) // 2
+            if cu.shape != (expected,):
+                raise ValueError(
+                    f"cov_upper must have P(P+1)/2 = {expected} entries for "
+                    f"{p} parameters, got shape {cu.shape}"
+                )
+            covariance = np.zeros((p, p), dtype=np.float64)
+            covariance[np.triu_indices(p)] = cu
+            covariance = covariance + np.triu(covariance, k=1).T
+        component = record.get("component")
+        if component is not None and not isinstance(component, str):
+            raise ValueError(f"component must be a string or None, got {component!r}")
+        return cls(params=params, covariance=covariance, component=component)

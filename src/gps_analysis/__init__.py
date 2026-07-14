@@ -50,6 +50,16 @@ from gps_analysis.deformation import (
     time_for_rate,
     volume_from_pressure,
 )
+from gps_analysis.detrend import (
+    DETREND_METHOD_PLAIN,
+    DETREND_METHOD_ROBUST,
+    DetrendEstimate,
+    apply_detrend,
+    estimate_detrend,
+    evaluate_record,
+    select_terms,
+    trajectory_from_record,
+)
 from gps_analysis.fitting import (
     ModelFunc,
     OutlierRejection,
@@ -186,6 +196,15 @@ __all__ = [
     "candidate_clusters",
     "step_evidence",
     "detect_outliers",
+    # detrend (stored-parameter detrending: estimate once, apply anywhere)
+    "DETREND_METHOD_PLAIN",
+    "DETREND_METHOD_ROBUST",
+    "DetrendEstimate",
+    "estimate_detrend",
+    "select_terms",
+    "trajectory_from_record",
+    "evaluate_record",
+    "apply_detrend",
     # baseline
     "slice_window",
     "estimate_offset",
