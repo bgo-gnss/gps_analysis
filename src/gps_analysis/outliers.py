@@ -12,6 +12,20 @@ Derivation chain
 Per component c of one station, with epochs t ∈ ℝᴺ (fractional years),
 observations y ∈ ℝᴺ [L] and optional formal 1-σ uncertainties σ ∈ ℝᴺ [L]:
 
+0. **Stage-0 gross-blunder despike** (§3.0 addendum; **off by default**,
+   ``despike=True`` opts in). Before any model is fitted, isolated
+   single-epoch spikes that are extreme against BOTH temporal neighbors
+   *and return to baseline* are masked out of every subsequent fit: with
+   gap-aware first differences δ⁻/δ⁺ (:func:`neighbor_differences`) and
+   the robust difference scale ``ŝ_Δ = mad_scale(δ⁻)``, epoch i is a
+   gross blunder (:func:`spike_mask`) iff
+   ``min(|δ⁻_i|, |δ⁺_i|) > k_d·ŝ_Δ`` ∧ ``δ⁻_i·δ⁺_i < 0`` ∧
+   ``|δ⁻_i + δ⁺_i| ≤ c_r·ŝ_Δ``. A persistent offset (a real step: the
+   level shifts and STAYS) fails the first two conditions and is never
+   despiked. Despiked epochs are masked — never deleted — tagged
+   ``REASON_GROSS``, excluded from the robust fit and the identifier
+   candidates, force-flagged, and counted in ``n_despiked``; caller
+   ``protect_windows`` disable despiking outright.
 1. **Step-augmented robust fit** (§3.1). The trajectory
    ``f(t; p, a) = f_traj(t; p) + Σ_k a_k·H(t − t_k)``
    (:func:`gps_analysis.fitting.with_steps`,
@@ -29,9 +43,17 @@ observations y ∈ ℝᴺ [L] and optional formal 1-σ uncertainties σ ∈ ℝ�
    normalized MAD (:func:`mad_scale`, default) or Qn (:func:`qn_scale`,
    optional); global candidates ``G_i : |ẑ_i| > k_g`` (Davies & Gather
    1993 identifier framing).
-4. **Windowed Hampel identifier** (§3.3b). Local median
-   ``m_i = med{w_j : |t_j − t_i| ≤ h}`` (:func:`rolling_median`), local
-   MAD about it ``s_i`` (:func:`rolling_mad`), decision
+4. **Windowed Hampel identifier** (§3.3b). Local center ``m_i`` and
+   scale ``s_i`` of selectable polynomial order (``window_order``):
+   order 0 (default) is the local median
+   ``m_i = med{w_j : |t_j − t_i| ≤ h}`` (:func:`rolling_median`) with
+   the local MAD about it (:func:`rolling_mad`); orders 1/2 are a
+   **robust local polynomial** (LOWESS — tricube distance weights +
+   bisquare robustness iterations, Cleveland 1979;
+   :func:`rolling_polyfit`) with ``m_i = f̂_i(t_i)`` and ``s_i`` the MAD
+   of the local fit residuals — during fast transients a local constant
+   lags the motion and over-flags on-trend epochs, a local line/parabola
+   tracks the slope/curvature. Decision (either order):
    ``L_i : |w_i − m_i| > k_w·max(s_i, s_floor)`` (:func:`hampel_mask`;
    Hampel 1974; Pearson et al. 2016). Windows are defined **in time**;
    thin windows (< n_min samples) fall back to the global center/scale —
@@ -93,6 +115,7 @@ __all__ = [
     "PROTECT_STEP",
     "PROTECT_WINDOW",
     "REASON_GLOBAL",
+    "REASON_GROSS",
     "REASON_LOCAL",
     "OutlierDetection",
     "OutlierParams",
@@ -101,9 +124,12 @@ __all__ = [
     "detect_outliers",
     "hampel_mask",
     "mad_scale",
+    "neighbor_differences",
     "qn_scale",
     "rolling_median",
     "rolling_mad",
+    "rolling_polyfit",
+    "spike_mask",
     "standardize_robust",
     "step_evidence",
     "whiten",
@@ -118,6 +144,13 @@ REASON_GLOBAL = 1
 
 REASON_LOCAL = 2
 """Reason bit: windowed Hampel identifier fired (§3.3b)."""
+
+REASON_GROSS = 4
+"""Reason bit: Stage-0 gross-blunder despike fired (§3.0 addendum) —
+an isolated single-epoch spike, extreme against both temporal neighbors
+with the series returning to baseline. Set instead of (never together
+with) ``REASON_GLOBAL``/``REASON_LOCAL``: despiked epochs are decided
+before the model fit and removed from the identifier candidates."""
 
 PROTECT_FLOOR = 1
 """Protection bit: candidate below the physical magnitude floor a_min
@@ -271,6 +304,150 @@ def qn_scale(x: ArrayLike) -> float:
     diffs = np.abs(xx[i_upper] - xx[j_upper])
     kth = float(np.partition(diffs, k - 1)[k - 1])
     return float(_QN_CONSISTENCY * _qn_finite_sample_factor(n) * kth)
+
+
+def neighbor_differences(
+    t: ArrayLike, x: ArrayLike, *, max_gap: float
+) -> tuple[FloatArray, FloatArray]:
+    """Compute the gap-aware first differences δ⁻, δ⁺ to both neighbors.
+
+    Equation:
+        ``δ⁻_i = x_i − x_{i−1}``  if ``t_i − t_{i−1} ≤ g``  else NaN,
+        ``δ⁺_i = x_{i+1} − x_i``  if ``t_{i+1} − t_i ≤ g``  else NaN
+
+    — the deviation of epoch i from its previous/next **temporally
+    adjacent** sample. Adjacency is decided on the time axis, not on the
+    array index: across a data gap wider than g the difference mixes
+    real signal accumulated over the gap with the blunder amplitude, so
+    it is reported NaN (= "no usable neighbor"). The series boundaries
+    (i = 0 for δ⁻, i = N−1 for δ⁺) are NaN by construction.
+
+    Symbols → args:
+        - ``t_i`` → ``t``: epochs, shape (N,), sorted ascending [yr]
+        - ``x_i`` → ``x``: samples, shape (N,) [units of x]
+        - ``g``   → ``max_gap``: maximum neighbor spacing [units of t]
+          (fractional years — pass e.g. ``1.5 / 365.25`` for 1.5 d)
+
+    Returns:
+        ``(δ⁻, δ⁺)`` — two float64 arrays, shape (N,); NaN marks a
+        missing/too-distant neighbor.
+
+    Raises:
+        ValueError: If ``t`` is unsorted/non-finite, ``x`` is non-finite,
+            shapes mismatch, or ``max_gap ≤ 0``.
+
+    Reference:
+        First-difference despiking statistics: Goring & Nikora 2002,
+        J. Hydraul. Eng. 128(1) (difference-based spike detection);
+        successive differences as a trend-immune noise probe:
+        von Neumann et al. 1941, Ann. Math. Statist. 12.
+
+    Numerical notes:
+        One ``np.diff`` pass, no accumulation. A locally linear signal
+        of rate v contributes v·Δt to both differences with the SAME
+        sign, so the downstream two-sided rule (:func:`spike_mask`) is
+        trend-immune by construction.
+    """
+    tt = _validate_sorted_time(t)
+    xx = _validate_series("x", x)
+    if xx.shape != tt.shape:
+        raise ValueError(f"x shape {xx.shape} does not match t shape {tt.shape}")
+    if max_gap <= 0.0:
+        raise ValueError(f"max_gap must be > 0, got {max_gap}")
+    n = int(tt.size)
+    delta_prev = np.full(n, np.nan, dtype=np.float64)
+    delta_next = np.full(n, np.nan, dtype=np.float64)
+    if n < 2:
+        return delta_prev, delta_next
+    d = np.diff(xx)
+    adjacent = np.diff(tt) <= max_gap
+    delta_prev[1:][adjacent] = d[adjacent]
+    delta_next[:-1][adjacent] = d[adjacent]
+    return delta_prev, delta_next
+
+
+def spike_mask(
+    delta_prev: ArrayLike,
+    delta_next: ArrayLike,
+    *,
+    n_sigma: float,
+    scale: float,
+    return_n_sigma: float,
+) -> NDArray[np.bool_]:
+    """Apply the two-sided isolated-spike decision rule elementwise.
+
+    Equation:
+        ``S_i : min(|δ⁻_i|, |δ⁺_i|) > k_d·ŝ_Δ`` ∧ ``δ⁻_i·δ⁺_i < 0`` ∧
+        ``|δ⁻_i + δ⁺_i| ≤ c_r·ŝ_Δ``
+
+    — epoch i deviates strongly from BOTH temporal neighbors (first
+    condition), in opposite difference directions, i.e. up-then-down or
+    down-then-up (second condition), and the two neighbors agree with
+    each other, ``δ⁻ + δ⁺ = x_{i+1} − x_{i−1}``, so the series RETURNS
+    to baseline (third condition). A persistent offset (real step) has
+    ``δ⁺ ≈ 0`` at the jump epoch and fails the first two conditions; a
+    linear trend gives same-sign differences and fails the second — so
+    only isolated single-epoch spikes fire.
+
+    Symbols → args:
+        - ``δ⁻_i`` → ``delta_prev``: backward differences, shape (N,)
+          [units of x]; NaN = no usable neighbor
+          (:func:`neighbor_differences`)
+        - ``δ⁺_i`` → ``delta_next``: forward differences, shape (N,)
+          [units of x]
+        - ``k_d``  → ``n_sigma``: spike threshold [dimensionless]
+        - ``ŝ_Δ``  → ``scale``: robust first-difference scale
+          [units of x] — e.g. ``mad_scale`` of the finite δ⁻ (median-
+          centered, so a constant rate does not inflate it); under white
+          noise σ, ŝ_Δ estimates √2·σ, and a spike of amplitude A scores
+          ``A/(√2·σ)`` on both sides
+        - ``c_r``  → ``return_n_sigma``: neighbor-agreement (return-to-
+          baseline) tolerance [dimensionless]; under white noise
+          ``δ⁻ + δ⁺`` has the same √2·σ scale, so c_r ≈ 4 accepts
+          essentially every genuine spike while a residual same-sign
+          offset > c_r·ŝ_Δ (spike-plus-step) is left to the main,
+          protection-aware stage
+
+    Returns:
+        Boolean mask S, shape (N,) — True where an isolated gross spike
+        is identified. Any NaN δ (gap, boundary) yields **False**
+        (conservative: no usable neighbor ⇒ never despike).
+
+    Raises:
+        ValueError: On shape mismatch, or non-positive ``n_sigma``,
+            ``scale`` or ``return_n_sigma``.
+
+    Reference:
+        Spike-vs-step framing (a spike returns immediately, a level
+        shift persists): Pearson, Neuvo, Astola & Gabbouj 2016, EURASIP
+        J. Adv. Signal Process. 2016:87, §1; difference-based despiking:
+        Goring & Nikora 2002, J. Hydraul. Eng. 128(1); why steps must
+        never be auto-clipped: Gazeaux et al. 2013, JGR 118 (DOGEx).
+
+    Numerical notes:
+        Pure elementwise comparisons; NaN comparisons are IEEE-False so
+        gap/boundary epochs drop out without special-casing. The rule is
+        deliberately blind to multi-epoch clusters (two adjacent
+        blunders give a small middle difference) — those remain the main
+        detector's job.
+    """
+    dp = np.asarray(delta_prev, dtype=np.float64)
+    dn = np.asarray(delta_next, dtype=np.float64)
+    if dp.shape != dn.shape:
+        raise ValueError(
+            f"delta_prev shape {dp.shape} does not match delta_next shape {dn.shape}"
+        )
+    if n_sigma <= 0.0:
+        raise ValueError(f"n_sigma must be > 0, got {n_sigma}")
+    if scale <= 0.0:
+        raise ValueError(f"scale must be > 0, got {scale}")
+    if return_n_sigma <= 0.0:
+        raise ValueError(f"return_n_sigma must be > 0, got {return_n_sigma}")
+    with np.errstate(invalid="ignore"):
+        two_sided = np.minimum(np.abs(dp), np.abs(dn)) > n_sigma * scale
+        opposite = dp * dn < 0.0
+        returns = np.abs(dp + dn) <= return_n_sigma * scale
+    return np.asarray(two_sided & opposite & returns, dtype=np.bool_)
 
 
 def whiten(r: ArrayLike, sigma: ArrayLike | None) -> FloatArray:
@@ -497,6 +674,158 @@ def rolling_mad(
         if hi - lo >= min_count and not math.isnan(cc[i]):
             out[i] = _MAD_TO_SIGMA * np.median(np.abs(xx[lo:hi] - cc[i]))
     return out
+
+
+def _lowess_window_fit(
+    dt: FloatArray,
+    xw: FloatArray,
+    order: int,
+    robust_iterations: int,
+) -> tuple[float, float]:
+    """Robust local polynomial fit of one window (LOWESS, Cleveland 1979).
+
+    Equation (window {j}, centered times dt_j = t_j − t_i, h = max|dt|):
+        ``β̂ = argmin_β Σ_j u_j·δ_j·(x_j − Σ_{k=0}^{q} β_k·dt_j^k)²``
+    with tricube distance weights ``u_j = (1 − (|dt_j|/h)³)³``
+    (h = max_j|dt_j|; h = 0 — all epochs identical — is degenerate ⇒
+    NaN/NaN) and bisquare robustness weights, re-estimated
+    ``robust_iterations`` times from the residuals e_j = x_j − A·β̂:
+        ``δ_j = (1 − (e_j / 6·med|e|)²)²`` for |e_j| < 6·med|e|, else 0
+    (Cleveland 1979, JASA 74:829, eqs. 1–4 and the robustness step §3).
+    Returns ``(m, s) = (β̂_0, 1.4826·med_j|e_j|)`` — the fit value at
+    dt = 0 and the normalized MAD of the local residuals about the fit.
+    Shared per-window core of :func:`rolling_polyfit`; inputs are
+    pre-validated there. NaN/NaN on a rank-deficient weighted design.
+    """
+    h = float(np.max(np.abs(dt)))
+    if h <= 0.0:
+        return float("nan"), float("nan")
+    u = (1.0 - (np.abs(dt) / h) ** 3) ** 3
+    a = np.vander(dt, order + 1, increasing=True)
+    weights = u
+    beta = np.zeros(order + 1, dtype=np.float64)
+    for _ in range(robust_iterations + 1):
+        sw = np.sqrt(weights)
+        beta_new, _, rank, _ = np.linalg.lstsq(
+            a * sw[:, np.newaxis], xw * sw, rcond=None
+        )
+        if rank < order + 1:
+            return float("nan"), float("nan")
+        beta = np.asarray(beta_new, dtype=np.float64)
+        e = xw - a @ beta
+        s6 = 6.0 * float(np.median(np.abs(e)))
+        if s6 <= 0.0:
+            break  # exact fit on ≥ half the window — already robust
+        delta = np.clip(1.0 - (e / s6) ** 2, 0.0, None) ** 2
+        weights = u * delta
+    resid = xw - a @ beta
+    return float(beta[0]), float(_MAD_TO_SIGMA * float(np.median(np.abs(resid))))
+
+
+def rolling_polyfit(
+    t: ArrayLike,
+    x: ArrayLike,
+    *,
+    half_window: float,
+    min_count: int,
+    order: int,
+    robust_iterations: int = 2,
+) -> tuple[FloatArray, FloatArray]:
+    """Compute the time-windowed robust local polynomial center and scale.
+
+    Equation (per epoch i, window ``W_i = {j : |t_j − t_i| ≤ h}``):
+        ``m_i = f̂_i(t_i) = β̂_0``  from the robust local fit
+        ``f̂_i(t) = Σ_{k=0}^{q} β̂_k·(t − t_i)^k``  (LOWESS: tricube
+        distance weights × bisquare robustness iterations —
+        :func:`_lowess_window_fit`), and
+        ``s_i = 1.4826 · med{ |x_j − f̂_i(t_j)| : j ∈ W_i }``
+
+    — the order-q generalization of the (order-0)
+    :func:`rolling_median`/:func:`rolling_mad` pair: during fast
+    transients a local constant lags the motion, so genuine on-trend
+    samples acquire large ``|x_i − m_i|`` and over-flag; a local line
+    (q = 1) or parabola (q = 2) tracks the local slope/curvature and
+    leaves on-trend residuals small. Robustness iterations keep the fit
+    from being pulled by the very outlier under test (masking).
+
+    Symbols → args:
+        - ``t_j`` → ``t``: epochs, shape (N,), sorted ascending [yr]
+        - ``x_j`` → ``x``: samples, shape (N,) [units of x]
+        - ``h``   → ``half_window``: half-window [units of t]
+        - ``min_count``: minimum in-window sample count; must be
+          ≥ q + 2 so the residual scale is not identically zero
+        - ``q``   → ``order``: local polynomial order, 1 or 2 (order 0
+          is exactly :func:`rolling_median` — the L1-optimal local
+          constant — and stays on that path)
+        - ``robust_iterations``: bisquare robustness re-weightings
+          (Cleveland 1979 recommends 2; 0 = plain weighted LSQ,
+          NOT robust — documented, not recommended)
+
+    Returns:
+        ``(m, s)`` — local fit value and local residual MAD, each shape
+        (N,), float64 [units of x]. ``NaN`` at i when the window holds
+        fewer than ``min_count`` samples or the weighted design is
+        rank-deficient (e.g. duplicate epochs) — the caller substitutes
+        its global fallback (same degradation convention as
+        :func:`rolling_median`). ``s_i = 0`` is possible (≥ 50 % of a
+        window fitted exactly) — the caller's ``scale_floor`` guards it,
+        exactly the :func:`rolling_mad` Hampel degeneracy.
+
+    Raises:
+        ValueError: If ``t`` is unsorted/non-finite, shapes mismatch,
+            ``half_window ≤ 0``, ``order ∉ {1, 2}``,
+            ``min_count < order + 2``, or ``robust_iterations < 0``.
+
+    Reference:
+        Cleveland 1979, *Robust locally weighted regression and
+        smoothing scatterplots*, JASA 74(368), 829–836 (LOWESS: tricube
+        kernel, bisquare robustness iterations); windowed-identifier
+        framing: Pearson et al. 2016, EURASIP J. Adv. Signal Process.
+        2016:87 (generalized Hampel filter — here with a polynomial
+        center function).
+
+    Numerical notes:
+        Same two-pointer window sweep as :func:`rolling_median`; per
+        window one (q+1)-column Vandermonde LSQ per robustness pass —
+        O(N·w̄·(q+1)²·(robust_iterations+1)) total. The design is built
+        on **centered** times dt = t_j − t_i (|dt| ≤ h ≈ 0.04 yr), so
+        conditioning is excellent regardless of the absolute ``yearf``
+        epoch. ``np.linalg.lstsq`` (SVD) with an explicit rank check —
+        rank-deficient windows degrade to NaN, never to a silent
+        minimum-norm fit.
+    """
+    tt = _validate_sorted_time(t)
+    xx = _validate_series("x", x)
+    if xx.shape != tt.shape:
+        raise ValueError(f"x shape {xx.shape} does not match t shape {tt.shape}")
+    if half_window <= 0.0:
+        raise ValueError(f"half_window must be > 0, got {half_window}")
+    if order not in (1, 2):
+        raise ValueError(
+            f"order must be 1 or 2 (order 0 is rolling_median), got {order}"
+        )
+    if min_count < order + 2:
+        raise ValueError(
+            f"min_count must be >= order + 2 = {order + 2}, got {min_count}"
+        )
+    if robust_iterations < 0:
+        raise ValueError(f"robust_iterations must be >= 0, got {robust_iterations}")
+    n = int(tt.size)
+    center = np.full(n, np.nan, dtype=np.float64)
+    scale = np.full(n, np.nan, dtype=np.float64)
+    lo = 0
+    hi = 0
+    for i in range(n):
+        t_i = tt[i]
+        while tt[lo] < t_i - half_window:
+            lo += 1
+        while hi < n and tt[hi] <= t_i + half_window:
+            hi += 1
+        if hi - lo >= min_count:
+            center[i], scale[i] = _lowess_window_fit(
+                tt[lo:hi] - t_i, xx[lo:hi], order, robust_iterations
+            )
+    return center, scale
 
 
 def hampel_mask(
@@ -749,9 +1078,39 @@ class OutlierParams:
             h = window_days/2); ≳ 2× a typical outlier-cluster span, ≪
             seasonal period and typical transient τ.
         window_n_sigma: Hampel threshold k_w (§3.3b) — sits below k_g
-            because the local median absorbs the noise wander.
+            because the local center absorbs the noise wander.
         window_min_count: Minimum in-window samples n_min; thinner
-            windows fall back to the global center/scale.
+            windows fall back to the global center/scale. With
+            ``window_order`` q ≥ 1 it must be ≥ q + 2.
+        window_order: Local polynomial order q of the windowed
+            identifier — 0 (default; the current
+            :func:`rolling_median`/:func:`rolling_mad` path, taken
+            identically) | 1 | 2 (robust local line/parabola,
+            :func:`rolling_polyfit`; Cleveland 1979). Orders ≥ 1 track
+            fast transients (e.g. an unrest ramp) so on-trend epochs are
+            not over-flagged by a lagging local constant.
+        window_robust_iterations: Bisquare robustness re-weightings of
+            the local polynomial fit (orders ≥ 1 only; Cleveland 1979
+            recommends 2). 0 = plain local WLS — susceptible to masking
+            by the very outlier under test; not recommended.
+        despike: Enable the Stage-0 gross-blunder despike (§3.0
+            addendum; default **False** — existing behavior is
+            unchanged). When True, isolated single-epoch spikes that
+            are extreme against both temporal neighbors AND return to
+            baseline are masked out before the model fit, so they can
+            neither drag the robust fit nor inflate the detection
+            scale.
+        despike_n_sigma: Stage-0 spike threshold k_d on
+            ``min(|δ⁻|, |δ⁺|)/ŝ_Δ`` [dimensionless]; deliberately high
+            (10) — Stage 0 removes only OBVIOUS extremes (a spike of
+            amplitude A scores ≈ A/(√2σ) under white noise σ, so
+            k_d = 10 ⇒ A ≳ 14σ).
+        despike_return_sigma: Stage-0 return-to-baseline tolerance c_r
+            on ``|δ⁻ + δ⁺|/ŝ_Δ`` [dimensionless] (:func:`spike_mask`).
+        despike_gap_days: Maximum neighbor spacing of the Stage-0
+            differences [d] — across wider gaps an epoch has no usable
+            neighbor and is never despiked
+            (:func:`neighbor_differences`).
         scale_floor: Hampel scale floor s_floor [whitened-residual
             units] — guards the MAD-collapse degeneracy.
         min_outlier: Physical magnitude floor a_min [L], applied per
@@ -782,6 +1141,12 @@ class OutlierParams:
     window_days: float = 31.0
     window_n_sigma: float = 4.0
     window_min_count: int = 11
+    window_order: int = 0
+    window_robust_iterations: int = 2
+    despike: bool = False
+    despike_n_sigma: float = 10.0
+    despike_return_sigma: float = 4.0
+    despike_gap_days: float = 1.5
     scale_floor: float = 0.0
     min_outlier: float = 0.0
     max_run_days: float = 2.0
@@ -814,6 +1179,9 @@ class OutlierParams:
             "step_evidence_sigma",
             "step_window_days",
             "f_scale",
+            "despike_n_sigma",
+            "despike_return_sigma",
+            "despike_gap_days",
         )
         for name in positive:
             if float(getattr(self, name)) <= 0.0:
@@ -830,6 +1198,15 @@ class OutlierParams:
             raise ValueError("window_min_count must be >= 1")
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be >= 1")
+        if self.window_order not in (0, 1, 2):
+            raise ValueError(f"window_order must be 0, 1 or 2, got {self.window_order}")
+        if self.window_order >= 1 and self.window_min_count < self.window_order + 2:
+            raise ValueError(
+                "window_min_count must be >= window_order + 2 = "
+                f"{self.window_order + 2}, got {self.window_min_count}"
+            )
+        if self.window_robust_iterations < 0:
+            raise ValueError("window_robust_iterations must be >= 0")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -876,11 +1253,15 @@ class OutlierDetection:
     flags, it never filters).
 
     Attributes:
-        flags: Final outlier mask — True = OUTLIER. All-False when
+        flags: Final outlier mask — True = OUTLIER (protection-surviving
+            candidates plus Stage-0 despiked epochs). All-False when
             ``excess_flag_abort`` is True (§3.5 abort rule).
         candidates: Pre-protection identifier union G ∪ L (final sweep).
-        reasons: Per-epoch ``REASON_*`` bitmask (uint8; 0 on
-            non-candidates), final sweep.
+            Stage-0 despiked epochs are decided before the identifiers
+            and are NOT candidates (they carry ``REASON_GROSS`` and are
+            flagged directly).
+        reasons: Per-epoch ``REASON_*`` bitmask (uint8; 0 on epochs that
+            are neither candidates nor despiked), final sweep.
         protected: Per-epoch ``PROTECT_*`` bitmask (uint8), final sweep.
         z: Final-sweep global detection statistic ẑ (shape of y).
         scale_global: Global robust scale ŝ per component, shape (C,)
@@ -895,6 +1276,8 @@ class OutlierDetection:
         suspected_events: Protected clusters of the final sweep
             (:class:`SuspectedEvent`) — feed the operator review /
             ``steps.csv`` lane; the leaf only surfaces them.
+        n_despiked: Stage-0 gross-blunder count per component, shape
+            (C,) int64 — all zeros unless ``params.despike`` is True.
         n_iterations: Detection sweeps actually performed.
         converged: True when the flag mask reached a fixed point within
             ``max_iterations`` (False on abort).
@@ -915,6 +1298,7 @@ class OutlierDetection:
     fits: list[TrajectoryParams]
     step_amplitudes: FloatArray | None
     suspected_events: list[SuspectedEvent]
+    n_despiked: NDArray[np.int64]
     n_iterations: int
     converged: bool
     excess_flag_abort: bool
@@ -938,6 +1322,46 @@ def _resolve_floors(
     if np.any(arr < 0.0) or not np.all(np.isfinite(arr)):
         raise ValueError("min_outlier must be finite and >= 0")
     return arr
+
+
+def _despike_component(
+    tt: FloatArray,
+    y_c: FloatArray,
+    protect_windows: Sequence[tuple[float, float]],
+    params: OutlierParams,
+    max_gap: float,
+) -> NDArray[np.bool_]:
+    """One component's Stage-0 gross-blunder despike (§3.0 addendum).
+
+    Thin orchestration (no new math): gap-aware first differences on the
+    RAW observations (:func:`neighbor_differences` — Stage 0 runs before
+    any fit, so there are no residuals yet; formal σ is not consulted,
+    which is acceptable for the k_d ≈ 10 gross-blunder regime) → robust
+    difference scale ``ŝ_Δ = mad_scale(δ⁻)`` over the finite differences
+    (median-centered, so a constant secular rate does not inflate it) →
+    two-sided isolated-spike rule (:func:`spike_mask`) → caller
+    ``protect_windows`` cleared (never despike inside a protected
+    interval). Degenerate cases (< 3 usable differences, ŝ_Δ ≤ 0) despike
+    nothing — the module's conservative never-flag convention.
+    """
+    mask = np.zeros(tt.size, dtype=np.bool_)
+    delta_prev, delta_next = neighbor_differences(tt, y_c, max_gap=max_gap)
+    finite = np.isfinite(delta_prev)
+    if int(np.count_nonzero(finite)) < 3:
+        return mask
+    s_delta = mad_scale(delta_prev[finite])
+    if s_delta <= 0.0:
+        return mask
+    mask = spike_mask(
+        delta_prev,
+        delta_next,
+        n_sigma=params.despike_n_sigma,
+        scale=s_delta,
+        return_n_sigma=params.despike_return_sigma,
+    )
+    for t_a, t_b in protect_windows:
+        mask &= ~((tt >= t_a) & (tt <= t_b))
+    return mask
 
 
 def _component_candidates(
@@ -964,8 +1388,10 @@ def _component_candidates(
     (:func:`~gps_analysis.fitting.fit_components`) → Huber M-fit
     (:func:`~gps_analysis.fitting._robust_params`) → residuals on ALL
     epochs → :func:`whiten` → :func:`standardize_robust` (global) +
-    :func:`rolling_median`/:func:`rolling_mad`/:func:`hampel_mask`
-    (local, thin windows falling back to the global center/scale).
+    the windowed identifier — :func:`rolling_median`/:func:`rolling_mad`
+    at ``window_order = 0`` (default), :func:`rolling_polyfit` at
+    orders 1/2 — through :func:`hampel_mask` (thin windows falling back
+    to the global center/scale either way).
 
     Returns:
         ``(r, w, z, s_global, s_local_raw, candidates, reasons)`` — raw
@@ -998,12 +1424,22 @@ def _component_candidates(
     if s_global <= 0.0:
         return r, w, z, s_global, s_local, candidates, reasons
     global_mask = np.abs(z) > params.global_n_sigma
-    m = rolling_median(
-        tt, w, half_window=half_window, min_count=params.window_min_count
-    )
-    s_local = rolling_mad(
-        tt, w, m, half_window=half_window, min_count=params.window_min_count
-    )
+    if params.window_order == 0:
+        m = rolling_median(
+            tt, w, half_window=half_window, min_count=params.window_min_count
+        )
+        s_local = rolling_mad(
+            tt, w, m, half_window=half_window, min_count=params.window_min_count
+        )
+    else:
+        m, s_local = rolling_polyfit(
+            tt,
+            w,
+            half_window=half_window,
+            min_count=params.window_min_count,
+            order=params.window_order,
+            robust_iterations=params.window_robust_iterations,
+        )
     thin = np.isnan(s_local) | np.isnan(m)
     center_eff = np.where(thin, center, m)
     scale_eff = np.where(thin, s_global, s_local)
@@ -1033,6 +1469,7 @@ def _protect_component(
     max_run: float,
     step_window: float,
     component: int,
+    despiked: NDArray[np.bool_] | None = None,
 ) -> tuple[NDArray[np.uint8], list[SuspectedEvent]]:
     """One component's §3.4 protection stage over the candidate mask.
 
@@ -1054,6 +1491,9 @@ def _protect_component(
       protected even though D ≈ 0.
 
     Protected clusters become :class:`SuspectedEvent` records.
+    Stage-0 ``despiked`` epochs (already-decided gross blunders,
+    ``None`` ⇒ none) are excluded from the flank medians alongside the
+    candidates so they cannot bias the step-evidence statistic.
 
     Returns:
         ``(protected, events)`` — the per-epoch ``PROTECT_*`` bitmask
@@ -1064,6 +1504,7 @@ def _protect_component(
     events: list[SuspectedEvent] = []
     if not bool(np.any(candidates)):
         return protected, events
+    flank_exclude = candidates if despiked is None else candidates | despiked
     floor_hit = candidates & (np.abs(r) < floor)
     protected[floor_hit] |= np.uint8(PROTECT_FLOOR)
     for t_a, t_b in protect_windows:
@@ -1081,7 +1522,7 @@ def _protect_component(
         background_rule = False
         if s_global > 0.0:
             med_pre, med_post = _flank_medians(
-                tt, w, i_start, i_end, window=step_window, exclude=candidates
+                tt, w, i_start, i_end, window=step_window, exclude=flank_exclude
             )
             if math.isnan(med_pre) or math.isnan(med_post):
                 d = float("nan")
@@ -1130,10 +1571,14 @@ def detect_outliers(
     """Detect outliers against a robust step-augmented trajectory model.
 
     Thin orchestration (MATH_STANDARDS §1) of the module's derivation
-    chain, §3.1 → §3.5: :func:`~gps_analysis.fitting.with_steps` →
+    chain, §3.0 → §3.5: optional Stage-0 gross-blunder despike
+    (:func:`neighbor_differences` / :func:`spike_mask`; ``params.despike``,
+    off by default) → :func:`~gps_analysis.fitting.with_steps` →
     robust Huber fit → :func:`whiten` → :func:`standardize_robust`
-    (global identifier) + :func:`rolling_median` / :func:`rolling_mad` /
-    :func:`hampel_mask` (windowed Hampel identifier) →
+    (global identifier) + the windowed Hampel identifier
+    (:func:`rolling_median` / :func:`rolling_mad` at
+    ``params.window_order = 0``, the default; :func:`rolling_polyfit`
+    at orders 1/2) through :func:`hampel_mask` →
     :func:`candidate_clusters` / :func:`step_evidence` signal protection
     → conservative iteration with the excess-candidate abort → final
     plain-WLS refit on the inliers. Returns a MASK plus diagnostics —
@@ -1173,11 +1618,13 @@ def detect_outliers(
         names: Optional per-component labels for the returned fits.
 
     Returns:
-        :class:`OutlierDetection` — final flags (True = outlier),
+        :class:`OutlierDetection` — final flags (True = outlier;
+        Stage-0 despiked epochs included when ``params.despike``),
         pre-protection candidates, ``REASON_*``/``PROTECT_*`` bitmasks,
         the detection statistic ẑ, global/local scales, the final
         step-augmented inlier WLS fits, fitted step amplitudes,
-        suspected-event hints, iteration/convergence/abort state, and
+        suspected-event hints, the per-component Stage-0 count
+        ``n_despiked``, iteration/convergence/abort state, and
         the parameter echo. Under ``epoch_policy="union"`` an epoch
         flagged in any component is flagged in all (diagnostics stay
         per-component; union deliberately overrides per-component
@@ -1197,12 +1644,21 @@ def detect_outliers(
         identifier exists at all).
 
     Numerical notes:
+        - Stage 0 (when enabled) runs ONCE, on the raw per-component
+          observations, before the sweep loop: despiked epochs are
+          excluded from every robust fit and from the identifier
+          candidates (they carry ``REASON_GROSS`` and are flagged
+          directly), so a gross blunder can neither drag the trajectory
+          fit nor inflate the detection scales. Despiked epochs do NOT
+          count toward the abort fraction — they are decided blunders,
+          not "epochs that look like outliers".
         - The abort guard is evaluated on the per-component **candidate**
           fraction, pre-protection (§3.5's "epochs that *look like*
           outliers", §8.3 test contract) — strictly more conservative
           than a post-protection count, and immune to the protection
           stage rescuing a pathological series into silence. On abort
-          the flags are all-False, ``excess_flag_abort=True``,
+          the flags are all-False (Stage-0 despikes included — the §3.5
+          rule is unconditional), ``excess_flag_abort=True``,
           diagnostics populated from the aborting sweep — loud, never a
           silent cap.
         - Flags are recomputed on ALL epochs each sweep (no ratchet — a
@@ -1252,6 +1708,14 @@ def detect_outliers(
         for g in base_guesses
     ]
 
+    gross = np.zeros((n_components, n), dtype=np.bool_)
+    if detection_params.despike:
+        despike_gap = detection_params.despike_gap_days / _DAYS_PER_YEAR
+        for c in range(n_components):
+            gross[c] = _despike_component(
+                tt, yy[c], protect_windows, detection_params, despike_gap
+            )
+
     flags = np.zeros((n_components, n), dtype=np.bool_)
     candidates = np.zeros((n_components, n), dtype=np.bool_)
     reasons = np.zeros((n_components, n), dtype=np.uint8)
@@ -1276,9 +1740,13 @@ def detect_outliers(
                 yy[c],
                 sigmas[c],
                 guesses[c],
-                ~flags[c],
+                ~(flags[c] | gross[c]),
                 detection_params,
                 half_window,
+            )
+            cand_c &= ~gross[c]
+            reasons_c = np.where(gross[c], np.uint8(REASON_GROSS), reasons_c).astype(
+                np.uint8
             )
             prot_c, events_c = _protect_component(
                 tt,
@@ -1293,6 +1761,7 @@ def detect_outliers(
                 max_run,
                 step_window,
                 c,
+                despiked=gross[c],
             )
             candidates[c] = cand_c
             reasons[c] = reasons_c
@@ -1301,7 +1770,7 @@ def detect_outliers(
             scale_global[c] = s_g
             scale_local[c] = s_loc
             events.extend(events_c)
-            new_flags[c] = cand_c & (prot_c == 0)
+            new_flags[c] = (cand_c & (prot_c == 0)) | gross[c]
             if float(np.count_nonzero(cand_c)) / n > detection_params.max_flag_fraction:
                 aborted = True
         if detection_params.epoch_policy == "union":
@@ -1335,6 +1804,7 @@ def detect_outliers(
         if step_amplitudes is not None:
             step_amplitudes[c] = fit.params[n_base:]
 
+    n_despiked = np.asarray(np.sum(gross, axis=1), dtype=np.int64)
     if was_1d:
         return OutlierDetection(
             flags=flags[0],
@@ -1347,6 +1817,7 @@ def detect_outliers(
             fits=fits,
             step_amplitudes=step_amplitudes,
             suspected_events=events,
+            n_despiked=n_despiked,
             n_iterations=n_iterations,
             converged=converged,
             excess_flag_abort=aborted,
@@ -1363,6 +1834,7 @@ def detect_outliers(
         fits=fits,
         step_amplitudes=step_amplitudes,
         suspected_events=events,
+        n_despiked=n_despiked,
         n_iterations=n_iterations,
         converged=converged,
         excess_flag_abort=aborted,
