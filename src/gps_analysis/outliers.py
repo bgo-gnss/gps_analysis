@@ -948,6 +948,61 @@ def candidate_clusters(
     return clusters
 
 
+#: Minimum usable samples per flank for a determinate flank median (§3.4.2).
+FLANK_MIN_COUNT: int = 3
+
+
+def _flank_median_one_side(
+    t: FloatArray,
+    r: FloatArray,
+    in_window_usable: NDArray[np.bool_],
+    in_window_present: NDArray[np.bool_],
+    usable: NDArray[np.bool_],
+    edge: float,
+    *,
+    max_reach: float,
+) -> float:
+    """Median of one flank, with the §3.4.2a nearest-k gap fallback.
+
+    Three masks, because WHY a flank is thin decides what to do about it:
+    ``in_window_usable`` (fixed-W ∧ not excluded), ``in_window_present``
+    (fixed-W, exclusions ignored) and ``usable`` (every epoch on this
+    side of the cluster that is not excluded).
+
+    - **≥ FLANK_MIN_COUNT usable in-window samples** — plain in-window
+      median, byte-identical to the fixed-window behavior.  Widening
+      never perturbs an already-determinate flank.
+    - **Thin because the epochs are EXCLUDED** (present ≥ min, usable <
+      min) — stay NaN.  The neighborhood being wall-to-wall candidates
+      is the signature of a fast transient, precisely the §3.4 case that
+      must keep protecting; reaching past it would sample a different
+      part of the signal and manufacture a verdict.
+    - **Thin because the DATA IS ABSENT** (present < min) — the fixed
+      window measured elapsed time, not evidence.  Fall back to the
+      ``FLANK_MIN_COUNT`` usable samples nearest the cluster edge within
+      ``max_reach``.
+
+    Where there is genuinely no data at all (a cluster at the series
+    end) the fallback finds nothing and NaN is preserved — the correct
+    indeterminate answer rather than a manufactured one.
+    """
+    if int(np.count_nonzero(in_window_usable)) >= FLANK_MIN_COUNT:
+        return float(np.median(r[in_window_usable]))
+    if max_reach <= 0.0:
+        return float("nan")
+    if int(np.count_nonzero(in_window_present)) >= FLANK_MIN_COUNT:
+        return float("nan")  # excluded, not absent -- keep protecting
+
+    reach = usable & (np.abs(t - edge) <= max_reach)
+    idx = np.flatnonzero(reach)
+    if idx.size < FLANK_MIN_COUNT:
+        return float("nan")
+    # nearest k BY TIME, not by index: unequal spacing means the k
+    # index-adjacent epochs can straddle a far larger interval
+    nearest = idx[np.argsort(np.abs(t[idx] - edge), kind="stable")[:FLANK_MIN_COUNT]]
+    return float(np.median(r[nearest]))
+
+
 def _flank_medians(
     t: FloatArray,
     r: FloatArray,
@@ -956,6 +1011,7 @@ def _flank_medians(
     *,
     window: float,
     exclude: NDArray[np.bool_] | None,
+    max_reach: float = 0.0,
 ) -> tuple[float, float]:
     """Median residuals of the two flank windows of a cluster.
 
@@ -964,26 +1020,38 @@ def _flank_medians(
         ``r̄_post = med{ r_j : t_j ∈ (t_end, t_end + W] }``
 
     with ``exclude``-masked epochs dropped from both flanks. Either
-    median is NaN when its flank holds fewer than 3 usable samples.
-    Shared numerator machinery of :func:`step_evidence` (D) and the
-    elevated-background protection arm (§3.4.2 implementation note in
-    :func:`_protect_component`). Inputs are pre-validated by callers.
+    median is NaN when its flank holds fewer than
+    :data:`FLANK_MIN_COUNT` usable samples — unless ``max_reach`` > 0,
+    which enables the §3.4.2a nearest-k fallback for THIN flanks only
+    (see :func:`_flank_median_one_side`); ``max_reach=0`` is exactly the
+    original fixed-window behavior.  Shared numerator machinery of
+    :func:`step_evidence` (D) and the elevated-background protection arm
+    (§3.4.2 implementation note in :func:`_protect_component`). Inputs
+    are pre-validated by callers.
     """
-    pre = (t >= t[i_start] - window) & (t < t[i_start])
-    post = (t > t[i_end]) & (t <= t[i_end] + window)
+    before = t < t[i_start]
+    after = t > t[i_end]
+    # exclusions ignored: "is there DATA here at all", the discriminator
+    # between a data gap and a candidate-saturated transient neighborhood
+    pre_present = before & (t >= t[i_start] - window)
+    post_present = after & (t <= t[i_end] + window)
+    pre, post = pre_present, post_present
     if exclude is not None:
         ex = np.asarray(exclude, dtype=np.bool_)
         if ex.shape != t.shape:
             raise ValueError(
                 f"exclude shape {ex.shape} does not match t shape {t.shape}"
             )
-        pre &= ~ex
-        post &= ~ex
-    med_pre = (
-        float(np.median(r[pre])) if int(np.count_nonzero(pre)) >= 3 else float("nan")
+        before = before & ~ex
+        after = after & ~ex
+        pre = pre_present & ~ex
+        post = post_present & ~ex
+
+    med_pre = _flank_median_one_side(
+        t, r, pre, pre_present, before, float(t[i_start]), max_reach=max_reach
     )
-    med_post = (
-        float(np.median(r[post])) if int(np.count_nonzero(post)) >= 3 else float("nan")
+    med_post = _flank_median_one_side(
+        t, r, post, post_present, after, float(t[i_end]), max_reach=max_reach
     )
     return med_pre, med_post
 
@@ -997,6 +1065,7 @@ def step_evidence(
     window: float,
     scale: float,
     exclude: NDArray[np.bool_] | None = None,
+    max_reach: float = 0.0,
 ) -> float:
     """Compute the step-evidence statistic D of a candidate cluster.
 
@@ -1019,16 +1088,23 @@ def step_evidence(
         - ``exclude`` → ``exclude``: boolean mask of epochs to drop from
           both flank medians (normally the full candidate mask, so
           neighboring outliers cannot bias the flanks)
+        - ``R``       → ``max_reach``: nearest-k fallback reach [units of
+          t]; 0 (default) = fixed-window behavior only (§3.4.2a)
 
     Returns:
         D [dimensionless], float64. ``NaN`` when either flank holds
         fewer than 3 usable samples — the caller treats NaN as "cannot
         rule out a step" and protects (Gazeaux et al. 2013 motivates the
-        conservatism).
+        conservatism).  With ``max_reach`` > 0 a THIN flank first falls
+        back to the 3 usable samples nearest the cluster edge within
+        ``R``, so a flank straddling a data gap becomes determinate
+        instead of protecting by default; NaN then means genuinely
+        absent data (e.g. a cluster at the series end).
 
     Raises:
         ValueError: On invalid indices (``0 ≤ i_start ≤ i_end < N``),
-            shape mismatches, ``window ≤ 0`` or ``scale ≤ 0``.
+            shape mismatches, ``window ≤ 0``, ``scale ≤ 0`` or
+            ``max_reach < 0``.
 
     Reference:
         Gazeaux et al. 2013, JGR 118 (DOGEx — offsets are hard to
@@ -1051,8 +1127,10 @@ def step_evidence(
         raise ValueError(f"window must be > 0, got {window}")
     if scale <= 0.0:
         raise ValueError(f"scale must be > 0, got {scale}")
+    if max_reach < 0.0:
+        raise ValueError(f"max_reach must be >= 0, got {max_reach}")
     med_pre, med_post = _flank_medians(
-        tt, rr, i_start, i_end, window=window, exclude=exclude
+        tt, rr, i_start, i_end, window=window, exclude=exclude, max_reach=max_reach
     )
     if math.isnan(med_pre) or math.isnan(med_post):
         return float("nan")
@@ -1122,6 +1200,39 @@ class OutlierParams:
         run_sign_fraction: Same-sign fraction q of the run rule.
         step_evidence_sigma: Step-evidence threshold k_step (§3.4.2).
         step_window_days: Step-evidence flank window W [d].
+        step_flank_max_reach_days: Nearest-k flank fallback reach R [d]
+            (§3.4.2a).  A fixed window W straddling a data gap holds < 3
+            usable samples and yields an INDETERMINATE D although good
+            samples sit just beyond the gap — the fixed window measures
+            elapsed time, not evidence.  When a flank is thin, the 3
+            usable samples nearest the cluster edge within R are used
+            instead; a flank that already has ≥ 3 in-window samples is
+            untouched, so this never perturbs a determinate statistic.
+            0 disables the fallback (pure fixed-window, the pre-2026-07
+            behavior).
+        step_magnitude_ratio: Magnitude-vs-step release ratio k_ratio
+            (§3.4.2b).  Releases ``PROTECT_STEP`` when the cluster's
+            amplitude about the local baseline exceeds ``k_ratio × D`` —
+            i.e. the excursion is far larger than the step invoked to
+            explain it (a 139 mm blunder on a 5 mm step scores ≈ 28; a
+            genuine step scores ≈ 0.5).  Applies only to the
+            DETERMINATE branch: with D indeterminate there is no step
+            magnitude to compare against, so this rule is silent there
+            and ``protect_on_indeterminate`` governs instead.  Default
+            **0.0 = disabled** — the rule can only ever loosen
+            detection, so it is opt-in until validated per network;
+            5.0 is the suggested starting value.
+        protect_on_indeterminate: Whether an INDETERMINATE step-evidence
+            statistic (``D`` NaN — a flank holding < 3 usable samples, so
+            "cannot rule out a step") protects the cluster (§3.4.2a).
+            Default **True**: the Gazeaux-motivated conservative
+            behavior, unchanged. Set False to make the step branch
+            respect ``step_evidence_sigma`` alone — without this switch
+            the NaN arm is unreachable by ANY threshold, so
+            ``step_evidence_sigma=1e6`` still protects and the knob
+            cannot express "stop protecting on step evidence". Turning
+            it off is also how a caller isolates the step rule when
+            testing the protection stages separately.
         max_flag_fraction: Abort threshold f_max on the per-component
             **candidate** fraction (§3.5 — "> f_max of epochs *look
             like* outliers ⇒ unmodeled signal, do nothing, loudly").
@@ -1154,6 +1265,9 @@ class OutlierParams:
     run_sign_fraction: float = 0.8
     step_evidence_sigma: float = 3.0
     step_window_days: float = 10.0
+    step_flank_max_reach_days: float = 60.0
+    step_magnitude_ratio: float = 0.0
+    protect_on_indeterminate: bool = True
     max_flag_fraction: float = 0.05
     max_iterations: int = 3
     loss: str = "huber"
@@ -1186,7 +1300,13 @@ class OutlierParams:
         for name in positive:
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be > 0")
-        non_negative = ("scale_floor", "min_outlier", "max_run_days")
+        non_negative = (
+            "scale_floor",
+            "min_outlier",
+            "max_run_days",
+            "step_flank_max_reach_days",
+            "step_magnitude_ratio",
+        )
         for name in non_negative:
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be >= 0")
@@ -1529,7 +1649,13 @@ def _protect_component(
         background_rule = False
         if s_global > 0.0:
             med_pre, med_post = _flank_medians(
-                tt, w, i_start, i_end, window=step_window, exclude=flank_exclude
+                tt,
+                w,
+                i_start,
+                i_end,
+                window=step_window,
+                exclude=flank_exclude,
+                max_reach=params.step_flank_max_reach_days / _DAYS_PER_YEAR,
             )
             if math.isnan(med_pre) or math.isnan(med_post):
                 d = float("nan")
@@ -1541,7 +1667,36 @@ def _protect_component(
                 background_rule = background > params.step_evidence_sigma
         else:
             d = float("nan")
-        step_rule = math.isnan(d) or d > params.step_evidence_sigma
+        # §3.4.2a: the indeterminate (NaN) arm is a SEPARATE policy from the
+        # threshold, not a special case of it.  Folding them together
+        # ("isnan(d) or d > k") made the NaN arm unreachable by any k, so
+        # step_evidence_sigma=1e6 still protected -- a knob that cannot be
+        # turned off.  Default True keeps the conservative behavior.
+        if math.isnan(d):
+            step_rule = params.protect_on_indeterminate
+        else:
+            step_rule = d > params.step_evidence_sigma
+        # §3.4.2b magnitude-vs-step release (BGÓ): step evidence answers "did
+        # the level shift?" but never "by how much, RELATIVE to the excursion
+        # that raised the question".  A 139 mm blunder sitting on a real 5 mm
+        # step yields D > k_step and is protected by a step it dwarfs.  When
+        # the cluster's own amplitude about the local baseline exceeds
+        # k_ratio x the step it measured, the step cannot explain it and the
+        # protection is released.  A genuine step scores ~0.5 (the members sit
+        # AT the offset, so the excursion about the mid-level is half of it),
+        # far below any sane k_ratio -- this rule can only ever release, never
+        # protect, so it cannot mask signal that the other rules would keep.
+        if (
+            step_rule
+            and params.step_magnitude_ratio > 0.0
+            and not math.isnan(d)
+            and d > 0.0
+            and s_global > 0.0
+        ):
+            baseline = 0.5 * (med_pre + med_post)
+            amplitude = float(np.max(np.abs(w[members] - baseline))) / s_global
+            if amplitude > params.step_magnitude_ratio * d:
+                step_rule = False
         # A multi-day same-sign run is protected as possible unmodeled signal
         # UNLESS the step-evidence conclusively marks it a blunder cluster: it
         # returns to baseline (D small AND determinate) and both flanks sit at

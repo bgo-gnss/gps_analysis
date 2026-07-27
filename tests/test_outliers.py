@@ -368,6 +368,84 @@ class TestStepEvidence:
             step_evidence(t, r, 5, 3, window=1.0, scale=1.0)
         with pytest.raises(ValueError, match="scale"):
             step_evidence(t, r, 3, 5, window=1.0, scale=0.0)
+        with pytest.raises(ValueError, match="max_reach"):
+            step_evidence(t, r, 3, 5, window=1.0, scale=1.0, max_reach=-1.0)
+
+
+class TestFlankNearestK:
+    """§3.4.2a — nearest-k flank fallback, for DATA GAPS only."""
+
+    @staticmethod
+    def _gapped(post_gap_days: float) -> tuple[FloatArr, FloatArr]:
+        """Daily series, spike at index 30, a gap immediately after it."""
+        t = np.concatenate(
+            [
+                _daily_t(31),
+                _daily_t(30, start=2015.0 + (31 + post_gap_days) * DAY),
+            ]
+        )
+        r = np.zeros(t.size)
+        r[30] = 100.0
+        return t, r
+
+    def test_gap_flank_is_nan_without_reach(self) -> None:
+        # 8-day post gap: < 3 epochs inside W = 10 d -> indeterminate. This
+        # is the RHOF 2013.977 shape, and the pre-fix behavior.
+        t, r = self._gapped(8.0)
+        assert math.isnan(step_evidence(t, r, 30, 30, window=10 * DAY, scale=2.0))
+
+    def test_gap_flank_determinate_with_reach(self) -> None:
+        # same series: the fallback reaches past the gap, the series returns
+        # to the model, D ~ 0 -> a blunder, not a step
+        t, r = self._gapped(8.0)
+        d = step_evidence(t, r, 30, 30, window=10 * DAY, scale=2.0, max_reach=60 * DAY)
+        assert d == pytest.approx(0.0)
+
+    def test_reach_beyond_data_stays_nan(self) -> None:
+        # cluster at the series end: no data beyond, the fallback finds
+        # nothing, NaN preserved (test_step_at_series_end depends on this)
+        t = _daily_t(40)
+        r = np.zeros(40)
+        assert math.isnan(
+            step_evidence(t, r, 39, 39, window=10 * DAY, scale=1.0, max_reach=60 * DAY)
+        )
+
+    def test_determinate_flank_untouched_by_reach(self) -> None:
+        # a flank with >= 3 in-window samples must give the IDENTICAL median
+        # whether or not the fallback is enabled
+        t = _daily_t(60)
+        r = np.where(t >= t[30], 5.0, 0.0)
+        fixed = step_evidence(t, r, 30, 30, window=10 * DAY, scale=2.0)
+        reached = step_evidence(
+            t, r, 30, 30, window=10 * DAY, scale=2.0, max_reach=60 * DAY
+        )
+        assert reached == fixed == pytest.approx(2.5)
+
+    def test_excluded_flank_stays_nan(self) -> None:
+        """The transient discriminator: EXCLUDED is not ABSENT.
+
+        A flank whose epochs are all candidates is the signature of a fast
+        transient -- exactly the §3.4 case that must keep protecting.
+        Reaching past them would sample a different part of the signal and
+        manufacture a verdict, so only a genuine data gap earns the
+        fallback.  (Caught by test_transient_survives[10.0] regressing.)
+        """
+        t = _daily_t(60)
+        r = np.zeros(60)
+        exclude = np.zeros(60, dtype=np.bool_)
+        exclude[31:41] = True  # every post-window epoch is a candidate
+        assert math.isnan(
+            step_evidence(
+                t,
+                r,
+                30,
+                30,
+                window=10 * DAY,
+                scale=1.0,
+                exclude=exclude,
+                max_reach=60 * DAY,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -743,6 +821,122 @@ class TestSignalProtection:
         assert not res.excess_flag_abort
         assert np.all(res.flags[idx])  # blunder cluster flagged
         assert not np.any(res.protected[idx] & PROTECT_RUN)  # run-rule released
+
+
+class TestIndeterminatePolicy:
+    """§3.4.2a — the NaN arm is a policy, separate from the threshold."""
+
+    @staticmethod
+    def _spike_before_gap() -> tuple[FloatArr, FloatArr, int]:
+        """Isolated spike on the last epoch before an 8-day data gap.
+
+        The RHOF 2013.977 shape in miniature: span 0 (so the run rule
+        cannot fire) and a post-flank too thin to measure, so D is NaN
+        and only the indeterminate policy decides.
+        """
+        n1, gap = 400, 8.0
+        t = np.concatenate(
+            [_daily_t(n1), _daily_t(400, start=2015.0 + (n1 + gap) * DAY)]
+        )
+        rng = np.random.default_rng(9)
+        y = lineperiodic(t, *TRUE_LP) + rng.normal(0.0, WN, t.size)
+        i = n1 - 1
+        y[i] += 140.0
+        return t, y, i
+
+    def test_indeterminate_protects_by_default(self) -> None:
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(step_flank_max_reach_days=0.0)
+        )
+        assert res.candidates[i] and not res.flags[i]
+        assert res.protected[i] & PROTECT_STEP
+
+    def test_threshold_alone_cannot_disable_the_nan_arm(self) -> None:
+        """The defect this switch exists for: k_step -> inf still protects."""
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(
+            lineperiodic,
+            t,
+            y,
+            params=OutlierParams(
+                step_flank_max_reach_days=0.0, step_evidence_sigma=1e6
+            ),
+        )
+        assert not res.flags[i]
+        assert res.protected[i] & PROTECT_STEP
+
+    def test_switch_off_flags_the_spike(self) -> None:
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(
+            lineperiodic,
+            t,
+            y,
+            params=OutlierParams(
+                step_flank_max_reach_days=0.0, protect_on_indeterminate=False
+            ),
+        )
+        assert res.flags[i]
+        assert not (res.protected[i] & PROTECT_STEP)
+
+    def test_nearest_k_fallback_reaches_the_same_verdict(self) -> None:
+        """§3.4.2a: with the gap bridged, D is measurable and ~0 -> flagged.
+
+        The point of fix 2 over fix 1: the spike is flagged because the
+        evidence says "returns to the model", not because protection was
+        switched off wholesale.
+        """
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(lineperiodic, t, y)  # 60 d reach is the default
+        assert res.flags[i]
+
+
+class TestMagnitudeRatioRelease:
+    """§3.4.2b — release a step protection the excursion dwarfs."""
+
+    @staticmethod
+    def _spike_on_step(step_amp: float, spike: float) -> tuple[FloatArr, FloatArr, int]:
+        rng = np.random.default_rng(11)
+        n = 1500
+        t = _daily_t(n)
+        y = lineperiodic(t, *TRUE_LP) + rng.normal(0.0, WN, n)
+        i0 = 900
+        y = y + step_amp * (t >= t[i0])
+        y[i0] += spike
+        return t, y, i0
+
+    def test_off_by_default(self) -> None:
+        assert OutlierParams().step_magnitude_ratio == 0.0
+
+    def test_big_spike_on_small_step_is_released(self) -> None:
+        # 250 mm spike on a 16 mm step: D = 3.09 clears k_step and protects
+        # the spike by a step it dwarfs (~30x)
+        t, y, i0 = self._spike_on_step(16.0, 250.0)
+        protected_run = detect_outliers(lineperiodic, t, y)
+        assert not protected_run.flags[i0]
+        assert protected_run.protected[i0] & PROTECT_STEP
+
+        released = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(step_magnitude_ratio=5.0)
+        )
+        assert released.flags[i0]
+        assert not (released.protected[i0] & PROTECT_STEP)
+
+    def test_silent_on_the_indeterminate_branch(self) -> None:
+        """No measured step => nothing to compare => protection stands.
+
+        A real step at the series end has D = NaN (no post flank at all),
+        which is where genuine steps are protected; the ratio rule must
+        not touch it.
+        """
+        n = 2000
+        t, y = _white_series(n, 3)
+        i0 = 1920
+        y2 = _inject_step(t, y, float(t[i0]), 40.0)
+        res = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(step_magnitude_ratio=5.0)
+        )
+        assert int(res.flags[i0 - 30 :].sum()) == 0
 
 
 # ---------------------------------------------------------------------------
