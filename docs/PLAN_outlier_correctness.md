@@ -1,6 +1,14 @@
 # PLAN — Outlier detection: correctness, then consistency
 
-> **Status:** agreed implementation plan, 2026-07-28. Not started.
+> **Status:** T0, T1, T2a DONE 2026-07-28. T-S, T2b, T3 outstanding.
+>
+> **T2b is the next ticket and it is NOT safe to run unattended** — it flips
+> `whiten_sigma_clip` to a live default, which changes detection for every
+> station and MOVES STORED DETREND RECORDS (`estimate_detrend` detects before
+> it fits). Everything landed so far is default-preserving and reversible.
+>
+> Measured effect of T1 on the fleet baseline: **+39 flags (+5.1 %)**, aborted
+> components 9 → 5 (SAUD east +25 / up +13, GFUM 90 d recovered).
 > Alignment artifact: `gps_plot/.interrogate-canonical-outlier-detection.md`
 > (gitignored — local). Backlog of deliberately-unactioned findings:
 > [`REVIEW_outlier_backlog.md`](REVIEW_outlier_backlog.md).
@@ -38,7 +46,7 @@ to pass is a pin deleted with extra steps.
 
 ---
 
-## T0 — Fleet measurement harness (enabler)
+## T0 — Fleet measurement harness (enabler)  ✅ DONE 2026-07-28
 
 `geo_dataread/tests/characterize_fleet_outliers.py`, non-`test_` prefix so
 pytest does not collect it; modelled on
@@ -112,7 +120,7 @@ numbers every later ticket cites have no reproducer in the repo.
 
 ---
 
-## T1 — Per-component abort + small-N floor + abort visible in the figure
+## T1 — Per-component abort + small-N floor + abort visible in the figure  ✅ DONE 2026-07-28
 
 Satisfies **DoD 1**. Depends on T0.
 Order: `gps_analysis` → `gps_api` → `geo_dataread` → `gps_plot`.
@@ -208,7 +216,7 @@ expect byte-identical except `fitted_at`.
 
 ---
 
-## T2a — Whitening statistic, param-gated, default bit-identical
+## T2a — Whitening statistic, param-gated, default bit-identical  ✅ DONE 2026-07-28
 
 First half of **DoD 2**. Depends on T0; sequence after T1.
 
