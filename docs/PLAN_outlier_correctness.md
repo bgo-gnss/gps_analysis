@@ -432,10 +432,56 @@ lifting it, at k_d = 3.5: RHOF 0.53 % → 0.61 % despiked (1.5 → 20 d), and
 20 → 60 adds nothing (0.61 → 0.61) — it saturates by ~20 d because only 0.51 %
 of epochs have a predecessor further back than that.
 
-So the gap default is the same failure shape as §11's unreachable NaN branch
-and `step_flank_max_reach_days`: **a fixed window measuring elapsed time rather
-than evidence.** Recommend treating 1.5 → 20 as a defect fix on its own
-evidence, separately from the k_d question, which still needs more labels.
+Structurally this is the same shape as §11's unreachable NaN branch and
+`step_flank_max_reach_days`: a fixed window measuring elapsed time rather than
+evidence.
+
+### …but the coverage fix is INERT on its own — measured, correcting the above
+
+An earlier revision of this file recommended treating 1.5 → 20 as a defect fix
+"on its own evidence, separately from the k_d question". **That recommendation
+was wrong** and is withdrawn. Measured over the working set, full span,
+`ref=plate`, `uncert=10`:
+
+| config | total flagged (6 stations) |
+|---|---|
+| baseline, S0 off | 688 |
+| S0 on, gap 1.5 (default) | 703 (+15) |
+| **S0 on, GAP 20 only** | **701 (+13)** |
+| S0 on, gap 20 + k_d 3.5 | 952 (+264) |
+
+Raising coverage from ~65 % to ~99 % moved the total by **−2**, and contributed
+exactly **zero** on AKUR. Per labelled point, no gap value recovers anything at
+k_d = 10:
+
+| labelled point | gap1.5/k10 | gap20/k10 | gap60/k10 | gap60/k6 | gap60/k3.5 |
+|---|---|---|---|---|---|
+| RED N −7.3 (5.0) | – | – | – | – | **FLAG** |
+| RED U +12.5 (4.2) | – | – | – | – | **FLAG** |
+| RED U −31 (4.1) | – | – | – | – | **FLAG** |
+| RED U +13 (3.9, gap 15 d) | – | – | – | – | **FLAG** |
+| RED N −11.8 (6.4, gap 36 d) | – | – | – | **FLAG** | **FLAG** |
+| GRN E +8.7 (8.4) | FLAG | FLAG | FLAG | FLAG | FLAG |
+| GOLD U −24 (3.2) | – | – | – | – | – |
+
+**Conclusion: the two knobs are coupled, not separable.** k_d is the binding
+constraint everywhere; the gap is a necessary enabler for one subclass only
+(isolated points after long gaps — `RED N −11.8` needs gap ≥ 40 **and**
+k_d < 6.4, neither alone). The coverage statistic is true but operationally
+inert at k_d = 10, because the blind region contains almost nothing that clears
+that threshold.
+
+Method note, since this is the third instance in this work: the error was
+reasoning from a structural fact (29–43 % blind) to an operational
+recommendation without measuring the consequence — the same pattern as the
+falsified `window_order=1` invariance claim and the `steps.csv` premise.
+**Measure the consequence, not the mechanism.**
+
+The separation boundary has now held across **7 labelled points in 2 windows**:
+reds at 3.9–6.4 all flagged at k_d = 3.5, gold at 3.2 still correctly
+undecided. Cost of the combined change: 688 → 952 (+38 %), 0.46–2.20 % per
+station. Still short of the 5–10 windows this file requires before a default
+moves.
 
 Fixture #2 (BGÓ, RHOF 2013–2020): **2016-04-02 north −11.8 mm**, gap_before
 35.9 d, gap_after 4.0 d. At gap ≥ 60 its statistic is **6.39** with a near
