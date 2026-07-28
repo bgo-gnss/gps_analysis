@@ -403,12 +403,51 @@ VMEY 0.32) — far under `max_flag_fraction`.
 The separation is clean but rests on **one station-window and six points**.
 Flipping the default would move stored detrend records (S0 flags feed the fit
 exclusion), re-hash provenance in both mirrors, and require rewriting §3.0's
-justification for k_d = 10 — all from a sample of six. `despike_gap_days`
-1.5 → 20 is the larger semantic change of the two and is untested outside this
-window.
+justification for k_d = 10 — all from a sample of six.
 
 Instead: **label 5–10 more station-windows first**, then set the default from
 the pooled boundary in a measured ticket shaped like T2b.
+
+### `despike_gap_days` is a DIFFERENT question — and it is a defect, not tuning
+
+Measured 2026-07-28 (correcting an earlier claim in this file that the gap was
+"the larger semantic change of the two" — it is the opposite).
+
+The two S0 knobs are not equivalent. **`despike_gap_days` controls COVERAGE**
+(what fraction of epochs S0 can judge at all — outside it δ is NaN and no
+despike is possible however extreme the point); **`despike_n_sigma` controls
+SENSITIVITY** within that coverage.
+
+S0 coverage — % of epochs with BOTH neighbours inside the gap:
+
+| sta | gap=1.5 (default) | gap=5 | gap=20 | gap=60 |
+|---|---|---|---|---|
+| RHOF | 71.4 % | 94.4 % | 99.0 % | 99.5 % |
+| HOFN | **58.5 %** | 93.8 % | 99.4 % | 99.7 % |
+| REYK | **57.0 %** | 94.1 % | 99.4 % | 99.8 % |
+| AKUR | 63.8 % | 92.4 % | 98.9 % | 99.4 % |
+
+**At the default, S0 is structurally blind to 29–43 % of epochs.** Cost of
+lifting it, at k_d = 3.5: RHOF 0.53 % → 0.61 % despiked (1.5 → 20 d), and
+20 → 60 adds nothing (0.61 → 0.61) — it saturates by ~20 d because only 0.51 %
+of epochs have a predecessor further back than that.
+
+So the gap default is the same failure shape as §11's unreachable NaN branch
+and `step_flank_max_reach_days`: **a fixed window measuring elapsed time rather
+than evidence.** Recommend treating 1.5 → 20 as a defect fix on its own
+evidence, separately from the k_d question, which still needs more labels.
+
+Fixture #2 (BGÓ, RHOF 2013–2020): **2016-04-02 north −11.8 mm**, gap_before
+35.9 d, gap_after 4.0 d. At gap ≥ 60 its statistic is **6.39** with a near
+perfect return (0.01) — the strongest S0 signature in either fixture, invisible
+solely because its predecessor is 36 days away.
+
+Caveats to carry into implementation: no case for > 20 d as a default (the
+2016-04-02 point at 36 d is the tail, not the norm); and a 36-day-old neighbour
+is a weaker baseline reference than a 1-day one (seasonal motion over that span
+is ~1 mm against ŝ_Δ ≈ 1.5 mm, so ~1σ of bias in the return test). **Nothing
+currently records the reach used** — as with the flank fallback, the reach
+should be reported so a far-reaching verdict is legible as less reliable.
 
 ### No new option is needed to do that
 
