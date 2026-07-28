@@ -528,7 +528,17 @@ and T1's `test_outlier_field_parity` (if landed first) catches it.
 
 ---
 
-## S-N — Network-coherent epoch rejection (PROPOSED, strongest lead so far)
+## S-N — Network-coherent epoch rejection (DEFERRED — separate project)
+
+> **Status 2026-07-28: OUT OF SCOPE for this plan.** BGÓ's decision —
+> network/regional-wide effects (atmospheric loading, reference-frame and
+> orbit artifacts, common-mode) are their own project for a later time, not a
+> branch of the per-station outlier work. Recorded here because the evidence
+> was gathered and should not be lost, **not** as a live lead.
+>
+> Consequently the k_d default question below is **deferred pending more
+> labelled windows** (as originally stated), NOT suspended pending an S-N
+> feasibility check. Ignore any wording to the contrary.
 
 Found 2026-07-28 while labelling VMEY. This is the design doc's own **Q7**
 ("signal coherence lives across stations, which is the caller's network-level
@@ -582,15 +592,55 @@ threshold can recover it without also flagging genuine noise.**
 
 ### Consequences for the rest of this plan
 
-- **Both levers are needed.** 2 of 7 labelled points (RHOF U 2013-08-23,
-  2015-10-03) are genuinely station-local and only S0 will catch them.
-- **It weakens the case for lowering k_d.** If the majority class is caught
-  network-wide, S0 can stay near its original intent (isolated station-local
-  spikes) rather than being re-tuned into an aggressive filter.
-- The k_d default question is therefore **suspended**, not merely deferred,
-  pending an S-N feasibility check.
+- **2 of 7 labelled points are genuinely station-local** (RHOF U 2013-08-23,
+  2015-10-03) — only S0 will ever catch those, whatever happens network-side.
+- The remaining 4 belong to the deferred class. **They should not be used as
+  evidence for or against a k_d default**, since the lever that fits them is
+  out of scope. The usable labelled set for the k_d question is therefore
+  much smaller than 7 — another reason not to move that default yet.
 
-### Open questions before this becomes a ticket
+### Sweep result (archive-wide, for the future project)
+
+Run 2026-07-28 over 18 stations, full archive. Residual vs a centred 25-day
+rolling median, robust-scaled; a day is a candidate when ≥ 5 stations have data,
+|median z| > 2 and > 50 % of stations exceed 3σ.
+
+**138 distinct candidate days** (165 component-days); **20 hit more than one
+component** — whole-solution failures, the least ambiguous class:
+
+```
+2021-12-03  north(−11.0, 100%)  east(+66.6, 100%)  up(+10.7, 100%)
+2022-09-08  north(−29.7, 100%)  east(+26.9, 100%)  up( +6.3,  88%)
+2022-06-30  north( −9.7, 100%)  east(+42.2, 100%)  up( +6.4, 100%)
+2013-10-02  north( −4.4, 100%)  east( +8.5, 100%)  up( −5.0, 100%)
+```
+
+Component split: **east 70, north 70, up 25** — i.e. NOT north-specific. The
+earlier speculation that north was systematically hit came from reading two
+hand-found samples as a pattern; it is withdrawn.
+
+**Three caveats that must travel with these numbers** — they are not clean:
+
+1. **The sweep misses the strongest known positive.** `2016-04-02` (median z
+   −10.09, 100 % of stations) was NOT recovered, because only 4 stations had
+   data and the gate required ≥ 5. 138 is an undercount and the threshold is
+   doing unexamined work.
+2. **The year distribution is uninterpretable as a trend** (2001–2013: 5 days;
+   2022–2026: 120). Few of the 18 stations existed before ~2015, so the n ≥ 5
+   gate can rarely fire early. Almost certainly a method artifact.
+3. **The 2022–2026 concentration overlaps the Reykjanes/Grindavík unrest**, and
+   a dike intrusion moves many stations coherently — the exact false-positive
+   mode. That 100 % of stations exceed 3σ argues artifact (real deformation
+   decays with distance, and RHOF/HOFN should not respond identically to a
+   Reykjanes source) — but it argues, it does not demonstrate.
+
+**The single check that would separate the two populations** and was not run:
+whether z varies with geography on the strongest days. Uniform across the
+country ⇒ processing artifact; decaying from a source ⇒ real deformation. That
+turns the geographic-dispersion discriminator from an assumption into a
+measurement, and is the natural first step whenever this project is picked up.
+
+### Open questions for that future project
 
 1. **Network-coherent is not automatically a blunder.** A large earthquake
    moves many stations at once. What makes these diagnostic is
