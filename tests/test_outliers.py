@@ -50,6 +50,7 @@ from gps_analysis.outliers import (
     REASON_LOCAL,
     OutlierParams,
     candidate_clusters,
+    clip_sigma,
     detect_outliers,
     hampel_mask,
     mad_scale,
@@ -576,19 +577,57 @@ class TestDetectionQuality:
         assert sum(counts) <= 15  # measured 9 over these seeds
         assert max(counts) <= 6
 
-    def test_sigma_weighting(self) -> None:
-        # same raw residual: large formal sigma -> not flagged, small
-        # formal sigma -> flagged (studentization works, §3.1)
+    @staticmethod
+    def _coinflated_fixture():
+        """Same raw residual, one epoch carrying an inflated formal sigma.
+
+        Proportions follow the real case this exists for — RHOF 2023-02-28
+        Up: an 83 mm residual (~26x the median sigma) at a sigma 4.1x the
+        median. A spike only ~6x the median sigma is too small to clear k_g
+        once capped, so a fixture built at that scale would pin nothing.
+        """
         t, y = _white_series(1000, 6)
-        sigma = np.full(1000, WN)
         i_noisy, i_quiet = 300, 700
         y2 = y.copy()
-        y2[[i_noisy, i_quiet]] += 6 * WN
-        sigma2 = sigma.copy()
-        sigma2[i_noisy] = 6 * WN
-        res = detect_outliers(lineperiodic, t, y2, sigma2)
+        y2[[i_noisy, i_quiet]] += 15 * WN
+        sigma2 = np.full(1000, WN)
+        sigma2[i_noisy] = 4 * WN
+        return t, y2, sigma2, i_noisy, i_quiet
+
+    def test_sigma_weighting_default(self) -> None:
+        # §3.1 as originally specified: large formal sigma -> not flagged,
+        # small -> flagged. Kept, with the clip made EXPLICIT rather than
+        # implicit, because this behaviour is still correct at the default —
+        # it is only the DESIRABILITY of the default that §13 disputes.
+        t, y2, sigma2, i_noisy, i_quiet = self._coinflated_fixture()
+        res = detect_outliers(
+            lineperiodic, t, y2, sigma2, params=OutlierParams(whiten_sigma_clip=0.0)
+        )
         assert not bool(res.flags[i_noisy])
         assert bool(res.flags[i_quiet])
+
+    def test_sigma_clip_releases_coinflated_epoch(self) -> None:
+        # §13: the SAME fixture with the whitening denominator capped. The
+        # co-inflated epoch is no longer excused by its own sigma. This is the
+        # behaviour DoD 2 requires, pinned separately rather than by editing
+        # the assertion above — both are true, at different settings.
+        t, y2, sigma2, i_noisy, i_quiet = self._coinflated_fixture()
+        res = detect_outliers(
+            lineperiodic, t, y2, sigma2, params=OutlierParams(whiten_sigma_clip=1.5)
+        )
+        assert bool(res.flags[i_noisy]), "capped sigma must stop the self-pardon"
+        assert bool(res.flags[i_quiet])
+
+    def test_clip_sigma_primitive(self) -> None:
+        sigma = np.array([1.0, 1.0, 1.0, 10.0, np.nan, 0.0])
+        out = clip_sigma(sigma, 2.0)
+        assert out is not None
+        # median over FINITE POSITIVE entries only (1.0) -> cap 2.0
+        np.testing.assert_allclose(out[:4], [1.0, 1.0, 1.0, 2.0])
+        assert np.isnan(out[4]) and out[5] == 0.0  # sentinels untouched
+        # disabled forms are pass-through
+        np.testing.assert_array_equal(clip_sigma(sigma, 0.0), sigma)
+        assert clip_sigma(None, 1.5) is None
 
     def test_qn_matches_mad_flags(self) -> None:
         # identical flag sets for well-separated spikes (§8.2)

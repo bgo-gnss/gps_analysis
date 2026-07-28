@@ -800,6 +800,89 @@ Default **0.0 (off)**: it loosens detection and is the least validated of the
 three, so it stays opt-in until validated per network. 5.0 is the suggested
 starting value.
 
+
+## 12. Addendum — per-component abort (branch `outlier-abort-granularity`, 2026-07-28)
+
+### §3.5a — the abort is per COMPONENT, with an absolute floor
+
+§3.5 wrote the gate as a "per-component candidate fraction" but the ACTION
+was global: any component over `f_max` zeroed all three. The evidence is per
+component and so is the failure. Measured:
+
+| station | per-component candidate fraction | old result | new result |
+|---|---|---|---|
+| SAUD full | `[0.100, 0.009, 0.006]` | all three zeroed | `[True, False, False]` — E and U recover **38 flags** |
+| GFUM full | `[0.086, 0.076, 0.088]` | all three zeroed | all three abort — correct, genuine multi-year misfit |
+| GFUM 90 d | 4 candidates of **63** = 6.3 % | north zeroed | survives at `min_abort_candidates = 10` |
+
+Two changes:
+
+1. **Per-component action.** `OutlierDetection.component_abort` (shape `(C,)`).
+   An aborted component is DECIDED — skipped on later sweeps, keeping its
+   zeroed row — while healthy siblings continue to their own fixed point. Its
+   per-epoch diagnostics are those of the sweep in which IT aborted.
+   `epoch_policy="union"` unions over SURVIVORS only; folding an aborted
+   all-False row back in would reintroduce the blast radius this removes.
+2. **`min_abort_candidates`** (default 0 = unchanged). The fraction is
+   quantized at small N; 4 of 63 is noise in the counting, not evidence of a
+   wrong model.
+
+**`excess_flag_abort` keeps its meaning** as `component_abort.any()`. That is
+the compatibility hinge, and the reason this change moves **no stored detrend
+records**: `detrend.estimate_detrend` reads the scalar and takes the identical
+branch. Verified, not assumed.
+
+**Visibility (DoD 1).** An aborted component is served raw with only a
+`UserWarning`, so the figure was indistinguishable from a clean one — the
+worst failure mode for a monitoring product. `gps_plot` now badges the aborted
+component's AXIS (not a figure banner: a station where north aborted but east
+and up cleaned is a different object from one where all three failed), and the
+badge deliberately survives `--hide-outliers` — decluttering removes DECIDED
+outliers, and an abort is the opposite of decided.
+
+**Not fixed here, and not a side effect:** the abort's non-monotonicity
+(backlog #2 — RHOF `window_n_sigma` 2.5 → 414 flags, 2.0 → **0**) survives both
+changes untouched.
+
+## 13. Addendum — clipped whitening (`whiten_sigma_clip`, 2026-07-28)
+
+### §3.1 amendment — the formal σ is NOT a trustworthy quality ratio
+
+§3.1 asserts that σ contributes "the epoch-to-epoch quality *ratio*". Measured
+on RHOF full span, that is false: Spearman(σ, |r|) = **−0.06 / +0.24 / +0.12**
+(N/E/U). Worse, σ inflates at exactly the bad epochs — the same daily
+estimation produces both the blunder and its σ — so `r/σ` is near-invariant to
+how bad the solution was and **self-pardons gross excursions**:
+
+```
+RHOF 2023-02-28 Up:  residual +83.0 mm,  σ = 13.2 mm (4.1× median)
+  uncapped      |z| = 3.33   ← not even a candidate, against k_g = 5.0
+  c = 1.5       |z| = 8.82
+  c = 2.0       |z| = 6.74
+  c = 3.0       |z| = 4.53   ← fails the gate
+  drop σ        |z| = 12.85
+```
+
+**Mechanism: clipped whitening** (`clip_sigma`, §4.1), `σ'ᵢ = min(σᵢ, c·med σ)`,
+applied to the **identifiers only** — the robust fit keeps raw σ, so §3.1's WLS
+weighting survives and backlog #6 (`f_scale` not unit-agnostic on the σ=None
+path) stays out of scope.
+
+Chosen over the alternatives on measurement, not preference: clipping at
+c = 1.5 recovers **29 epochs over k_g fleet-wide against 30 for dropping σ
+entirely** — nearly all the recall, without landing on the non-unit-agnostic
+σ=None path.
+
+**Default 0.0 = off, bit-identical.** Flipping it is T2b, and that ticket
+DOES move stored detrend records (`estimate_detrend` detects before it fits).
+
+**A blind spot this exposed.** `test_golden_order0_fixture` passes **no σ**, so
+`whiten(r, None)` returns `r` and the entire σ path is invisible to it — the
+first version of the T2a pin table wrongly predicted that fixture would break.
+`test_golden_whitened_fixture` now pins a σ-bearing series. Note it is a value
+pin, not a clip-decisive one; the behavioural pin is
+`test_sigma_clip_releases_coinflated_epoch`.
+
 ---
 
 _Spec created 2026-07-13 (analysis lane). §10 addendum implemented 2026-07-14

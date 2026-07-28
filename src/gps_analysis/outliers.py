@@ -133,6 +133,7 @@ __all__ = [
     "standardize_robust",
     "step_evidence",
     "whiten",
+    "clip_sigma",
 ]
 
 _DAYS_PER_YEAR = 365.25
@@ -489,6 +490,49 @@ def whiten(r: ArrayLike, sigma: ArrayLike | None) -> FloatArray:
     if not np.all(ss > 0.0):
         raise ValueError("sigma must be strictly positive (and finite)")
     return np.asarray(rr / ss, dtype=np.float64)
+
+
+def clip_sigma(sigma: ArrayLike | None, c: float) -> FloatArray | None:
+    """Cap formal uncertainties at ``c * median(sigma)`` (§3.4.3/§13).
+
+    Equation:
+        ``sigma'_i = min(sigma_i, c * med(sigma))``
+
+    Rationale (backlog finding 1, measured): the formal sigma inflates at
+    exactly the bad epochs, because the same daily estimation produces both
+    the blunder and its sigma.  ``r/sigma`` is therefore close to invariant
+    to how bad the solution was, and whitening SELF-PARDONS gross excursions
+    — RHOF 2023-02-28 Up carries an 83.0 mm residual at sigma = 13.2 mm
+    (4.1x median) and scores |z| = 3.33, not even a candidate.  Capping the
+    denominator keeps the seasonal quality RATIO that §3.1 wants while
+    removing the blunder-epoch self-pardon: the same epoch scores 8.82 at
+    c = 1.5.
+
+    Symbols -> args:
+        - ``sigma_i`` -> ``sigma``: formal 1-sigma uncertainties, or None
+        - ``c``       -> ``c``: cap in units of the median sigma; ``c <= 0``
+          disables the cap and returns ``sigma`` unchanged
+
+    Returns:
+        The capped array (a copy), or ``sigma`` itself when the cap is
+        disabled or ``sigma`` is None.  Non-finite and non-positive sigmas
+        are left alone — :func:`whiten` owns that contract.
+
+    Numerical notes:
+        The median is taken over FINITE POSITIVE sigmas only, so a series
+        carrying NaN/0 sentinels caps against the same reference the usable
+        epochs do.
+    """
+    if sigma is None or c <= 0.0:
+        return None if sigma is None else np.asarray(sigma, dtype=np.float64)
+    ss = np.asarray(sigma, dtype=np.float64)
+    usable = np.isfinite(ss) & (ss > 0.0)
+    if not usable.any():
+        return ss
+    cap = c * float(np.median(ss[usable]))
+    out = ss.copy()
+    out[usable] = np.minimum(out[usable], cap)
+    return out
 
 
 def standardize_robust(
@@ -1233,6 +1277,16 @@ class OutlierParams:
             cannot express "stop protecting on step evidence". Turning
             it off is also how a caller isolates the step rule when
             testing the protection stages separately.
+        whiten_sigma_clip: Cap c on the whitening denominator, in units
+            of the median sigma (§13, :func:`clip_sigma`).  The formal
+            sigma inflates at exactly the bad epochs, so r/sigma
+            self-pardons gross excursions; capping it removes that
+            without discarding the seasonal quality ratio.  Default
+            **0.0 = off**, bit-identical to the pre-2026-07-28
+            behavior.  Measured on RHOF 2023-02-28 U (83.0 mm residual,
+            sigma 4.1x median): |z| 3.33 uncapped -> 8.82 at c=1.5 ->
+            6.74 at c=2.0 -> 4.53 at c=3.0, against k_g = 5.0.  Applies
+            to the IDENTIFIERS only; the robust fit keeps raw sigma.
         max_flag_fraction: Abort threshold f_max on the per-component
             **candidate** fraction (§3.5 — "> f_max of epochs *look
             like* outliers ⇒ unmodeled signal, do nothing, loudly").
@@ -1277,6 +1331,7 @@ class OutlierParams:
     step_flank_max_reach_days: float = 60.0
     step_magnitude_ratio: float = 0.0
     protect_on_indeterminate: bool = True
+    whiten_sigma_clip: float = 0.0
     max_flag_fraction: float = 0.05
     min_abort_candidates: int = 0
     max_iterations: int = 3
@@ -1312,6 +1367,7 @@ class OutlierParams:
                 raise ValueError(f"{name} must be > 0")
         non_negative = (
             "scale_floor",
+            "whiten_sigma_clip",
             "min_outlier",
             "max_run_days",
             "step_flank_max_reach_days",
@@ -1571,7 +1627,10 @@ def _component_candidates(
         params.f_scale,
     )
     r = np.asarray(y_c - np.asarray(fit_model(tt, *p_hat), dtype=np.float64))
-    w = whiten(r, sigma_c)
+    # §13: cap sigma for the IDENTIFIER only. The robust fit above keeps the
+    # raw sigma, so §3.1's WLS weighting is untouched and backlog #6
+    # (f_scale not unit-agnostic on the sigma=None path) stays out of scope.
+    w = whiten(r, clip_sigma(sigma_c, params.whiten_sigma_clip))
     z, center, s_global = standardize_robust(w, scale=params.scale_estimator)
     n = int(tt.size)
     s_local = np.full(n, np.nan, dtype=np.float64)

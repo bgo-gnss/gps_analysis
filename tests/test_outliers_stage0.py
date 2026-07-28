@@ -519,6 +519,43 @@ class TestLocalPolynomialIdentifier:
         assert float(res.scale_global[0]) == pytest.approx(1.878318937520205, rel=1e-12)
         assert res.n_iterations == 2 and res.converged
 
+    def test_golden_whitened_fixture(self) -> None:
+        """Durable regression on a SIGMA-BEARING series (§13).
+
+        ``test_golden_order0_fixture`` calls ``detect_outliers(model, t, y)``
+        with NO sigma, so ``whiten(r, None)`` returns r and the whole sigma
+        path — whitening, the scale estimated from whitened residuals, and
+        any capping of it — is invisible to it. That blind spot is why the
+        pin table for §13 was wrong at first: it predicted the order-0
+        fixture would break on a whitening change, and it cannot.
+
+        This pins exact flags + global scale on a series that DOES carry
+        sigma, including one co-inflated epoch (index 420: large residual
+        AND 4x median sigma).
+
+        Honest limitation: these values do not move under
+        ``whiten_sigma_clip`` alone, because the co-inflated epoch is caught
+        by the WINDOWED identifier either way. It is a value pin for the
+        sigma path in general, not a clip-decisive one — that role belongs
+        to ``TestDetectionQuality::test_sigma_clip_releases_coinflated_epoch``.
+        Values captured on this branch, 2026-07-28.
+        """
+        rng = np.random.default_rng(1234)
+        n = 900
+        t = _daily_t(n, start=2015.0)
+        y = lineperiodic(t, *TRUE_LP) + rng.normal(0.0, 2.0, n)
+        sigma = np.full(n, 2.0)
+        idx = np.array([150, 420, 730], dtype=np.intp)
+        y[idx] += np.array([30.0, -34.0, 40.0])
+        sigma[420] = 8.0  # co-inflated: big residual AND big formal sigma
+
+        res = detect_outliers(lineperiodic, t, y, sigma)
+        np.testing.assert_array_equal(
+            np.flatnonzero(res.flags), [150, 194, 420, 730, 837, 838, 857]
+        )
+        assert float(res.scale_global[0]) == pytest.approx(0.999378493340234, rel=1e-12)
+        assert res.n_iterations == 2 and res.converged
+
     def test_order1_determinism(self) -> None:
         t, y, _ = self._ramp_with_spikes()
         p = OutlierParams(window_order=1)
