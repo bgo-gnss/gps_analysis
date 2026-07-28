@@ -350,13 +350,110 @@ yet chosen.
 
 ---
 
+## T-S — Stage isolation (`--stages`) + the S0 calibration question
+
+Added 2026-07-28 from BGÓ's annotated RHOF 2013–2016 figure. Slots **before
+T2a**: being able to run S0 alone is how you measure whether the whitening fix
+is even needed for a given class of outlier.
+
+### Naming
+
+**Stages are S0–S5, tickets are T0–T3.** BGÓ's original phrasing used T0/T1 for
+stages, which collides with the ticket names. Stages, per the spec:
+
+| stage | what | spec |
+|---|---|---|
+| **S0** | gross-blunder despike — robust first differences of RAW data | §3.0 |
+| **S1** | step-augmented robust `lineperiodic` fit → residuals | §3.1 |
+| **S2** | whitening by formal σ | §3.1 |
+| **S3** | global identifier, \|ẑ\| > k_g | §3.3a |
+| **S4** | windowed Hampel identifier | §3.3b |
+| **S5** | signal protection (floor / run / step / window) | §3.4 |
+
+### The finding that motivates it
+
+**S0 is σ-free.** It works on robust first differences of the raw series — no
+model fit, no whitening — so it is structurally immune to the σ-blindness that
+backlog #1 calls the central design error. That makes it a cheap *partial*
+answer to "obvious outliers survive", independent of T2.
+
+**S0 currently fires on almost nothing.** Default `despike_n_sigma` (k_d) = 10,
+chosen for "gross blunders only" (A ≳ 14σ). Measured on BGÓ's labelled figure
+(RHOF, `ref=plate`, `uncert=10`, 2013-01-01 → 2016-01-01), the S0 statistic
+`min(|δ⁻|,|δ⁺|)/ŝ_Δ` at each annotated point — **all six pass the sign-flip and
+return-to-baseline conditions**, so magnitude alone separates them:
+
+| point | date | statistic | BGÓ label |
+|---|---|---|---|
+| E +8.7 | 2013-10-02 | **8.4** | correctly detected (by S3/S4) |
+| N −7.3 | 2013-10-02 | **5.0** | MISSED — should be caught |
+| U +12.5 | 2013-08-23 | **4.2** | MISSED |
+| U −31 | 2013-10-02 | **4.1** | MISSED |
+| U +13 | 2015-10-03 | **3.9** | MISSED (15 d gap after ⇒ also needs `despike_gap_days`) |
+| U −24 | 2015-12-31 | **3.2** | provisional/gold — correctly undecided |
+
+`k_d = 3.5` + `despike_gap_days = 20` reproduces the labelling exactly: all
+four misses flagged, the already-caught epoch still flagged, the gold epoch
+still undecided. Network cost of S0 alone at k_d = 3.5: **0.21–0.74 %** of
+component-epochs (RHOF 0.53, AKUR 0.74, THEY 0.21, HOFN 0.32, REYK 0.38,
+VMEY 0.32) — far under `max_flag_fraction`.
+
+### Recommendation on the default: **do not lower it yet**
+
+The separation is clean but rests on **one station-window and six points**.
+Flipping the default would move stored detrend records (S0 flags feed the fit
+exclusion), re-hash provenance in both mirrors, and require rewriting §3.0's
+justification for k_d = 10 — all from a sample of six. `despike_gap_days`
+1.5 → 20 is the larger semantic change of the two and is untested outside this
+window.
+
+Instead: **label 5–10 more station-windows first**, then set the default from
+the pooled boundary in a measured ticket shaped like T2b.
+
+### No new option is needed to do that
+
+Already works, via `dataclasses.fields` introspection in
+`plot_gps_timeseries._build_outlier_params` — verified 2026-07-28:
+
+```bash
+figview.sh RHOF --ref plate --view cleaned --uncert 10 -s 20130101 -e 20160101 \
+  --outlier-param despike=true \
+  --outlier-param despike_n_sigma=3.5 \
+  --outlier-param despike_gap_days=20
+```
+
+### Scope of T-S
+
+1. **`--stages S0[,S1,…]` / `--stages all`** as a first-class selector,
+   replacing the sentinel-threshold hack (`global_n_sigma=1e9`). Sentinels do
+   not express intent and cannot be asserted on. Needs explicit enable flags on
+   `OutlierParams` (or an equivalent), since S5's indeterminate arm is the one
+   branch already shown to be unreachable by thresholds (§11 §3.4.2a-i).
+2. **A labelled-fixture harness**: record `(station, window, component, epoch,
+   label)` from human annotation, and report per-stage attribution — which
+   stage caught each labelled epoch, and which labelled epochs nothing caught.
+   BGÓ's figure above is fixture #1.
+3. Do **not** change any default in T-S. Defaults move in a later measured
+   ticket, once the fixture set is large enough to justify them.
+
+**Pins:** adding enable flags to `OutlierParams` disturbs both params-hash
+mirrors and config parity, exactly as T1 does — same re-establishment recipe,
+and T1's `test_outlier_field_parity` (if landed first) catches it.
+**Detrend records:** not moved, provided every stage defaults to enabled.
+
+---
+
 ## Dependencies and merge order
 
 ```
-T0 ──► T1 ──► T2a ──► T2b ──► T3
+T0 ──► T1 ──► T-S ──► T2a ──► T2b ──► T3
         │
         └─ T1b (optional store column for component_abort) — independent after T1
 ```
+
+T-S sits after T1 (it wants T1's field-parity test) and before T2a (running S0
+alone is how you measure whether the whitening fix is needed for a given
+outlier class).
 
 - **T0** first: every later acceptance check is a T0 command.
 - **T1** before **T2a**: T1's field-parity test is what stops T2a's new field
