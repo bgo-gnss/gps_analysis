@@ -528,6 +528,88 @@ and T1's `test_outlier_field_parity` (if landed first) catches it.
 
 ---
 
+## S-N — Network-coherent epoch rejection (PROPOSED, strongest lead so far)
+
+Found 2026-07-28 while labelling VMEY. This is the design doc's own **Q7**
+("signal coherence lives across stations, which is the caller's network-level
+domain") — anticipated in §3.4.4 and never built.
+
+### The finding
+
+BGÓ labelled exactly one obvious outlier on VMEY 2013–2020: **north
+2016-04-02**. That is the *same date* as RHOF's isolated −11.8 mm north point.
+Checking the network:
+
+| 2016-04-02, north residual vs local 15-d median | |
+|---|---|
+| RHOF | −11.8 mm |
+| AKUR | −7.0 mm (−13.1σ) |
+| HOFN | −5.8 mm (−37.1σ) |
+| VMEY | −4.3 mm (−6.1σ) |
+| REYK | −3.1 mm (−7.1σ) |
+| Up component | unaffected everywhere (0.0, −0.5, +0.7, +0.9σ) |
+
+Every station, north only, same sign, from Vestmannaeyjar to Akureyri to Höfn.
+That is a **solution-day artifact**, not station physics.
+
+**Two bad days account for 4 of the 7 labelled points.** 2013-10-02 shows in
+all three components at RHOF; 2016-04-02 in north at RHOF and VMEY.
+
+| labelled epoch | n_sta | median z | frac \|z\|>3 | verdict | BGÓ |
+|---|---|---|---|---|---|
+| 2016-04-02 N | 4 | **−10.09** | **100 %** | network-coherent | OBVIOUS |
+| 2013-10-02 E | 7 | **+10.55** | 86 % | network-coherent | already caught |
+| 2013-10-02 U | 7 | **−4.69** | 86 % | network-coherent | missed |
+| 2013-10-02 N | 7 | **−3.23** | 57 % | network-coherent | missed |
+| 2013-08-23 U | 6 | +0.56 | 17 % | station-local | missed |
+| 2015-10-03 U | 12 | −1.27 | 8 % | station-local | missed |
+| 2015-01-07 N (VMEY) | 9 | −1.90 | 22 % | station-local | **not** circled |
+| 2017-09-18 U (VMEY) | 8 | −0.15 | 12 % | station-local | **not** circled |
+| 2019-11-11 U (VMEY) | 11 | +0.44 | 18 % | station-local | **not** circled |
+
+### Why this beats tuning k_d
+
+On VMEY the S0 statistic cannot separate the labels at all — BGÓ's obvious
+point scores **4.06**, the three he did *not* circle score **3.74 / 3.78 /
+3.75**. There is no defensible threshold in that gap, and the clean RHOF
+boundary (3.9 vs gold 3.2) **does not transfer**. Network coherence separates
+the same set by an order of magnitude (|med z| 3.2–10.6 at 57–100 % vs 0.15–1.9
+at 8–22 %).
+
+Structural reason: on any single station the artifact is modest (VMEY −4.3 mm,
+REYK −3.1 mm). It is unambiguous only in aggregate, so **no per-station
+threshold can recover it without also flagging genuine noise.**
+
+### Consequences for the rest of this plan
+
+- **Both levers are needed.** 2 of 7 labelled points (RHOF U 2013-08-23,
+  2015-10-03) are genuinely station-local and only S0 will catch them.
+- **It weakens the case for lowering k_d.** If the majority class is caught
+  network-wide, S0 can stay near its original intent (isolated station-local
+  spikes) rather than being re-tuned into an aggressive filter.
+- The k_d default question is therefore **suspended**, not merely deferred,
+  pending an S-N feasibility check.
+
+### Open questions before this becomes a ticket
+
+1. **Network-coherent is not automatically a blunder.** A large earthquake
+   moves many stations at once. What makes these diagnostic is
+   single-component, same-sign, across stations hundreds of km apart in
+   different tectonic settings. That discriminator must be *encoded*, not
+   assumed — geographic dispersion and component-selectivity are the
+   candidate features.
+2. Evidence so far is **2 dates, 4–12 stations**. Needs a sweep over the full
+   archive: how many such days exist, and do they correlate with known
+   processing events (orbit products, frame changes, GAMIT/GLOBK reruns)?
+3. Architecturally this cannot live in `gps_analysis.outliers` — the leaf is
+   per-station by contract. It belongs in the caller
+   (`gps_api.precompute`/`geo_dataread`), consistent with §3.4.4's Q7 note.
+4. Interaction with detection: is a network-flagged epoch removed before
+   per-station detection runs (changing every fit), or masked after? The
+   former moves stored detrend records.
+
+---
+
 ## Dependencies and merge order
 
 ```
