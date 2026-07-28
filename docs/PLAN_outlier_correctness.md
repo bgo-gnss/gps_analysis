@@ -57,17 +57,51 @@ and excludes those epochs, so the harness never hits the leaf's NaN crash. The
 leaf-level `ValueError` is still real for the `estimate_detrend`/precompute
 lane — that stays backlog #9. **Do not "fix" it here.**
 
-**Acceptance**
+**Acceptance** — DONE 2026-07-28, `geo_dataread/tests/characterize_fleet_outliers.py`
 
 ```bash
 python geo_dataread/tests/characterize_fleet_outliers.py \
-  --stations RHOF VMEY HOFN SAUD GFUM AKUR REYK --windows 90d,1yr,full --ref plate --uncert 10
+  --stations RHOF VMEY HOFN SAUD GFUM AKUR REYK THEY \
+  --windows 90d,1yr,full --ref plate --uncert 10 \
+  --save tests/data/fleet_baseline.tsv
 ```
 
-Exits 0 with REYK included and reproduces: SAUD full-span per-component
-fractions ≈ `[0.100, 0.009, 0.006]`; GFUM ≈ `[0.077, 0.045, 0.092]`; GFUM 90 d
-= 4 candidates of 63; HOFN 90 d → 7 flagged, 1 yr → 6. Table committed as
-`geo_dataread/tests/data/fleet_baseline.txt`.
+Reproduced exactly: SAUD full-span per-component candidate fractions
+`[0.1005, 0.0085, 0.0060]`; GFUM `[0.0774, 0.0451, 0.0925]`; GFUM 90 d = 4
+candidates of 63; **REYK included** (the finite mask is mirrored from
+`detect_view_outliers`, so the leaf NaN crash never fires — that leaf
+fragility stays backlog #9, unworked-around).
+
+⚠ **The plan's HOFN criterion was itself defective and is replaced.** It said
+"HOFN 90 d → 7 flagged, 1 yr → 6", measured against `currDatetime(-1)`. That
+anchor MOVES, and on a detector we already know is window-dependent the counts
+move with it: measured 8 / 6 / 5 flagged at 90 d for three end dates days
+apart. The full-span checks reproduced precisely because they are
+anchor-insensitive; only the windowed ones drifted. **A baseline tied to
+"yesterday" is not a baseline** — this is the T3 defect surfacing inside T0's
+own acceptance test. All windowed acceptance numbers must pin `--end`
+explicitly (the harness takes it as a fractional year); windows otherwise
+anchor on each station's own last epoch, which keeps a station that stopped
+years ago measurable.
+
+**Config-file lever (BGÓ's stated end goal: per-station control from a config
+file rather than flags).** `--outlier-overrides PATH` resolves through the
+production chain — `station_step_epochs` + `resolve_protect_windows` +
+`resolve_outlier_detection` — so a candidate `outlier_overrides.csv` is
+evaluated exactly as deployment would apply it. Demonstrated: a CSV with rows
+for RHOF and VMEY only moved those two stations (+21/+22/+8 and +13/+9/+3
+flags) and left THEY untouched.
+
+**Coverage gap found while wiring it:** the per-station catalog
+(`gps_parser.outlier_catalogs.OUTLIER_OVERRIDE_COLUMNS` — note: *not*
+`OUTLIER_OVERRIDE_KEYS`, as an earlier revision of this file said) carries only
+**5 of 26** `OutlierParams` fields: `despike`, `despike_n_sigma`,
+`window_order`, `window_robust_iterations`, `epoch_policy`, plus the
+per-component `min_outlier_{n,e,u}` floor. **`despike_gap_days` is NOT among
+them** — the S0 coverage knob has no per-station route today, nor do
+`global_n_sigma`, `window_n_sigma` or any `step_*`. Extending that column set
+is a prerequisite for tuning S0 from config, and it touches all four
+`OutlierParams` mirrors.
 
 **Pins:** none. **Detrend records:** not moved.
 
