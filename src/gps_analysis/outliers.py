@@ -1236,6 +1236,15 @@ class OutlierParams:
         max_flag_fraction: Abort threshold f_max on the per-component
             **candidate** fraction (§3.5 — "> f_max of epochs *look
             like* outliers ⇒ unmodeled signal, do nothing, loudly").
+            The abort is PER COMPONENT (§3.5a): a pathological component
+            no longer zeroes its healthy siblings.
+        min_abort_candidates: Minimum ABSOLUTE candidate count before the
+            fraction rule may abort a component (§3.5a).  ``f_max`` alone
+            is quantized at small N — GFUM over a 90-day window aborts on
+            **4 candidates of 63** (6.3 % > 5 %), which is noise in the
+            counting rather than evidence of a wrong model.  Default
+            **0** reproduces the pre-2026-07-28 behavior bit-identically;
+            10 is the suggested production value.
         max_iterations: Sweep cap of the conservative iteration.
         loss: Robust-fit loss (``scipy.optimize.least_squares``);
             ``"huber"`` per §3.1.
@@ -1269,6 +1278,7 @@ class OutlierParams:
     step_magnitude_ratio: float = 0.0
     protect_on_indeterminate: bool = True
     max_flag_fraction: float = 0.05
+    min_abort_candidates: int = 0
     max_iterations: int = 3
     loss: str = "huber"
     f_scale: float = 1.0
@@ -1316,6 +1326,8 @@ class OutlierParams:
             raise ValueError("max_flag_fraction must be in (0, 1]")
         if self.window_min_count < 1:
             raise ValueError("window_min_count must be >= 1")
+        if self.min_abort_candidates < 0:
+            raise ValueError("min_abort_candidates must be >= 0")
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be >= 1")
         if self.window_order not in (0, 1, 2):
@@ -1404,11 +1416,25 @@ class OutlierDetection:
         n_despiked: Stage-0 gross-blunder count per component, shape
             (C,) int64 — all zeros unless ``params.despike`` is True.
         n_iterations: Detection sweeps actually performed.
-        converged: True when the flag mask reached a fixed point within
-            ``max_iterations`` (False on abort).
-        excess_flag_abort: True ⇒ the candidate fraction exceeded
-            ``max_flag_fraction`` and ``flags`` is all-False by rule
-            §3.5 — loud, diagnostics fully populated, never silent.
+        converged: True when every NON-ABORTED component reached a fixed
+            point within ``max_iterations``.  False when the sweep cap
+            was hit, or when every component aborted.  A partial abort
+            with the survivors converged reports True — the aborted
+            components are decided, not unfinished.
+        component_abort: Per-component abort mask, shape (C,) — True
+            where that component's candidate fraction exceeded
+            ``max_flag_fraction`` (subject to ``min_abort_candidates``)
+            and its ``flags`` row was therefore zeroed (§3.5a).  Always
+            present, shape (1,) for 1-D input.  An aborted component's
+            per-epoch diagnostics (``candidates``/``reasons``/
+            ``protected``/``z``) are those of the sweep in which IT
+            aborted, not of the last sweep the survivors ran — it is
+            decided and no longer re-evaluated.
+        excess_flag_abort: ``component_abort.any()`` — kept with its
+            original meaning so callers written against the whole-station
+            rule (notably ``detrend.estimate_detrend``) are unaffected.
+            Note the flags are now all-False only for the ABORTED
+            components; healthy siblings keep theirs.
         params: Echo of the thresholds used — provenance building block
             (MATH_STANDARDS §6).
     """
@@ -1428,6 +1454,11 @@ class OutlierDetection:
     converged: bool
     excess_flag_abort: bool
     params: OutlierParams
+    # Defaulted so any caller constructing this by hand (tests, stubs) keeps
+    # working; detect_outliers always passes it explicitly.
+    component_abort: NDArray[np.bool_] = dataclasses.field(
+        default_factory=lambda: np.zeros(0, dtype=np.bool_)
+    )
 
 
 def _resolve_floors(
@@ -1907,15 +1938,23 @@ def detect_outliers(
     scale_local = np.full((n_components, n), np.nan, dtype=np.float64)
     events: list[SuspectedEvent] = []
     converged = False
-    aborted = False
+    # §3.5a: the abort is per COMPONENT. The evidence is per component (SAUD's
+    # candidate fractions are [0.100, 0.009, 0.006] — only north is
+    # pathological), and zeroing east and up because north has an unmodeled
+    # signal problem discards perfectly good cleaning. Once a component
+    # aborts it is DECIDED: it is skipped on later sweeps and keeps its
+    # zeroed flags, while healthy siblings continue to their own fixed point.
+    component_abort = np.zeros(n_components, dtype=np.bool_)
     n_iterations = 0
 
     for _sweep in range(detection_params.max_iterations):
         n_iterations += 1
         events = []
-        aborted = False
-        new_flags = np.zeros_like(flags)
+        # aborted components keep their (zeroed) row rather than being rebuilt
+        new_flags = flags.copy()
         for c in range(n_components):
+            if component_abort[c]:
+                continue
             r, w, z_c, s_g, s_loc, cand_c, reasons_c = _component_candidates(
                 fit_model,
                 tt,
@@ -1973,12 +2012,25 @@ def detect_outliers(
             # (§3.5).
             abort_candidates = cand_c & ~in_protect
             n_abort = float(np.count_nonzero(abort_candidates))
-            if n_abort / n > detection_params.max_flag_fraction:
-                aborted = True
+            # §3.5a: the fraction rule is quantized at small N (GFUM/90 d
+            # aborts on 4 candidates of 63 = 6.3 %), so an absolute floor
+            # gates it. Default 0 leaves the rule exactly as it was.
+            if (
+                n_abort / n > detection_params.max_flag_fraction
+                and n_abort >= detection_params.min_abort_candidates
+            ):
+                component_abort[c] = True
+                new_flags[c] = False  # zero THIS component only
         if detection_params.epoch_policy == "union":
-            union = np.any(new_flags, axis=0)
-            new_flags = np.repeat(union[np.newaxis, :], n_components, axis=0)
-        if aborted:
+            # Union over the SURVIVORS only: an aborted component's all-False
+            # row carries no information, and folding it in would let one
+            # pathological component suppress nothing while a healthy one
+            # promotes across it — reintroducing the blast radius §3.5a removes.
+            live = ~component_abort
+            if live.any():
+                union = np.any(new_flags[live], axis=0)
+                new_flags[live] = union
+        if component_abort.all():
             flags = np.zeros_like(flags)
             converged = False
             break
@@ -2022,8 +2074,9 @@ def detect_outliers(
             n_despiked=n_despiked,
             n_iterations=n_iterations,
             converged=converged,
-            excess_flag_abort=aborted,
+            excess_flag_abort=bool(component_abort.any()),
             params=detection_params,
+            component_abort=component_abort,
         )
     return OutlierDetection(
         flags=flags,
@@ -2039,6 +2092,7 @@ def detect_outliers(
         n_despiked=n_despiked,
         n_iterations=n_iterations,
         converged=converged,
-        excess_flag_abort=aborted,
+        excess_flag_abort=bool(component_abort.any()),
         params=detection_params,
+        component_abort=component_abort,
     )
