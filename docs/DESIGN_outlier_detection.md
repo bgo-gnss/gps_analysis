@@ -883,6 +883,68 @@ first version of the T2a pin table wrongly predicted that fixture would break.
 pin, not a clip-decisive one; the behavioural pin is
 `test_sigma_clip_releases_coinflated_epoch`.
 
+
+## 14. Addendum — stage isolation (`enable_*` / `--stages`, 2026-07-28)
+
+Each stage can now be switched off explicitly:
+
+| flag | stage |
+|---|---|
+| `despike` | S0 gross-blunder despike |
+| `enable_global` | S3 global identifier |
+| `enable_window` | S4 windowed Hampel |
+| `enable_protection` | S5 signal protection |
+
+S1 (robust fit) and S2 (whitening) are **structural** — every later stage is
+defined on their residuals — so they always run.
+
+Previously the only way to disable a stage was a sentinel threshold
+(`global_n_sigma = 1e9`). That does not express intent, cannot be asserted on,
+and **for the protection stage could not express "off" at all**: its
+indeterminate arm ignored every threshold (§3.4.2a).
+
+A disabled stage's **diagnostics stay populated** (`z`, `scale_global`,
+`scale_local`) — the purpose of isolation is attribution, and blanking them
+would defeat it. With S5 off, `flags == candidates` exactly; that is an
+attribution tool, never a production setting.
+
+### Why this matters: the abort measures window composition, not model error
+
+SELF (Selfoss) carries an **undeclared 143 mm coseismic offset** from the
+Ölfus M6.3 of 2008-05-29. Measured candidate fraction against the fraction of
+the window lying *before* that step:
+
+| window start | pre-step fraction | candidate fraction | abort |
+|---|---|---|---|
+| 2005 | 0.083 | 0.091 | **yes** |
+| 2006 | 0.058 | 0.067 | **yes** |
+| 2007 | 0.036 | 0.044 | no |
+| 2009 | 0.000 | 0.009 | no |
+
+`cand_frac ≈ pre_frac + 0.009`. The robust fit **adopts the majority segment**
+and marks the entire minority as candidates, so the abort statistic is
+essentially *how much of the window sits on the wrong side of the step* — plus
+the station's baseline rate. **Same data, same earthquake, different verdict
+purely from where the plot starts.** This is backlog #2's non-monotonicity in
+another guise, and it is why an undeclared step is not merely "over-flagging".
+
+Stage isolation makes the mechanism visible and gives a way around it:
+
+| config (SELF from 2005) | candidate fraction | result |
+|---|---|---|
+| all stages | 0.091 / 0.089 / 0.083 | abort, 0 flags |
+| **S0 only** | **0.004 / 0.004 / 0.001** | **clean, 19 / 16 / 3 flags** |
+| S0 + S3 (global only) | 0.087 / 0.086 / 0.080 | abort |
+| S0 + S4 (windowed only) | 0.069 / 0.066 / 0.061 | abort |
+
+Both model-based identifiers independently exceed `f_max` — they ride the same
+contaminated residuals. **S0 does not**: it works on local first differences
+with no global fit, and its verdict is unchanged across window starts
+(19/16/3, 19/15/3, 18/15/3 for 2005/2007/2009). S0 is therefore the only stage
+that is robust to undeclared steps *without prior knowledge* — which is the
+property BGÓ asked for, and the reason declared steps, while still valuable,
+are not a precondition for useful detection.
+
 ---
 
 _Spec created 2026-07-13 (analysis lane). §10 addendum implemented 2026-07-14

@@ -1277,6 +1277,17 @@ class OutlierParams:
             cannot express "stop protecting on step evidence". Turning
             it off is also how a caller isolates the step rule when
             testing the protection stages separately.
+        enable_global: Run the GLOBAL identifier S3 (|ẑ| > k_g).  Default
+            True.  Turning a stage off is a FIRST-CLASS operation (§14):
+            previously the only way was a sentinel threshold
+            (``global_n_sigma=1e9``), which does not express intent, cannot
+            be asserted on, and — for the protection stage — could not
+            express "off" at all (the §3.4.2a NaN arm).
+        enable_window: Run the WINDOWED Hampel identifier S4.  Default True.
+        enable_protection: Run the signal-protection stage S5 (floor / run /
+            step / operator windows).  Default True.  With it off, every
+            candidate becomes a flag — useful for attributing WHICH stage
+            found an epoch, never for production.
         whiten_sigma_clip: Cap c on the whitening denominator, in units
             of the median sigma (§13, :func:`clip_sigma`).  The formal
             sigma inflates at exactly the bad epochs, so r/sigma
@@ -1331,6 +1342,9 @@ class OutlierParams:
     step_flank_max_reach_days: float = 60.0
     step_magnitude_ratio: float = 0.0
     protect_on_indeterminate: bool = True
+    enable_global: bool = True
+    enable_window: bool = True
+    enable_protection: bool = True
     whiten_sigma_clip: float = 0.0
     max_flag_fraction: float = 0.05
     min_abort_candidates: int = 0
@@ -1665,6 +1679,14 @@ def _component_candidates(
         n_sigma=params.window_n_sigma,
         scale_floor=params.scale_floor,
     )
+    # §14 stage gating. Zeroing the mask (rather than skipping the compute)
+    # keeps z / s_local populated, so a disabled stage stays DIAGNOSABLE —
+    # the point of isolation is attribution, and blanking the diagnostics
+    # would defeat it.
+    if not params.enable_global:
+        global_mask = np.zeros_like(global_mask)
+    if not params.enable_window:
+        local_mask = np.zeros_like(local_mask)
     candidates = global_mask | local_mask
     reasons[global_mask] |= np.uint8(REASON_GLOBAL)
     reasons[local_mask] |= np.uint8(REASON_LOCAL)
@@ -2033,21 +2055,29 @@ def detect_outliers(
             reasons_c = np.where(gross[c], np.uint8(REASON_GROSS), reasons_c).astype(
                 np.uint8
             )
-            prot_c, events_c = _protect_component(
-                tt,
-                r,
-                w,
-                cand_c,
-                s_g,
-                float(floors[c]),
-                protect_windows,
-                detection_params,
-                max_gap,
-                max_run,
-                step_window,
-                c,
-                despiked=gross[c],
-            )
+            # §14: with S5 off every candidate becomes a flag. An
+            # attribution tool ("which stage found this epoch?"), never a
+            # production setting -- protection is what stops real signal
+            # being masked.
+            if not detection_params.enable_protection:
+                prot_c = np.zeros(cand_c.shape, dtype=np.uint8)
+                events_c: list[SuspectedEvent] = []
+            else:
+                prot_c, events_c = _protect_component(
+                    tt,
+                    r,
+                    w,
+                    cand_c,
+                    s_g,
+                    float(floors[c]),
+                    protect_windows,
+                    detection_params,
+                    max_gap,
+                    max_run,
+                    step_window,
+                    c,
+                    despiked=gross[c],
+                )
             # Returned candidate mask INCLUDES gross so the documented §8.4
             # invariants hold with despike on: flags ⊆ candidates and
             # reasons == 0 exactly off candidates. Gross epochs carry

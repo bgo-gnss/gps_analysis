@@ -629,6 +629,52 @@ class TestDetectionQuality:
         np.testing.assert_array_equal(clip_sigma(sigma, 0.0), sigma)
         assert clip_sigma(None, 1.5) is None
 
+    def test_stage_gating_is_first_class(self) -> None:
+        """§14: each identifier can be switched off explicitly.
+
+        Previously the only way was a sentinel threshold
+        (``global_n_sigma=1e9``) — which does not express intent, cannot be
+        asserted on, and for the protection stage could not express "off" at
+        all, because its indeterminate arm ignored every threshold (§3.4.2a).
+        """
+        t, y = _white_series(1200, 11)
+        idx = _spike_indices(6, 200, 150)
+        y2 = _inject_spikes(y, idx, np.full(6, 12.0 * WN))
+
+        allon = detect_outliers(lineperiodic, t, y2)
+        no_g = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(enable_global=False)
+        )
+        no_w = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(enable_window=False)
+        )
+        neither = detect_outliers(
+            lineperiodic,
+            t,
+            y2,
+            params=OutlierParams(enable_global=False, enable_window=False),
+        )
+        # every subset is a subset of all-on; disabling both leaves nothing
+        assert set(np.flatnonzero(no_g.flags)) <= set(np.flatnonzero(allon.flags))
+        assert set(np.flatnonzero(no_w.flags)) <= set(np.flatnonzero(allon.flags))
+        assert int(neither.candidates.sum()) == 0
+        assert int(neither.flags.sum()) == 0
+        # diagnostics stay populated for a disabled stage -- attribution is
+        # the point, and blanking them would defeat it
+        assert np.isfinite(neither.z).any()
+        assert float(neither.scale_global[0]) > 0.0
+
+    def test_protection_off_promotes_every_candidate(self) -> None:
+        """§14: with S5 off, flags == candidates exactly."""
+        t, y = _white_series(1500, 12)
+        i0 = 900
+        y2 = _inject_step(t, y, float(t[i0]), 40.0)  # would normally protect
+        res = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(enable_protection=False)
+        )
+        np.testing.assert_array_equal(res.flags, res.candidates)
+        assert int(res.protected.sum()) == 0
+
     def test_qn_matches_mad_flags(self) -> None:
         # identical flag sets for well-separated spikes (§8.2)
         t, y = _white_series(1000, 8)
