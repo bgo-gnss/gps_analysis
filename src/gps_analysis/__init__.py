@@ -134,7 +134,10 @@ from gps_analysis.staged import (
     HeldExplicit,
     HeldFromStage,
     Stage,
+    StagedEstimate,
+    StageResult,
     compose_held,
+    estimate_staged,
     fit_held_partition,
 )
 from gps_analysis.transient import (
@@ -225,7 +228,10 @@ __all__ = [
     "HeldExplicit",
     "HeldFromStage",
     "Stage",
+    "StageResult",
+    "StagedEstimate",
     "compose_held",
+    "estimate_staged",
     "fit_held_partition",
     "slice_window",
     "slice_windows",

@@ -51,14 +51,17 @@ from collections.abc import Mapping, Sequence
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
-from .fitting import _wls_solve
-from .models import FloatArray
+from .fitting import ModelFunc, _wls_solve
+from .models import FloatArray, TrajectoryParams
 
 __all__ = [
     "HeldExplicit",
     "HeldFromStage",
     "Stage",
+    "StageResult",
+    "StagedEstimate",
     "compose_held",
+    "estimate_staged",
     "fit_held_partition",
 ]
 
@@ -337,3 +340,368 @@ def compose_held(
         mask |= member
         values[member] = supplied
     return mask, values
+
+
+@dataclasses.dataclass(frozen=True)
+class StageResult:
+    """Diagnostics of one executed stage.
+
+    Attributes:
+        name: The stage's label.
+        free_mask: (P,) parameters this stage estimated.
+        held_mask: (P,) parameters it held.
+        held_values: (P,) the values held, zero off ``held_mask``.
+        held_sources: Group name → provenance string (an earlier stage's
+            name, or a donor station for a borrow).
+        n_epochs: Epochs inside this stage's domain.
+        params: Per component, the stage's own full-length solution.
+        covariance: Per component, its (P, P) covariance — propagated when
+            the held values carried one, conditional otherwise.
+        held_covariance: ``"propagated"`` or ``"conditional"``, so a reader
+            of a stored record can tell which was reported.
+    """
+
+    name: str
+    free_mask: NDArray[np.bool_]
+    held_mask: NDArray[np.bool_]
+    held_values: FloatArray
+    held_sources: Mapping[str, str]
+    n_epochs: int
+    params: tuple[FloatArray, ...]
+    covariance: tuple[FloatArray, ...]
+    held_covariance: str
+
+
+@dataclasses.dataclass(frozen=True)
+class StagedEstimate:
+    """Result of :func:`estimate_staged` — one parameter set, many stages.
+
+    Attributes:
+        fits: One :class:`~gps_analysis.models.TrajectoryParams` per
+            component, the COMPOSED solution.  Composition rule: the last
+            stage in which a term was free owns its value.
+        stages: Per-stage diagnostics in execution order.
+        plan: The plan as executed.
+        model: Model registry code.
+        param_names: Positional parameter names of the model.
+    """
+
+    fits: tuple[TrajectoryParams, ...]
+    stages: tuple[StageResult, ...]
+    plan: tuple[Stage, ...]
+    model: str
+    param_names: tuple[str, ...]
+
+    def to_record_fragment(self) -> dict[str, object]:
+        """The additive record keys describing how this was estimated.
+
+        Additive at ``RECORD_VERSION`` 1, following the ``segments``
+        precedent: ``trajectory_from_record`` reads only
+        version/model/step_epochs/param_names/components, and
+        ``TrajectoryParams.from_record`` ignores unknown keys, so a staged
+        record and a single-fit one coexist in one document.
+        """
+        return {
+            "stage_plan": [
+                {
+                    "name": s.name,
+                    "free": list(s.free),
+                    "held": {k: _held_provenance(v) for k, v in s.held.items()},
+                    "segments": (
+                        None if s.segments is None else [[a, b] for a, b in s.segments]
+                    ),
+                }
+                for s in self.plan
+            ],
+            "stages": [
+                {
+                    "name": r.name,
+                    "n_epochs": int(r.n_epochs),
+                    "free": [
+                        n
+                        for n, k in zip(self.param_names, r.free_mask, strict=True)
+                        if k
+                    ],
+                    "held_sources": dict(r.held_sources),
+                    "held_covariance": r.held_covariance,
+                }
+                for r in self.stages
+            ],
+        }
+
+
+def _held_provenance(held: Held) -> str:
+    """One string naming where a held value came from."""
+    if isinstance(held, HeldFromStage):
+        return f"stage:{held.stage}"
+    return f"explicit:{held.source}"
+
+
+def _group_masks(
+    model: ModelFunc, groups: Sequence[str]
+) -> dict[str, NDArray[np.bool_]]:
+    """Term-group membership masks, via the existing classifier.
+
+    Reuses ``detrend._term_keep_mask`` rather than restating which
+    parameter names belong to which group — one definition of "secular",
+    in one place, shared with :func:`gps_analysis.detrend.select_terms`.
+    """
+    from .detrend import _term_keep_mask
+
+    return {g: _term_keep_mask(model, g) for g in groups}
+
+
+def estimate_staged(
+    model: str | ModelFunc,
+    t: ArrayLike,
+    y: ArrayLike,
+    sigma: ArrayLike | None = None,
+    *,
+    plan: Sequence[Stage],
+    segments: Sequence[tuple[float | None, float | None]] | None = None,
+    absolute_sigma: bool = False,
+    names: Sequence[str] | None = None,
+    tol: float = 1e-3,
+) -> StagedEstimate:
+    """Run a staged estimation plan and compose one parameter set.
+
+    Thin orchestration (MATH_STANDARDS §1, no new math): per stage, resolve
+    the free/held column partition from the term groups, slice the stage's
+    domain with :func:`~gps_analysis.baseline.slice_windows`, and call
+    :func:`fit_held_partition`.  All the mathematics lives there.
+
+    Composition rule: **the last stage in which a term is free owns its
+    value.**  A term that is never free and never held in the final stage
+    would leave an unowned coefficient, so the plan is rejected up front
+    rather than silently emitting a zero.
+
+    Symbols → args:
+        - ``f`` → ``model``: registry code or a registered callable
+        - ``tᵢ`` → ``t``: epochs, fractional years [yr]
+        - ``y_cᵢ`` → ``y``: observations, (N,) or (C, N) [L]
+        - ``σ_cᵢ`` → ``sigma``: 1-σ uncertainties, shape of ``y`` [L]
+        - stages → ``plan``: the :class:`Stage` sequence, executed in order
+        - default domain → ``segments``: used by any stage whose own
+          ``segments`` is None
+
+    Args:
+        model: Trajectory model.
+        t: Epochs, sorted ascending.
+        y: Observations.
+        sigma: Uncertainties.
+        plan: Stages, in execution order.
+        segments: Default fit domain (union form); None = the whole series.
+        absolute_sigma: Passed to the WLS solve.
+        names: Per-component labels.
+        tol: Window boundary tolerance [yr].
+
+    Returns:
+        A :class:`StagedEstimate`.
+
+    Raises:
+        ValueError: For an empty plan, a duplicate stage name, a reference
+            to a stage that has not run yet, a term owned by no stage, or a
+            stage whose domain holds no epochs.
+
+    Reference:
+        The manoeuvre is the operator recipe of
+        ``detrend-OLAC/detrend_test.py::katlafitlong``; the held mechanism
+        and its covariance are :func:`fit_held_partition`.
+
+    Numerical notes:
+        Each stage's held covariance is taken from the SOURCE stage's own
+        joint covariance block, which is the condition that makes the
+        propagation exact — see :func:`fit_held_partition`'s notes.  A
+        :class:`HeldExplicit` without a ``covariance`` yields a conditional
+        result for that stage, flagged as such in
+        :attr:`StageResult.held_covariance` so it cannot be mistaken for a
+        propagated one.
+    """
+    from .baseline import slice_windows
+    from .detrend import _resolve_model
+    from .fitting import _components_2d, _resolve_linear_design
+
+    if not plan:
+        raise ValueError("plan must contain at least one stage")
+    seen: set[str] = set()
+    for stage in plan:
+        if stage.name in seen:
+            raise ValueError(f"duplicate stage name {stage.name!r}")
+        seen.add(stage.name)
+
+    model_func, model_name = _resolve_model(model)
+    design_spec = _resolve_linear_design(model_func)
+    if design_spec is None:
+        raise ValueError(
+            "estimate_staged requires a linear-in-parameters model: holding a "
+            "term is column arithmetic, which only removes that term when the "
+            f"model is linear in its parameters; got {model_name!r}"
+        )
+    tt = np.asarray(t, dtype=np.float64)
+    yy, was_1d = _components_2d(y, "y")
+    ss = None if sigma is None else _components_2d(sigma, "sigma")[0]
+    n_components = yy.shape[0]
+
+    full_design = design_spec.build(tt)
+    n_params = full_design.shape[1]
+    from .detrend import _param_names
+
+    param_names = tuple(_param_names(model_func))
+
+    wanted = {g for s in plan for g in (*s.free, *s.held)}
+    masks = _group_masks(model_func, sorted(wanted))
+
+    # Composition ownership, validated BEFORE any fitting: a coefficient that
+    # no stage ever frees and that the last stage does not hold would silently
+    # be emitted as zero.
+    owner = np.zeros(n_params, dtype=np.bool_)
+    for stage in plan:
+        for g in stage.free:
+            owner |= masks[g]
+    for g in plan[-1].held:
+        owner |= masks[g]
+    if not owner.all():
+        orphan = [n for n, o in zip(param_names, owner, strict=True) if not o]
+        raise ValueError(
+            f"parameters {orphan} are never estimated and not held in the final "
+            f"stage, so the composed record would carry them as zero"
+        )
+
+    composed = [np.zeros(n_params, dtype=np.float64) for _ in range(n_components)]
+    composed_cov = [
+        np.zeros((n_params, n_params), dtype=np.float64) for _ in range(n_components)
+    ]
+    by_stage: dict[str, StageResult] = {}
+    results: list[StageResult] = []
+
+    for stage in plan:
+        segs = stage.segments if stage.segments is not None else segments
+        mask = (
+            np.ones(tt.size, dtype=np.bool_)
+            if segs is None
+            else slice_windows(tt, segs, tol=tol)
+        )
+        n_epochs = int(np.count_nonzero(mask))
+        if n_epochs == 0:
+            raise ValueError(f"stage {stage.name!r} domain {segs} contains no epochs")
+
+        held_mask = np.zeros(n_params, dtype=np.bool_)
+        sources: dict[str, str] = {}
+        for g in stage.held:
+            held_mask |= masks[g]
+            sources[g] = _held_provenance(stage.held[g])
+
+        free_mask = np.zeros(n_params, dtype=np.bool_)
+        for g in stage.free:
+            free_mask |= masks[g]
+        if (free_mask & held_mask).any():
+            overlap = [
+                n for n, k in zip(param_names, free_mask & held_mask, strict=True) if k
+            ]
+            raise ValueError(f"stage {stage.name!r} both frees and holds {overlap}")
+
+        stage_params: list[FloatArray] = []
+        stage_cov: list[FloatArray] = []
+        kind = "conditional"
+        for c in range(n_components):
+            values = np.zeros(n_params, dtype=np.float64)
+            held_cov_block: FloatArray | None = None
+            blocks: list[tuple[NDArray[np.bool_], FloatArray | None]] = []
+            for g, src in stage.held.items():
+                gm = masks[g]
+                if isinstance(src, HeldFromStage):
+                    if src.stage not in by_stage:
+                        raise ValueError(
+                            f"stage {stage.name!r} holds {g!r} from "
+                            f"{src.stage!r}, which has not run"
+                        )
+                    prior = by_stage[src.stage]
+                    values[gm] = prior.params[c][gm]
+                    blocks.append((gm, prior.covariance[c][np.ix_(gm, gm)]))
+                else:
+                    values[gm] = np.asarray(src.values, dtype=np.float64)
+                    blocks.append(
+                        (
+                            gm,
+                            None
+                            if src.covariance is None
+                            else np.asarray(src.covariance, dtype=np.float64),
+                        )
+                    )
+            if blocks and all(b is not None for _m, b in blocks):
+                idx = np.flatnonzero(held_mask)
+                held_cov_block = np.zeros((idx.size, idx.size), dtype=np.float64)
+                for gm, blk in blocks:
+                    pos = np.searchsorted(idx, np.flatnonzero(gm))
+                    held_cov_block[np.ix_(pos, pos)] = blk
+                kind = "propagated"
+
+            if held_mask.any():
+                p, cov = fit_held_partition(
+                    full_design[mask],
+                    yy[c][mask],
+                    None if ss is None else ss[c][mask],
+                    held_mask=held_mask,
+                    held_values=values,
+                    held_cov=held_cov_block,
+                    absolute_sigma=absolute_sigma,
+                )
+            else:
+                p, cov = _wls_solve(
+                    full_design[mask][:, free_mask],
+                    yy[c][mask],
+                    None if ss is None else ss[c][mask],
+                    absolute_sigma,
+                )
+                full_p = np.zeros(n_params, dtype=np.float64)
+                full_p[free_mask] = p
+                full_c = np.zeros((n_params, n_params), dtype=np.float64)
+                fi = np.flatnonzero(free_mask)
+                full_c[np.ix_(fi, fi)] = cov
+                p, cov = full_p, full_c
+            stage_params.append(p)
+            stage_cov.append(cov)
+            # the last stage that FREED a term owns its value
+            composed[c][free_mask] = p[free_mask]
+            fi = np.flatnonzero(free_mask)
+            composed_cov[c][np.ix_(fi, fi)] = cov[np.ix_(fi, fi)]
+
+        result = StageResult(
+            name=stage.name,
+            free_mask=free_mask,
+            held_mask=held_mask,
+            held_values=stage_params[0] * held_mask,
+            held_sources=sources,
+            n_epochs=n_epochs,
+            params=tuple(stage_params),
+            covariance=tuple(stage_cov),
+            held_covariance=kind if held_mask.any() else "n/a",
+        )
+        by_stage[stage.name] = result
+        results.append(result)
+
+    # anything only ever HELD in the final stage keeps that stage's value
+    final = results[-1]
+    for c in range(n_components):
+        composed[c][final.held_mask] = final.params[c][final.held_mask]
+        hi = np.flatnonzero(final.held_mask)
+        composed_cov[c][np.ix_(hi, hi)] = final.covariance[c][np.ix_(hi, hi)]
+
+    label: list[str | None] = (
+        list(names) if names is not None else [None] * n_components
+    )
+    fits = tuple(
+        TrajectoryParams(
+            params=composed[c], covariance=composed_cov[c], component=label[c]
+        )
+        for c in range(n_components)
+    )
+    if was_1d and len(fits) != 1:  # pragma: no cover - shape guard
+        raise ValueError("1-D y produced multiple components")
+    return StagedEstimate(
+        fits=fits,
+        stages=tuple(results),
+        plan=tuple(plan),
+        model=model_name,
+        param_names=param_names,
+    )

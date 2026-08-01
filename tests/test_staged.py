@@ -29,6 +29,7 @@ from gps_analysis.staged import (
     HeldFromStage,
     Stage,
     compose_held,
+    estimate_staged,
     fit_held_partition,
 )
 
@@ -440,3 +441,162 @@ class TestStagingEarnsItsPlace:
             f"propagated/empirical = {modelled / empirical:.3f}, expected ~1 "
             f"within MC noise at n={self.N_REAL}"
         )
+
+
+class TestEstimateStaged:
+    """The orchestrator: katlafitlong as a plan, plus its refusals."""
+
+    @staticmethod
+    def _series3(seed: int = 1, n: int = 3000):
+        rng = np.random.default_rng(seed)
+        t = 2001.6 + np.arange(n) / 365.25
+        a = _design(t)
+        y = np.vstack([a @ TRUTH + rng.normal(0.0, 1.0, n) for _ in range(3)])
+        return t, y
+
+    def test_one_stage_reproduces_a_plain_joint_fit(self) -> None:
+        """Parity gate: a single free-everything stage IS the joint fit.
+
+        Required before `estimate_detrend` could ever delegate here — if
+        one stage is not the same fit, nothing built on top can be trusted.
+        """
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[Stage("all", ("secular", "periodic"))],
+        )
+        a = _design(t)
+        p_joint, _ = _wls_solve(a, y[0], None, absolute_sigma=False)
+        np.testing.assert_allclose(est.fits[0].params, p_joint, rtol=1e-9, atol=0.0)
+
+    def test_katlafitlong_is_two_stages(self) -> None:
+        """The operator recipe, expressed rather than hand-coded."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y,
+            plan=[
+                Stage("clean", ("secular", "periodic"), segments=[(None, 2005.6)]),
+                Stage(
+                    "long",
+                    ("secular",),
+                    held={"periodic": HeldFromStage("clean")},
+                ),
+            ],
+            names=["north", "east", "up"],
+        )
+        assert [s.name for s in est.stages] == ["clean", "long"]
+        assert est.stages[0].n_epochs < est.stages[1].n_epochs, (
+            "the clean window must be a strict subset of the long span"
+        )
+        # the rate comes from the LAST stage that freed it; the seasonal from
+        # the only stage that freed it
+        assert est.fits[0].params[1] == pytest.approx(TRUTH[1], abs=0.1)
+        np.testing.assert_allclose(
+            est.fits[0].params[PERIODIC], TRUTH[PERIODIC], atol=0.25
+        )
+        assert [f.component for f in est.fits] == ["north", "east", "up"]
+
+    def test_holding_from_an_earlier_stage_propagates_its_covariance(self) -> None:
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage("clean", ("secular", "periodic"), segments=[(None, 2005.6)]),
+                Stage("long", ("secular",), held={"periodic": HeldFromStage("clean")}),
+            ],
+        )
+        assert est.stages[0].held_covariance == "n/a"
+        assert est.stages[1].held_covariance == "propagated"
+
+    def test_an_explicit_borrow_without_covariance_is_flagged_conditional(
+        self,
+    ) -> None:
+        """A donor's coefficients with no covariance CAN be used — but the
+        result is conditional on them and must say so."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage(
+                    "borrowed",
+                    ("secular",),
+                    held={"periodic": HeldExplicit(TRUTH[PERIODIC], source="OLAC")},
+                )
+            ],
+        )
+        assert est.stages[0].held_covariance == "conditional"
+        assert est.stages[0].held_sources == {"periodic": "explicit:OLAC"}
+        np.testing.assert_array_equal(est.fits[0].params[PERIODIC], TRUTH[PERIODIC])
+
+    def test_the_record_fragment_is_additive_and_names_provenance(self) -> None:
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage("clean", ("secular", "periodic"), segments=[(None, 2005.6)]),
+                Stage("long", ("secular",), held={"periodic": HeldFromStage("clean")}),
+            ],
+        )
+        frag = est.to_record_fragment()
+        assert set(frag) == {"stage_plan", "stages"}
+        assert frag["stage_plan"][1]["held"] == {"periodic": "stage:clean"}
+        assert frag["stages"][1]["held_covariance"] == "propagated"
+        import json
+
+        assert json.loads(json.dumps(frag)) == frag, "must be JSON-round-trippable"
+
+    @pytest.mark.parametrize(
+        "plan, match",
+        [
+            ([], "at least one stage"),
+            (
+                [Stage("a", ("secular",)), Stage("a", ("periodic",))],
+                "duplicate stage name",
+            ),
+            (
+                [Stage("a", ("secular",), held={"periodic": HeldFromStage("later")})],
+                "has not run",
+            ),
+            (
+                [
+                    Stage(
+                        "a",
+                        ("secular", "periodic"),  # everything owned, so the
+                        held={"secular": HeldExplicit(np.zeros(2), "x")},
+                    )  # orphan check passes and the overlap check is what fires
+                ],
+                "both frees and holds",
+            ),
+            ([Stage("a", ("secular",))], "never estimated and not held"),
+            (
+                [Stage("a", ("secular", "periodic"), segments=[(2050.0, 2060.0)])],
+                "contains no epochs",
+            ),
+        ],
+    )
+    def test_malformed_plans_are_refused(self, plan, match) -> None:
+        """Each refusal prevents a silently wrong composed record."""
+        t, y = self._series3(n=1200)
+        with pytest.raises(ValueError, match=match):
+            estimate_staged("lineperiodic", t, y[0], plan=plan)
+
+    def test_a_nonlinear_model_is_refused(self) -> None:
+        """Holding a term is column arithmetic — it only removes that term
+        when the model is linear in its parameters."""
+        from gps_analysis.models import exp_linear
+
+        t, y = self._series3(n=1200)
+        with pytest.raises(ValueError, match="linear-in-parameters"):
+            estimate_staged(
+                exp_linear, t, y[0], plan=[Stage("a", ("secular", "periodic"))]
+            )
