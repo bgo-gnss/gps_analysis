@@ -130,6 +130,13 @@ from gps_analysis.preprocess import (
     prep_plot_series,
     screen_uncertainty,
 )
+from gps_analysis.staged import (
+    HeldExplicit,
+    HeldFromStage,
+    Stage,
+    compose_held,
+    fit_held_partition,
+)
 from gps_analysis.transient import (
     BPD1Params,
     BPD2Params,
@@ -215,6 +222,11 @@ __all__ = [
     "evaluate_record",
     "apply_detrend",
     # baseline
+    "HeldExplicit",
+    "HeldFromStage",
+    "Stage",
+    "compose_held",
+    "fit_held_partition",
     "slice_window",
     "slice_windows",
     "estimate_offset",
