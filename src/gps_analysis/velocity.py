@@ -79,12 +79,12 @@ from scipy import optimize, stats
 from . import models
 from .baseline import slice_window
 from .fitting import (
-    _LINEAR_DESIGNS,
     ModelFunc,
     _components_2d,
     _n_model_params,
     _per_component_p0,
     _per_component_sigma,
+    _resolve_linear_design,
     _wls_solve,
     fit_components,
 )
@@ -816,7 +816,12 @@ def estimate_velocity_mle(
     """
     model_func = _resolve_model(model)
     n_params = _rate_param_count(model_func)
-    design = _LINEAR_DESIGNS.get(model_func)
+    # _resolve_linear_design, NOT _LINEAR_DESIGNS.get: the registry is keyed by
+    # callable identity and holds only the three house models, so a DERIVED model
+    # -- anything from `with_steps`, and every composed model to come -- carries
+    # its design on the _LINEAR_DESIGN_ATTR attribute instead and was rejected
+    # here as "nonlinear" despite being perfectly linear in its parameters.
+    design = _resolve_linear_design(model_func)
     if design is None:
         raise ValueError(
             "estimate_velocity_mle requires a linear-in-parameters model "
@@ -1060,7 +1065,11 @@ def sliding_velocity(
     # column space). Only the raw-t trend column is re-centered per window
     # for conditioning; the rate and its variance are invariant under that
     # centering.
-    design = _LINEAR_DESIGNS.get(model_func)
+    # As in estimate_velocity_mle: resolve through the attribute fallback, so a
+    # step-augmented model keeps the prebuilt-basis fast path instead of silently
+    # dropping to per-window curve_fit (same result, ~10-100x slower, and a
+    # different covariance path with no warning that it happened).
+    design = _resolve_linear_design(model_func)
     basis = None if design is None else design.build(tt)
 
     for k, center in enumerate(centers):

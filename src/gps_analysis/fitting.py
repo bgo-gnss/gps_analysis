@@ -30,11 +30,13 @@ f(t; p) from :mod:`gps_analysis.models` with parameters p ∈ ℝᴾ:
    built once and the σ-whitened system is solved by SVD
    (:func:`_wls_solve`), giving the exact optimum
    ``p̂ = (AᵀWA)⁻¹AᵀWy`` and covariance ``C_p̂ = (AᵀWA)⁻¹`` with
-   ``W = diag(1/σᵢ²)`` — no iteration. Genuinely nonlinear models
-   (:func:`~gps_analysis.models.exp_linear`,
-   :func:`~gps_analysis.models.poly2`, custom callables) go through
-   ``scipy.optimize.curve_fit`` (Levenberg–Marquardt / TRF; Moré 1978) as
-   before. Both paths share the covariance semantics (reduced-χ²
+   ``W = diag(1/σᵢ²)`` — no iteration. Everything else goes through
+   ``scipy.optimize.curve_fit`` (Levenberg–Marquardt / TRF; Moré 1978):
+   the genuinely nonlinear :func:`~gps_analysis.models.exp_linear` (and
+   custom callables), but ALSO
+   :func:`~gps_analysis.models.poly2`, which is linear in its parameters
+   (design ``[1, t, t²]``) and merely unregistered — the iterative path
+   there is an omission, not a mathematical necessity. Both paths share the covariance semantics (reduced-χ²
    rescaling unless ``absolute_sigma=True``).
 2. :func:`remove_trend` evaluates the fitted model and subtracts it,
    ``r = y − f(t; p̂)`` — the detrended series / residuals.
@@ -89,6 +91,15 @@ __all__ = [
 ModelFunc = Callable[..., FloatArray]
 """Trajectory-model callable ``f(t, *params) -> ndarray`` (see
 :mod:`gps_analysis.models`)."""
+
+_STEP_AMP_PREFIX = "step_amp_"
+"""Parameter-name prefix :func:`with_steps` synthesizes for step amplitudes.
+
+Mirrored by ``detrend._STEP_AMP_PREFIX``, which classifies these names into
+the secular term group.  It lives here too because :func:`with_steps` must
+count the amplitudes a base signature ALREADY carries in order to continue
+the numbering when it nests.
+"""
 
 _MAD_TO_SIGMA = 1.4826
 """Normalized-MAD factor: 1/Φ⁻¹(3/4), Gaussian-consistent scale
@@ -343,9 +354,13 @@ def with_steps(model: ModelFunc, step_epochs: ArrayLike) -> ModelFunc:
         rank-deficient — the existing :func:`_wls_solve` inf-covariance
         + ``OptimizeWarning`` path applies. Heaviside columns are 0/1:
         bounded, no conditioning interaction with the re-centered trend
-        column. Nesting :func:`with_steps` twice is supported only with
-        the amplitude-name collision caveat (``step_amp_i`` names must
-        stay unique) — pass all epochs in one call instead.
+        column. Nesting :func:`with_steps` composes: the amplitude
+        numbering CONTINUES from whatever the base signature already
+        carries, so ``with_steps(with_steps(m, [a]), [b, c])`` yields
+        ``step_amp_1..3``. It restarted at 1 before 2026-08, which made
+        the second call raise ``duplicate parameter name`` — one call
+        with all epochs is still the clearer spelling, but nesting is no
+        longer a trap.
     """
     epochs = np.asarray(step_epochs, dtype=np.float64)
     if epochs.ndim != 1 or epochs.size == 0:
@@ -370,8 +385,21 @@ def with_steps(model: ModelFunc, step_epochs: ArrayLike) -> ModelFunc:
         return np.asarray(base + steps, dtype=np.float64)
 
     base_sig = inspect.signature(model)
+    # Continue the numbering from whatever the base signature already carries,
+    # rather than restarting at 1. Restarting made a second with_steps call raise
+    # `ValueError: duplicate parameter name: 'step_amp_1'` from Signature.replace
+    # -- so the one composition primitive in the package could not compose with
+    # itself. A base with no step params gives `1 + 0`, i.e. the single-call
+    # naming is byte-identical, which the stored records and the param_names
+    # cross-check in `detrend.trajectory_from_record` depend on.
+    n_existing = sum(
+        1 for name in base_sig.parameters if name.startswith(_STEP_AMP_PREFIX)
+    )
     amp_params = [
-        inspect.Parameter(f"step_amp_{k + 1}", inspect.Parameter.POSITIONAL_OR_KEYWORD)
+        inspect.Parameter(
+            f"{_STEP_AMP_PREFIX}{n_existing + k + 1}",
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        )
         for k in range(n_steps)
     ]
     stepped.__signature__ = base_sig.replace(  # type: ignore[attr-defined]
@@ -490,6 +518,7 @@ def _fit_linear_design(
     y: FloatArray,
     sigma: FloatArray | None,
     absolute_sigma: bool,
+    n_params: int | None = None,
 ) -> tuple[FloatArray, FloatArray]:
     """Fit one component of a linear-in-parameters model in closed form.
 
@@ -512,6 +541,9 @@ def _fit_linear_design(
         - ``y``  → ``y``: observations, one component, shape (N,) [L]
         - ``σ``  → ``sigma``: 1-σ uncertainties, shape (N,) [L] or None
         - design → ``design``: the model's :class:`_LinearDesign`
+        - P      → ``n_params``: the model's parameter count, for the
+          design-width guard; None skips it (direct callers that have no
+          model, e.g. a hand-built design)
 
     Returns:
         ``(p̂, C_p̂)`` in the model's absolute-t parameterization —
@@ -532,6 +564,18 @@ def _fit_linear_design(
         ``curve_fit`` convention).
     """
     a = design.build(t)
+    if n_params is not None and a.shape[1] != n_params:
+        # A design whose column count disagrees with the model's parameter count
+        # is silent until it detonates: the solve returns a vector of the DESIGN's
+        # width, TrajectoryParams only checks cov against params, and the failure
+        # finally surfaces in remove_trend as `model(t, *params)` missing an
+        # argument -- arbitrarily far from the registration that caused it.
+        # Checked here because `a` already exists, so the guard is free.
+        raise ValueError(
+            f"linear design builds {a.shape[1]} columns for a "
+            f"{n_params}-parameter model; a design must emit exactly one "
+            f"column per model parameter, in positional order"
+        )
     t_ref = 0.0
     if design.trend_column is not None:
         t_ref = float(np.mean(t))
@@ -672,7 +716,7 @@ def fit_components(
     for i in range(yy.shape[0]):
         if design is not None:
             popt, pcov = _fit_linear_design(
-                design, tt, yy[i], sigmas[i], absolute_sigma
+                design, tt, yy[i], sigmas[i], absolute_sigma, n_params
             )
         else:
             popt, pcov = optimize.curve_fit(

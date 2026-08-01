@@ -107,6 +107,7 @@ __all__ = [
     "DETREND_METHOD_PLAIN",
     "DETREND_METHOD_ROBUST",
     "RECORD_VERSION",
+    "SUPPORTED_RECORD_VERSIONS",
     "DetrendEstimate",
     "apply_detrend",
     "estimate_detrend",
@@ -116,8 +117,20 @@ __all__ = [
 ]
 
 RECORD_VERSION = 1
-"""Version of the leaf's station-record shape (the ``record_version``
-key). Readers must reject unknown versions (design §3.2 rules)."""
+"""Version this writer EMITS for the leaf's station-record shape.
+
+Distinct from what the reader accepts (:data:`SUPPORTED_RECORD_VERSIONS`).
+Keeping the two separate is what lets a future shape ship without a flag day
+for the deployed documents: the writer advances, the reader keeps the older
+branch, and both live in one file (design §3.2 rules)."""
+
+SUPPORTED_RECORD_VERSIONS: frozenset[int] = frozenset({RECORD_VERSION})
+"""Record versions :func:`trajectory_from_record` can reconstruct.
+
+An exact-equality check would make every shape change a coordinated
+migration of every stored document at once.  Membership makes it additive:
+add the new version here together with its reconstruction branch, and old
+records keep reading BY CONSTRUCTION rather than by argument."""
 
 DETREND_METHOD_ROBUST = "step_augmented_robust"
 """``detrend_method`` provenance tag (design §0.2): outlier-robust
@@ -963,9 +976,10 @@ def trajectory_from_record(
         re-fitting, no renormalization.
     """
     version = record.get("record_version")
-    if version != RECORD_VERSION:
+    if version not in SUPPORTED_RECORD_VERSIONS:
         raise ValueError(
-            f"unknown record_version {version!r}; this reader supports {RECORD_VERSION}"
+            f"unknown record_version {version!r}; this reader supports "
+            f"{sorted(SUPPORTED_RECORD_VERSIONS)}"
         )
     model_name = record.get("model")
     if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
