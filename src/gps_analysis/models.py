@@ -265,8 +265,20 @@ def exp_linear(
         Model positions x(t) [L], float64, same shape as ``t``.
 
     Reference:
-        Bevis & Brown 2014, J. Geodesy 88, eq. (6)–(7) (exponential
-        transient term of the extended trajectory model). Legacy sources:
+        ⚠ UNRESOLVED — this previously cited "Bevis & Brown 2014, J. Geodesy
+        88, eq. (6)–(7) (exponential transient term of the extended
+        trajectory model)". That attribution is false and was struck
+        2026-08-02 after reading the paper (now in ``reference/papers/``):
+        its eq. (6) is the sub-model decomposition
+        ``x = x_trend + x_jumps + x_cycle``, eq. (7) is the polynomial
+        trend, and the paper contains **no exponential transient at all** —
+        its only transient is logarithmic, ``d = A·log(1 + Δt/T)`` (eq. 9),
+        composed into the ETM at eq. (10). The word "exponential" does not
+        occur anywhere in its 23 pages. This form is also not postseismic in
+        origin (see the legacy use below), so the 2020 viscoelastic
+        literature is not an automatic substitute. Supply a reference that
+        matches the actual use before citing one — MATH_STANDARDS §2.4.
+        Legacy sources:
         ``svartsengi_model.fitting.expf_long`` ≡
         ``exp_linear(t, p0, 0, p1, p2)`` (steady-state magma-inflow
         equilibration, Svartsengi half-life ≈ 90–120 d ⇒ k ≈ 2–3 yr⁻¹)

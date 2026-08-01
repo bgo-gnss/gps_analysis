@@ -154,17 +154,27 @@ from gps_analysis.transient import (
     prepare_bounds,
     run_inversion,
 )
+from gps_analysis.varpro import (
+    VarproFit,
+    estimate_varpro,
+)
 from gps_analysis.velocity import (
     SlidingVelocity,
     VelocityEstimate,
+    VelocityEstimateMIDAS,
     VelocityEstimateMLE,
     detectability_floor,
     estimate_velocity,
+    estimate_velocity_midas,
     estimate_velocity_mle,
     horizontal_azimuth,
     horizontal_azimuth_sigma,
     horizontal_magnitude,
     horizontal_magnitude_sigma,
+    midas_mad_sigma,
+    midas_pair_indices,
+    midas_rate_uncertainty,
+    midas_trimmed_median,
     sliding_velocity,
 )
 
@@ -245,15 +255,24 @@ __all__ = [
     # velocity
     "VelocityEstimate",
     "VelocityEstimateMLE",
+    "VelocityEstimateMIDAS",
     "SlidingVelocity",
     "estimate_velocity",
     "estimate_velocity_mle",
+    "estimate_velocity_midas",
+    "midas_pair_indices",
+    "midas_mad_sigma",
+    "midas_trimmed_median",
+    "midas_rate_uncertainty",
     "sliding_velocity",
     "horizontal_magnitude",
     "horizontal_azimuth",
     "horizontal_magnitude_sigma",
     "horizontal_azimuth_sigma",
     "detectability_floor",
+    # varpro (separable NLLS by variable projection)
+    "VarproFit",
+    "estimate_varpro",
     # noise (colored-noise MLE)
     "NoiseModel",
     "NoiseMLEFit",
