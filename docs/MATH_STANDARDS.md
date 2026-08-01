@@ -123,8 +123,10 @@ into the estimator — so the reader can follow the flow top-down before reading
   concentration of the linear amplitudes; `varpro`.)
 - **O'Leary & Rust 2013** — D.P. O'Leary & B.W. Rust, *Variable projection for
   nonlinear least squares problems*, Comput. Optim. Appl. 54(3), 579–593, eq. (8)
-  (VARPRO Jacobian), §2.5 (bordered-matrix covariance — never JᵀJ, which conditions
-  on the amplitudes). (`varpro._varpro_jacobian`, `varpro._bordered_covariance`.)
+  p. 585 (VARPRO Jacobian `J = −(A + B)`), §2.5 pp. 586–587 (`H = W[Φ, J]`
+  bordered-matrix covariance — never JᵀJ, which conditions on the amplitudes; dof
+  `m−n−q`), §3.1 pp. 588–589 (cost of the Kaufman approximation) — verified against
+  the primary source. (`varpro._varpro_jacobian`, `varpro._bordered_covariance`.)
 - **Kaufman 1975** — L. Kaufman, *A variable projection method for solving separable
   nonlinear least squares problems*, BIT 15(1), 49–57. (the dropped-B-term Jacobian
   approximation — cited as what `varpro` deliberately does NOT use; the gradient is

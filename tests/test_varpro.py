@@ -163,9 +163,10 @@ class TestExactRecovery:
 
 class TestJacobian:
     def test_eq8_matches_central_differences(self) -> None:
-        # Reference parity for O'Leary & Rust 2013 eq. (8), evaluated away
-        # from the optimum (nonzero gradient). Prior review measured 6e-9;
-        # 1e-6 leaves two orders of margin over FD truncation + roundoff.
+        # Reference parity for O'Leary & Rust 2013 eq. (8) (p. 585,
+        # verified against the primary source), evaluated away from the
+        # optimum (nonzero gradient). Prior review measured 6e-9; 1e-6
+        # leaves two orders of margin over FD truncation + roundoff.
         t = _time_axis()
         y, sigma = _noisy_data(t)
         design, _ = _builders(t)
@@ -185,11 +186,13 @@ class TestJacobian:
         # WHY Kaufman 1975 is tempting: the objective gradient r·J is
         # bit-identical (to roundoff) with the B term dropped, because
         # U'r = 0 exactly — so a gradient check can never expose the
-        # approximation. It is rejected anyway: O'Leary & Rust 2013
-        # measure Gauss-Newton iterations rising 3->7 with stalls under
-        # it, and the covariance border needs the full J. This test stops
-        # a future reader from "optimizing" the B term away: the full and
-        # Kaufman Jacobians must DIFFER while their gradients agree.
+        # approximation. It is rejected anyway: O'Leary & Rust 2013 §3.1
+        # (pp. 588-589) measure iterations rising 3->7 and function
+        # evaluations 8->12 (three stalls instead of one) with ||B||/||J||
+        # never above 2 %, and the covariance border needs the full J.
+        # This test stops a future reader from "optimizing" the B term
+        # away: the full and Kaufman Jacobians must DIFFER while their
+        # gradients agree.
         t = _time_axis()
         y, sigma = _noisy_data(t)
         for theta0 in (THETA_TRUE - 0.5, THETA_TRUE + 0.4):
@@ -206,8 +209,9 @@ class TestJacobian:
 class TestCovariance:
     def test_bordered_sigma_strictly_exceeds_jtj(self) -> None:
         # Pins the review correction: sigma_theta from the bordered matrix
-        # (O'Leary & Rust §2.5), never from J'J — the latter conditions on
-        # the amplitudes and understates sigma_theta. tau comparable to
+        # H = [Phi_w, J] (O'Leary & Rust §2.5, p. 587), never from J'J —
+        # the latter conditions on the amplitudes and understates
+        # sigma_theta. tau comparable to
         # the span makes the transient column nearly collinear with the
         # rate column (correlated amplitudes), where the gap is material.
         t = _time_axis()
@@ -225,6 +229,32 @@ class TestCovariance:
         _, jac = _jacobian_pieces(t, y, sigma, fit.theta)
         sigma_naive = float(np.sqrt(fit.scale_sq / float(jac @ jac)))
         assert fit.theta_sigma > sigma_naive
+
+    def test_border_column_is_j_and_variances_sign_invariant(self) -> None:
+        # The paper borders with J itself — H = W[Phi, J] (§2.5, p. 587)
+        # — and this pins that convention: the returned covariance must
+        # equal _bordered_covariance(a_w, J). All variances are invariant
+        # to the border column's sign (similarity by diag(1, ..., 1, -1))
+        # so only the amplitude-theta cross terms distinguish J from -J;
+        # they must follow the paper's sign.
+        t = _time_axis()
+        y, sigma = _noisy_data(t, theta=float(np.log(1.0)), noise=2.0)
+        design, d_design = _builders(t)
+        fit = estimate_varpro(
+            design,
+            y,
+            theta_bounds=BOUNDS,
+            sigma=sigma,
+            d_design=d_design,
+            absolute_sigma=True,
+        )
+        a_w = np.asarray(design(fit.theta)) / sigma[:, np.newaxis]
+        _, jac = _jacobian_pieces(t, y, sigma, fit.theta)
+        cov_j = _bordered_covariance(a_w, jac, fit.scale_sq)
+        np.testing.assert_allclose(fit.covariance, cov_j, rtol=0.0, atol=1e-14)
+        cov_neg = _bordered_covariance(a_w, -jac, fit.scale_sq)
+        np.testing.assert_allclose(np.diag(cov_neg), np.diag(cov_j), rtol=1e-12)
+        np.testing.assert_allclose(cov_neg[:-1, -1], -cov_j[:-1, -1], rtol=1e-12)
 
     def test_covariance_symmetric_positive_definite(self) -> None:
         t = _time_axis()

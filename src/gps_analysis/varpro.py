@@ -40,23 +40,29 @@ Derivation chain (MATH_STANDARDS §2, module contract)
    uses. A failed polish can never worsen the grid best (the
    ``noise.py`` guarantee, reproduced verbatim: the polish result is
    taken only if its objective value is strictly lower).
-3. **Jacobian** — O'Leary & Rust 2013, eq. (8) (numbering verified):
+3. **Jacobian** — O'Leary & Rust 2013, eq. (8), p. 585 (verified
+   against the primary source): ``J = −(A + B)`` with columns
 
-       ``J = −[(D·c − U·(Uᵀ·(D·c))) + U·S⁻¹·Vᵀ·(Dᵀ·r_w)]``
+       ``a = P·D·c = D·c − U·(Uᵀ·(D·c))``,  ``P = I − U·Uᵀ``
+       ``b = (Φ_w†)ᵀ·Dᵀ·r_w = U·S⁻¹·Vᵀ·(Dᵀ·r_w)``
 
-   with ``D = ∂Φ_w/∂θ``. The second addend is the **B term** that
-   Kaufman 1975 drops; it is kept here. Dropping it leaves the gradient
-   ``rᵀJ`` unchanged (``Uᵀr_w = 0`` exactly), which is why the
-   approximation is tempting, but O'Leary & Rust measure Gauss–Newton
-   iteration counts rising 3→7 with stalls under it — and the term costs
-   one back-substitution. Computed once, at θ̂, for the covariance and
-   diagnostics (the search itself is derivative-free).
-4. **Covariance** — from the **bordered** matrix ``H = [Φ_w, m]``,
-   ``m = ∂ŷ_w/∂θ = −J`` (O'Leary & Rust 2013, §2.5):
-   ``C = ŝ²·(HᵀH)⁻¹`` — never ``ŝ²/(JᵀJ)``, which conditions on the
-   amplitudes and understates σ_θ (Schur complement:
-   ``σ_θ,bordered² = ŝ²/‖(I−UUᵀ)m‖₂² ≥ ŝ²/‖J‖₂²``, strict whenever the
-   B term is nonzero).
+   and ``D = ∂Φ_w/∂θ``. ``B`` is the term Kaufman 1975 drops; it is
+   kept here. Dropping it leaves the gradient ``rᵀJ`` unchanged
+   (``Uᵀr_w = 0`` exactly), which is why the approximation is tempting,
+   but O'Leary & Rust §3.1 measure iterations rising 3→7 (function
+   evaluations 8→12, three stalls instead of one) with ``‖B‖/‖J‖``
+   never above 2 % — and the term costs one back-substitution. The
+   paper's grouping is deliberate — columns from matrix-vector products
+   only, never matrix-matrix (p. 585) — and is preserved verbatim here.
+   Computed once, at θ̂, for the covariance and diagnostics (the search
+   itself is derivative-free).
+4. **Covariance** — from the **bordered** matrix ``H = [Φ_w, J]``
+   (O'Leary & Rust 2013, §2.5, p. 587: ``H = W[Φ, J]``, linear
+   parameters first, nonlinear last): ``C = ŝ²·(HᵀH)⁻¹`` — never
+   ``ŝ²/(JᵀJ)``, which conditions on the amplitudes and understates
+   σ_θ (Schur complement: ``σ_θ,bordered² = ŝ²/‖(I−UUᵀ)·J‖₂²
+   ≥ ŝ²/‖J‖₂²``, strict whenever the B term is nonzero, since
+   ``(I−UUᵀ)·J = −A`` and ``U·Uᵀ·J = −B``).
 5. **Interval** — the Δχ²=1 profile-likelihood interval in θ
    (Venzon & Moolgavkar 1988), root-found on the concentrated χ²(θ).
    With θ = ln τ the interval is near-symmetric essentially always in
@@ -99,7 +105,10 @@ Conventions and caveats (binding, see ``docs/MATH_STANDARDS.md``)
 - The covariance is exact under **diagonal** Σ with ``W = Σ⁻¹``; under
   temporally correlated (colored) noise the usual Williams 2003 caveat
   applies — the same caveat class as every WLS covariance in this
-  package.
+  package. Notation map: O'Leary & Rust's ``W`` is the σ-whitening
+  ``diag(1/σᵢ)`` — this module's ``W^{1/2}`` — so their ``Φ_w = WΦ``
+  and ``r_w = W(y − Φc)`` (p. 585) are exactly the whitened design and
+  residual here.
 - No centering or reparameterization happens here: the returned
   amplitudes mean exactly what the caller's Φ columns define (the
   package invariant that parameter vectors crossing a boundary are in
@@ -119,8 +128,10 @@ References
   nonlinear least squares problems whose variables separate*, SIAM J.
   Numer. Anal. 10(2), 413–432. (the variable-projection method.)
 - O'Leary & Rust 2013, *Variable projection for nonlinear least squares
-  problems*, Comput. Optim. Appl. 54(3), 579–593. (eq. (8) Jacobian;
-  §2.5 bordered-matrix covariance — numbering verified.)
+  problems*, Comput. Optim. Appl. 54(3), 579–593. (eq. (8) Jacobian,
+  p. 585; §2.5 bordered-matrix covariance and residual-mean-square dof
+  convention, pp. 586–587; §3.1 Kaufman-approximation cost, pp. 588–589
+  — all verified against the primary source.)
 - Kaufman 1975, BIT 15(1), 49–57. (the dropped-B-term approximation —
   cited as what this module deliberately does NOT do.)
 - Venzon & Moolgavkar 1988, J. R. Stat. Soc. C 37(1), 87–94. (the
@@ -279,8 +290,11 @@ def _svd_solve(svd: _DesignSVD) -> FloatArray:
 
     Reference:
         Golub & Pereyra 1973 (the inner linear solve of the variable
-        projection); identical formula and conventions to
-        :func:`gps_analysis.fitting._wls_solve` — parity is test-pinned.
+        projection); O'Leary & Rust 2013, p. 585 (``Φ_w† = V·Σ⁻¹·Uᵀ``,
+        ``c = Φ_w†·y``; their footnote 6 endorses the minimum-norm
+        solution under rank deficiency); identical formula and
+        conventions to :func:`gps_analysis.fitting._wls_solve` — parity
+        is test-pinned.
 
     Numerical notes:
         Uses only kept singular values (rank-truncated), so a
@@ -310,7 +324,8 @@ def _projection_residual(svd: _DesignSVD) -> FloatArray:
 
     Reference:
         Golub & Pereyra 1973 (the variable projection functional);
-        O'Leary & Rust 2013, §2.
+        O'Leary & Rust 2013, p. 585 (``P = I − U·Uᵀ``, ``Pᵀ = P``,
+        ``r_w = W(y − Φc) = P·y``).
 
     Numerical notes:
         ``Uᵀ·r_w = 0`` to roundoff by construction — the identity behind
@@ -368,10 +383,15 @@ def _varpro_jacobian(
 ) -> FloatArray:
     """Compute the VARPRO residual Jacobian J = ∂r_w/∂θ (scalar θ).
 
-    Equation (O'Leary & Rust 2013, eq. (8) — numbering verified):
-        ``J = −[(D·c − U·(Uᵀ·(D·c))) + U·S⁻¹·Vᵀ·(Dᵀ·r_w)]``
-    first addend the projected direct term, second the **B term**
-    (from the θ-dependence of ĉ) that Kaufman 1975 drops.
+    Equation (O'Leary & Rust 2013, eq. (8), p. 585 — verified against
+    the primary source): ``J = −(A + B)``, single columns here (q = 1)
+
+        ``a = P·D·c = D·c − U·(Uᵀ·(D·c))``,  ``P = I − U·Uᵀ``
+        ``b = (P·D·Φ_w†)ᵀ·y = (Φ_w†)ᵀ·Dᵀ·Pᵀ·y = (Φ_w†)ᵀ·Dᵀ·r_w
+             = U·S⁻¹·Vᵀ·(Dᵀ·r_w)``   (using ``Pᵀ = P``, ``P·y = r_w``)
+
+    ``A`` is the projected direct term, ``B`` (from the θ-dependence of
+    ĉ) the term Kaufman 1975 drops.
 
     Symbols → args:
         - ``U, S, V`` → ``svd``: shared whitened factorization
@@ -387,16 +407,21 @@ def _varpro_jacobian(
         J, shape (N,), float64 [per θ-unit].
 
     Reference:
-        O'Leary & Rust 2013, Comput. Optim. Appl. 54(3), eq. (8);
-        Kaufman 1975, BIT 15(1) (the approximation deliberately NOT
-        used). The gradient ``rᵀJ`` is identical under both (``Uᵀr = 0``
-        exactly — test-pinned to ~4e-13), but O'Leary & Rust measure
-        Gauss–Newton iterations rising 3→7 with stalls without B.
+        O'Leary & Rust 2013, Comput. Optim. Appl. 54(3) 579–593,
+        eq. (8), p. 585; Kaufman 1975, BIT 15(1) (the approximation
+        deliberately NOT used). The gradient ``rᵀJ`` is identical under
+        both (``Uᵀr = 0`` exactly — test-pinned to ~4e-13), but O'Leary
+        & Rust §3.1 (pp. 588–589) measure iterations rising 3→7 and
+        function evaluations 8→12, with three stalls instead of one,
+        while ``‖B‖/‖J‖`` never exceeds 2 %.
 
     Numerical notes:
         Reuses the single SVD of the design — no new factorization; the
-        B term costs one (P,) back-substitution. ``S⁻¹`` uses kept
-        singular values only (rank-truncated pseudo-inverse).
+        B term costs one (P,) back-substitution. The grouping into
+        matrix-vector products only (never matrix-matrix) is the paper's
+        stated design of eq. (8) (p. 585) and is preserved verbatim.
+        ``S⁻¹`` uses kept singular values only (rank-truncated
+        pseudo-inverse).
     """
     dc = d_w @ coeffs
     projected = dc - svd.u @ (svd.u.T @ dc)
@@ -408,22 +433,28 @@ def _varpro_jacobian(
 
 def _bordered_covariance(
     a_w: FloatArray,
-    model_derivative: FloatArray,
+    jacobian: FloatArray,
     scale_sq: float,
 ) -> FloatArray:
     """Compute the joint (ĉ, θ̂) covariance from the bordered matrix.
 
-    Equation (O'Leary & Rust 2013, §2.5 — numbering verified):
-        ``H = [Φ_w, m]``,  ``m = ∂ŷ_w/∂θ = −J``,
-        ``C = ŝ²·(HᵀH)⁻¹``  (θ in the LAST row/column)
-    — never ``ŝ²/(JᵀJ)`` for σ_θ², which conditions on the amplitudes:
-    by the Schur complement ``σ_θ² = ŝ²/‖(I−UUᵀ)·m‖₂² ≥ ŝ²/‖J‖₂²``,
-    strictly larger whenever the B term is nonzero.
+    Equation (O'Leary & Rust 2013, §2.5, p. 587 — verified against the
+    primary source):
+        ``H = W[Φ, J] = [Φ_w, J]``,  ``C_v = ŝ²·(HᵀH)⁻¹``
+    with the linear parameters ordered first and θ LAST, exactly the
+    paper's convention — never ``ŝ²/(JᵀJ)`` for σ_θ², which conditions
+    on the amplitudes: by the Schur complement
+    ``σ_θ² = ŝ²/‖(I−UUᵀ)·J‖₂² ≥ ŝ²/‖J‖₂²``, strictly larger whenever
+    the B term is nonzero (``(I−UUᵀ)·J = −A``, ``U·Uᵀ·J = −B``).
 
     Symbols → args:
         - ``Φ_w`` → ``a_w``: σ-whitened design at θ̂, shape (N, P)
-        - ``m`` → ``model_derivative``: fitted-model derivative
-          ``∂ŷ_w/∂θ`` (the negated eq.-(8) Jacobian), shape (N,)
+        - ``J`` → ``jacobian``: the eq.-(8) VARPRO Jacobian
+          ``∂r_w/∂θ`` (:func:`_varpro_jacobian`, B term included),
+          shape (N,) — the paper borders with J itself; all variances
+          are invariant to the sign of this column (similarity by
+          ``diag(1, …, 1, −1)``), the amplitude–θ cross-covariances
+          follow the paper's sign convention
         - ``ŝ²`` → ``scale_sq``: residual variance scale
           [dimensionless when σ supplied]; 1.0 under ``absolute_sigma``
 
@@ -437,17 +468,21 @@ def _bordered_covariance(
             of the design), and no finite covariance exists.
 
     Reference:
-        O'Leary & Rust 2013, §2.5; scale convention as
-        :func:`gps_analysis.fitting._wls_solve` (curve_fit-compatible).
-        Exact under diagonal Σ; Williams 2003 caveat under colored noise
-        (module docstring).
+        O'Leary & Rust 2013, §2.5, p. 587 (``H = W[Φ, J]``,
+        ``C_v = σ²(HᵀH)⁻¹``, linear first / nonlinear last); scale
+        convention as :func:`gps_analysis.fitting._wls_solve`
+        (curve_fit-compatible). Exact under diagonal Σ; Williams 2003
+        caveat under colored noise (module docstring).
 
     Numerical notes:
         SVD of H (not normal equations): ``C = ŝ²·V_h·S_h⁻²·V_hᵀ`` —
         rank-safe, condition number not squared; same cutoff convention
-        as :func:`_design_svd`.
+        as :func:`_design_svd`. The paper uses a pivoted-QR R factor
+        here; the SVD gives the identical C in exact arithmetic, is at
+        least as stable, and matches the package-wide factorization
+        convention — the one documented divergence from §2.5.
     """
-    h = np.column_stack((a_w, model_derivative))
+    h = np.column_stack((a_w, jacobian))
     n, p_full = h.shape
     _, s_h, vt_h = np.linalg.svd(h, full_matrices=False)
     cutoff = np.finfo(np.float64).eps * max(n, p_full) * float(s_h[0])
@@ -579,9 +614,11 @@ class VarproFit:
         chisq: Whitened residual sum of squares χ²(θ̂)
             [dimensionless when σ supplied].
         scale_sq: ŝ² applied to the covariance and the interval —
-            ``chisq/(N−P−1)`` under ``absolute_sigma=False``, else 1.0
-            (curve_fit convention, as in
-            :func:`gps_analysis.fitting._wls_solve`).
+            ``chisq/(N−P−1)`` under ``absolute_sigma=False``, else 1.0.
+            The dof convention is O'Leary & Rust 2013 §2.5, p. 586
+            (``σ² = ‖r_w‖²/(m−n−q)``, q = 1 nonlinear parameter), which
+            coincides with the curve_fit convention of
+            :func:`gps_analysis.fitting._wls_solve` once θ is counted.
         n_obs: Number of observations N.
     """
 
@@ -614,9 +651,10 @@ def estimate_varpro(
         ``θ̂ = argmin_θ χ²(θ)``,  ``χ²(θ) = ‖(I − UUᵀ)·y_w‖₂²``
         (concentrated profile — Golub & Pereyra 1973), then
         ``ĉ = V·S⁻¹·Uᵀ·y_w``, the eq.-(8) Jacobian J (O'Leary & Rust
-        2013, B term included — no Kaufman 1975),
-        ``C = ŝ²·([Φ_w, −J]ᵀ[Φ_w, −J])⁻¹`` (§2.5 bordered covariance)
-        and the Δχ²=1 profile interval in θ (Venzon & Moolgavkar 1988).
+        2013, p. 585, B term included — no Kaufman 1975),
+        ``C = ŝ²·([Φ_w, J]ᵀ[Φ_w, J])⁻¹`` (§2.5, p. 587, bordered
+        covariance) and the Δχ²=1 profile interval in θ
+        (Venzon & Moolgavkar 1988).
 
     Symbols → args:
         - ``Φ(θ)`` → ``design``: θ → full design, shape (N, P)
@@ -663,7 +701,8 @@ def estimate_varpro(
     Reference:
         Golub & Pereyra 1973, SIAM J. Numer. Anal. 10(2) (variable
         projection); O'Leary & Rust 2013, Comput. Optim. Appl. 54(3),
-        eq. (8) + §2.5; Venzon & Moolgavkar 1988 (profile interval);
+        eq. (8) p. 585 + §2.5 p. 587; Venzon & Moolgavkar 1988 (profile
+        interval);
         Kaufman 1975 (rejected approximation); search structure mirrors
         :func:`gps_analysis.noise.estimate_noise_mle`.
 
@@ -778,7 +817,7 @@ def estimate_varpro(
     d_w = d if sig is None else np.asarray(d / sig[:, np.newaxis], dtype=np.float64)
 
     jac = _varpro_jacobian(svd, d_w, coeffs, residual)
-    covariance = _bordered_covariance(a_w, -jac, scale_sq)
+    covariance = _bordered_covariance(a_w, jac, scale_sq)
 
     lower, upper, open_lower, open_upper = _profile_interval(
         objective, theta_hat, chisq, scale_sq, lo, hi
