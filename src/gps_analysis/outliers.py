@@ -1233,6 +1233,38 @@ class OutlierParams:
             differences [d] — across wider gaps an epoch has no usable
             neighbor and is never despiked
             (:func:`neighbor_differences`).
+        scale_floor_fraction: Hampel scale floor as a FRACTION of the
+            component's MEDIAN LOCAL scale — unit-free, so it needs no
+            per-station tuning, and it composes with ``scale_floor`` (the
+            effective floor is the larger).  Guards the MAD-implosion
+            degeneracy of Pearson et al. 2016 §3: when K+1 of a window's
+            2K+1 values coincide the local scale is exactly 0 and the
+            identifier flags the entire window.
+
+            The reference is the median LOCAL scale and not the global
+            one, which was measured to be wrong: against ŝ the smallest
+            legitimate local scale spans 0.0020-0.166 across the working
+            set, because at an unrest station ŝ is inflated by real
+            signal and quiet stretches look pathological.  A
+            global-referenced 0.05 suppressed 36 % of SENG's East epochs
+            whose windows hold entirely distinct values.  Against the
+            median local scale the same quantity spans 0.0298-0.229.
+
+            Default **0.02**, below every observed legitimate value, so it
+            forecloses the degeneracy and changes no current verdict.  It
+            is deliberately NOT a general quantized-data remedy — that
+            needs a value large enough to move real verdicts, which
+            belongs in a per-station override.
+        freeze_scale: Hold the robust scale fixed at its FIRST-sweep
+            estimate through the conservative iteration (default True).
+            Re-estimating it each sweep is the classic swamping feedback:
+            each sweep removes the tails, the trimmed scatter is tighter
+            than the true noise, the threshold shrinks, and the next sweep
+            flags epochs that were never anomalous.  The center still
+            tracks the improving fit — only the yardstick is held.  The
+            first-sweep estimate is already outlier-resistant (Huber fit +
+            MAD), so freezing costs nothing and removes the feedback.
+            False restores the pre-2026-08 behavior for attribution.
         scale_floor: Hampel scale floor s_floor [whitened-residual
             units] — guards the MAD-collapse degeneracy.
         min_outlier: Physical magnitude floor a_min [L], applied per
@@ -1349,6 +1381,8 @@ class OutlierParams:
     max_flag_fraction: float = 0.05
     min_abort_candidates: int = 0
     max_iterations: int = 3
+    freeze_scale: bool = True
+    scale_floor_fraction: float = 0.02
     loss: str = "huber"
     f_scale: float = 1.0
     epoch_policy: str = "per_component"
@@ -1400,6 +1434,11 @@ class OutlierParams:
             raise ValueError("min_abort_candidates must be >= 0")
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be >= 1")
+        if not 0.0 <= self.scale_floor_fraction < 1.0:
+            raise ValueError(
+                f"scale_floor_fraction must be in [0, 1), got "
+                f"{self.scale_floor_fraction}"
+            )
         if self.window_order not in (0, 1, 2):
             raise ValueError(f"window_order must be 0, 1 or 2, got {self.window_order}")
         if self.window_order >= 1 and self.window_min_count < self.window_order + 2:
@@ -1599,6 +1638,7 @@ def _component_candidates(
     inliers: NDArray[np.bool_],
     params: OutlierParams,
     half_window: float,
+    frozen: tuple[float, FloatArray] | None = None,
 ) -> tuple[
     FloatArray,
     FloatArray,
@@ -1669,15 +1709,43 @@ def _component_candidates(
             order=params.window_order,
             robust_iterations=params.window_robust_iterations,
         )
+    if frozen is not None:
+        # Sweep >= 2: the SCALE is the one estimated on the first sweep. The
+        # center still tracks the improving fit -- only the yardstick is held.
+        s_global, s_local_frozen = frozen
+        s_local = s_local_frozen
     thin = np.isnan(s_local) | np.isnan(m)
     center_eff = np.where(thin, center, m)
     scale_eff = np.where(thin, s_global, s_local)
+    # MAD-implosion guard (Pearson et al. 2016 §3): if K+1 of a window's 2K+1
+    # values coincide the local scale is EXACTLY zero and the identifier flags
+    # the whole window. The absolute `scale_floor` guards it but defaults to 0,
+    # i.e. off.
+    #
+    # The reference is the MEDIAN LOCAL scale, deliberately NOT the global one.
+    # Measured: against s_global the smallest legitimate local scale ranges over
+    # 0.0020-0.166 across the working set -- an 80x spread -- because at an
+    # unrest station the global scale is inflated by real SIGNAL, so quiet
+    # stretches look pathologically small. A global-referenced floor of 0.05
+    # would have suppressed 36 % of SENG's East epochs whose windows are
+    # entirely distinct values (n=31, unique=31): not implosion at all. Against
+    # the median local scale the same quantity spans 0.0298-0.229, and the
+    # median is immune to that inflation.
+    #
+    # 0.02 sits below every observed legitimate value (min 0.0298, SENG E), so
+    # the guard forecloses collapse and changes no current verdict. It is NOT a
+    # general quantized-data remedy -- that needs a value large enough to move
+    # real verdicts, which belongs in a per-station override, not a default.
+    # The two floors compose; the effective one is whichever is larger.
+    finite_local = s_local[np.isfinite(s_local) & (s_local > 0.0)]
+    ref = float(np.median(finite_local)) if finite_local.size else float(s_global)
+    floor = max(params.scale_floor, float(params.scale_floor_fraction) * ref)
     local_mask = hampel_mask(
         w,
         center_eff,
         scale_eff,
         n_sigma=params.window_n_sigma,
-        scale_floor=params.scale_floor,
+        scale_floor=floor,
     )
     # §14 stage gating. Zeroing the mask (rather than skipping the compute)
     # keeps z / s_local populated, so a disabled stage stays DIAGNOSABLE —
@@ -2027,6 +2095,9 @@ def detect_outliers(
     # zeroed flags, while healthy siblings continue to their own fixed point.
     component_abort = np.zeros(n_components, dtype=np.bool_)
     n_iterations = 0
+    # First-sweep robust scale per component, reused by every later sweep when
+    # `freeze_scale` is on (see OutlierParams.freeze_scale for why).
+    frozen_scale: list[tuple[float, FloatArray] | None] = [None] * n_components
 
     for _sweep in range(detection_params.max_iterations):
         n_iterations += 1
@@ -2045,7 +2116,10 @@ def detect_outliers(
                 ~(flags[c] | gross[c] | in_protect),
                 detection_params,
                 half_window,
+                frozen_scale[c],
             )
+            if detection_params.freeze_scale and frozen_scale[c] is None:
+                frozen_scale[c] = (float(s_g), np.array(s_loc, copy=True))
             # Gross (Stage-0) epochs are decided BEFORE the identifiers:
             # remove them from the identifier candidate set used for
             # protection and the abort fraction (they are not "epochs that
