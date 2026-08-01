@@ -127,9 +127,9 @@ def test_recovery_white_noise_with_outliers() -> None:
         assert est.n_rejected[c] > 0
         # parameter recovery within 4 sigma-hat (tolerance note above).
         err = np.abs(est.fits[c].params - TRUE_P[c])
-        assert np.all(
-            err <= 4.0 * est.fits[c].uncertainties
-        ), f"component {c}: err {err} vs sigma {est.fits[c].uncertainties}"
+        assert np.all(err <= 4.0 * est.fits[c].uncertainties), (
+            f"component {c}: err {err} vs sigma {est.fits[c].uncertainties}"
+        )
         assert est.rms[c] == pytest.approx(WN, rel=0.15)
     assert est.span_used[0] >= t[0] and est.span_used[1] <= t[-1]
 
@@ -504,6 +504,9 @@ def test_record_validation_rejects_bad_documents() -> None:
             n_rejected=est.n_rejected,
             rms=est.rms,
             window=est.window,
+            segments=est.segments,
+            segment_gaps=est.segment_gaps,
+            window_mask=est.window_mask,
             model="my_custom_model",
             step_epochs=est.step_epochs,
             detrend_method=est.detrend_method,
@@ -571,3 +574,284 @@ def test_one_component_input() -> None:
     np.testing.assert_allclose(
         detrended + evaluate_record(record, t)[0], y[0], rtol=1e-12, atol=1e-9
     )
+
+
+# ---------------------------------------------------------------------------
+# Union-of-segments fitting: excise a transient, keep the offset estimable
+# ---------------------------------------------------------------------------
+
+#: The excised interval and the coseismic epoch inside it. Chosen so the
+#: transient's support is EXACTLY the excision -- see the test docstring.
+_EXC = (2008.35, 2008.70)
+_STEP = 2008.5
+
+
+def _segmented_series() -> tuple[np.ndarray, np.ndarray, float, float]:
+    """Truth + a transient supported exactly on the excised interval.
+
+    Compact support is what makes the recovery claim ANALYTIC rather than
+    approximate: outside ``_EXC`` the series is exactly
+    ``offset + rate·t + annual + A·H(t − _STEP)``, so a fit that sees only
+    the flanks has that exact function as its estimand. A decaying
+    post-seismic tail would leak into the second segment and turn an
+    equality into a bound. The bump is asymmetric-free but tapered C¹ to
+    zero at both ends, so nothing discontinuous enters even the excised
+    part.
+    """
+    rate, amp = 12.5, -37.0
+    t = np.arange(2002.0, 2019.5, 1.0 / 365.25)
+    truth = (
+        3.0
+        + rate * (t - 2010.0)
+        + 2.0 * np.cos(2 * np.pi * t)
+        + 1.5 * np.sin(2 * np.pi * t)
+        + amp * (t >= _STEP)
+    )
+    x = (t - _EXC[0]) / (_EXC[1] - _EXC[0])
+    bump = np.where((x > 0) & (x < 1), np.sin(np.pi * np.clip(x, 0, 1)) ** 2, 0.0)
+    return t, (truth + 25.0 * bump)[np.newaxis, :], rate, amp
+
+
+def test_union_fit_recovers_rate_and_coseismic_offset_with_transient_excised():
+    """The headline: excising the transient recovers BOTH truths exactly.
+
+    Rate and step amplitude are asserted at 1e-6 relative -- these are the
+    quantities the operator is after, and with the transient's support
+    excised the estimand is exact, so the only error is the closed-form WLS
+    solve's own conditioning.
+
+    The intercept is deliberately NOT asserted that tightly: in the
+    absolute-``yearf`` parameterization it is ``a − v·t_center`` with
+    t_center ≈ 2010 and v ≈ 12.5 mm/yr, i.e. 4-5 digits of cancellation
+    before the residual is formed. Asserting 1e-9 there would be a flaky
+    test measuring float64 cancellation, not the estimator.
+    """
+    t, y, rate, amp = _segmented_series()
+    sigma = np.ones_like(y)
+    est = estimate_detrend(
+        "lineperiodic",
+        t,
+        y,
+        sigma,
+        segments=[(2002.1, _EXC[0]), (_EXC[1], 2019.5)],
+        step_epochs=[_STEP],
+        detect=False,
+        max_gap_years=1.5,
+        names=["north"],
+    )
+    names = est.to_record()["param_names"]
+    got_rate = float(est.fits[0].params[names.index("rate")])
+    got_step = float(est.fits[0].params[names.index("step_amp_1")])
+    assert got_rate == pytest.approx(rate, rel=1e-6)
+    assert got_step == pytest.approx(amp, rel=1e-6)
+
+    # the offset epoch lies INSIDE the excision and is still estimated --
+    # that is the whole point, and it is what the hull-bounded step filter
+    # in estimate_detrend buys us
+    assert _EXC[0] < _STEP < _EXC[1]
+    assert est.step_epochs.tolist() == [_STEP]
+
+    assert est.segments == ((2002.1, _EXC[0]), (_EXC[1], 2019.5))
+    assert est.window == (2002.1, 2019.5), "window is the hull of the segments"
+    assert len(est.segment_gaps) == 1
+    assert est.segment_gaps[0] == pytest.approx(_EXC[1] - _EXC[0], abs=0.01)
+
+
+def test_contiguous_window_over_the_same_transient_is_biased():
+    """Negative control: without the excision, both estimates degrade.
+
+    Without this the headline test could pass on a series where the
+    transient did not matter. Asserted as an ORDERING (union beats
+    contiguous by orders of magnitude), not as a derived bias magnitude --
+    projecting the bump through the step and seasonal columns is not the
+    claim under test.
+    """
+    t, y, rate, amp = _segmented_series()
+    sigma = np.ones_like(y)
+    common = dict(step_epochs=[_STEP], detect=False, max_gap_years=1.5, names=["north"])
+    union = estimate_detrend(
+        "lineperiodic",
+        t,
+        y,
+        sigma,
+        segments=[(2002.1, _EXC[0]), (_EXC[1], 2019.5)],
+        **common,
+    )
+    contig = estimate_detrend(
+        "lineperiodic", t, y, sigma, window=(2002.1, 2019.5), **common
+    )
+    names = union.to_record()["param_names"]
+    i_r, i_a = names.index("rate"), names.index("step_amp_1")
+    err_u = abs(float(union.fits[0].params[i_r]) - rate)
+    err_c = abs(float(contig.fits[0].params[i_r]) - rate)
+    assert err_c > 100 * err_u
+    assert abs(float(contig.fits[0].params[i_a]) - amp) > 0.1  # mm, visible
+
+
+def test_single_segment_reproduces_the_window_path():
+    """J = 1 must be the SAME fit, not merely a similar one."""
+    t, y, _rate, _amp = _segmented_series()
+    sigma = np.ones_like(y)
+    common = dict(step_epochs=[_STEP], detect=False, max_gap_years=1.5, names=["n"])
+    a = estimate_detrend("lineperiodic", t, y, sigma, window=(2002.1, 2019.5), **common)
+    b = estimate_detrend(
+        "lineperiodic", t, y, sigma, segments=[(2002.1, 2019.5)], **common
+    )
+    assert np.array_equal(a.fits[0].params, b.fits[0].params)
+    assert a.window == b.window
+    assert b.segments == (a.window,)
+    assert b.segment_gaps == ()
+
+
+def test_max_gap_is_per_segment_not_hull():
+    """The blocker, and the gate that must survive removing it.
+
+    The excision is deliberately WIDER than max_gap_years and must pass;
+    an equally wide hole INSIDE a segment must still fail, naming it.
+    """
+    t = np.arange(2002.0, 2012.0, 1.0 / 365.25)
+    y = (10.0 * (t - 2007.0))[np.newaxis, :]
+    sigma = np.ones_like(y)
+    common = dict(detect=False, max_gap_years=0.5, min_epochs=10, names=["n"])
+
+    est = estimate_detrend(
+        "lineperiodic",
+        t,
+        y,
+        sigma,
+        segments=[(2002.1, 2006.0), (2007.0, 2011.9)],
+        **common,
+    )
+    assert est.segment_gaps[0] > 0.5, "the excision must exceed the gate"
+
+    holed = (t < 2004.0) | (t > 2004.8)  # 0.8 yr hole inside segment 0
+    with pytest.raises(ValueError, match="max_gap_years"):
+        estimate_detrend(
+            "lineperiodic",
+            t[holed],
+            y[:, holed],
+            sigma[:, holed],
+            segments=[(2002.1, 2006.0), (2007.0, 2011.9)],
+            **common,
+        )
+
+
+def test_min_span_is_summed_coverage_not_hull():
+    """Hull would admit two nubs 9 yr apart fitting four seasonal terms."""
+    t = np.arange(2002.0, 2012.0, 1.0 / 365.25)
+    y = (10.0 * (t - 2007.0))[np.newaxis, :]
+    sigma = np.ones_like(y)
+    with pytest.raises(ValueError, match="summed segment coverage"):
+        estimate_detrend(
+            "lineperiodic",
+            t,
+            y,
+            sigma,
+            segments=[(2002.1, 2002.3), (2011.6, 2011.9)],
+            detect=False,
+            min_span_years=2.0,
+            min_epochs=10,
+            max_gap_years=1.0,
+            names=["n"],
+        )
+
+
+def test_segment_and_window_together_is_refused():
+    t, y, _r, _a = _segmented_series()
+    with pytest.raises(ValueError, match="not both"):
+        estimate_detrend(
+            "lineperiodic",
+            t,
+            y,
+            window=(2002.0, 2019.0),
+            segments=[(2002.1, 2008.0)],
+            detect=False,
+            names=["n"],
+        )
+
+
+@pytest.mark.parametrize(
+    "segs, match",
+    [
+        ([(2005.0, 2004.0)], "end 2004.0 <= start 2005.0"),
+        ([(2002.1, 2008.0), (2007.0, 2019.0)], "strictly increasing"),
+        ([(2002.1, None), (2008.7, 2019.0)], "open end"),
+        ([(2002.1, 2008.0), (None, 2019.0)], "open start"),
+    ],
+)
+def test_malformed_segments_are_refused(segs, match):
+    """Overlap is refused because it would DOUBLE-COUNT summed coverage."""
+    t, y, _r, _a = _segmented_series()
+    with pytest.raises(ValueError, match=match):
+        estimate_detrend("lineperiodic", t, y, segments=segs, detect=False, names=["n"])
+
+
+def test_empty_segment_is_named():
+    """A segment typed into a data gap is the real operator failure."""
+    t, y, _r, _a = _segmented_series()
+    with pytest.raises(ValueError, match="segment 1"):
+        estimate_detrend(
+            "lineperiodic",
+            t,
+            y,
+            segments=[(2002.1, 2008.0), (2030.0, 2031.0)],
+            detect=False,
+            max_gap_years=25.0,
+            names=["n"],
+        )
+
+
+def test_two_steps_with_no_fitted_epoch_between_them_are_refused():
+    """Identical Heaviside columns -> rank-deficient design (§3).
+
+    Segments make this ordinary: declare two steps inside one excision and
+    nothing separates them. Refuse with both epochs named rather than
+    returning amplitudes that are individually meaningless.
+    """
+    t, y, _r, _a = _segmented_series()
+    sigma = np.ones_like(y)
+    with pytest.raises(ValueError, match="not separable"):
+        estimate_detrend(
+            "lineperiodic",
+            t,
+            y,
+            sigma,
+            segments=[(2002.1, _EXC[0]), (_EXC[1], 2019.5)],
+            step_epochs=[2008.45, 2008.55],
+            detect=False,
+            max_gap_years=1.5,
+            names=["n"],
+        )
+
+
+def test_segmented_record_is_additive_and_legacy_records_still_apply():
+    """A segmented record must not disturb the 37 deployed single-window ones.
+
+    Two halves: the new keys round-trip through JSON, AND a record with
+    them stripped -- standing in for a deployed entry written before this
+    existed -- still reconstructs and applies bit-exactly.
+    """
+    t, y, _rate, _amp = _segmented_series()
+    sigma = np.ones_like(y)
+    est = estimate_detrend(
+        "lineperiodic",
+        t,
+        y,
+        sigma,
+        segments=[(2002.1, _EXC[0]), (_EXC[1], 2019.5)],
+        step_epochs=[_STEP],
+        detect=False,
+        max_gap_years=1.5,
+        names=["north"],
+    )
+    record = est.to_record()
+    assert record["record_version"] == 1, "additive change must NOT bump the version"
+    assert record["segments"] == [[2002.1, _EXC[0]], [_EXC[1], 2019.5]]
+    assert len(record["segment_gaps"]) == 1
+    assert len(record["window"]) == 2, "window stays a 2-tuple; readers index it"
+    assert json.loads(json.dumps(record)) == record
+
+    legacy = {k: v for k, v in record.items() if k not in ("segments", "segment_gaps")}
+    assert trajectory_from_record(legacy) is not None
+    full = evaluate_record(record, t)
+    assert np.allclose(evaluate_record(legacy, t), full, rtol=0, atol=0)

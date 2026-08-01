@@ -21,6 +21,7 @@ from gps_analysis.baseline import (
     estimate_step_offset,
     remove_offset,
     slice_window,
+    slice_windows,
 )
 from gps_analysis.deformation import (
     FaultPatches,
@@ -215,6 +216,7 @@ __all__ = [
     "apply_detrend",
     # baseline
     "slice_window",
+    "slice_windows",
     "estimate_offset",
     "remove_offset",
     "estimate_step_offset",

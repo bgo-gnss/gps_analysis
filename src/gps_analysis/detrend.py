@@ -88,7 +88,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from . import models
-from .baseline import slice_window
+from .baseline import slice_window, slice_windows
 from .fitting import (
     ModelFunc,
     _components_2d,
@@ -189,8 +189,25 @@ class DetrendEstimate:
         n_rejected: Outliers removed per component.
         rms: Inlier residual RMS per component [L] — drift-staleness
             baseline (design §6 T3); NaN for a component with no inliers.
-        window: Requested fit window (start, end) [yr]; open bounds are
-            resolved to the first/last windowed epoch.
+        window: Requested fit window (start, end) [yr] — the HULL when
+            the fit spans several segments; open bounds are resolved to
+            the first/last windowed epoch.
+        segments: The resolved fit segments, shape (J, 2) [yr], each
+            open bound collapsed to the first/last kept epoch OF THAT
+            SEGMENT.  ``(window,)`` when J = 1, a deliberate redundancy
+            that keeps consumers reading one field rather than branching.
+        segment_gaps: The REALIZED excised gaps, length J−1 [yr] — the
+            distance from the last kept epoch of segment j to the first
+            kept epoch of segment j+1.  Reported rather than gated: a
+            segment boundary placed inside a genuine data outage hides
+            that outage from ``max_gap_years`` (which is per segment),
+            and this is what makes "you excised 0.35 yr" and "you excised
+            1.02 yr" distinguishable without adding a threshold.
+        window_mask: The union mask over the INPUT ``t`` that the fit
+            actually used, shape (N,).  Returned so a caller lifting
+            results back to its own index space uses the mask the fit
+            used instead of re-deriving one that merely ought to agree.
+            Not serialized.
         model: Model registry code (``"lineperiodic"`` | ``"linear"`` |
             ``"periodic"``) — or the callable's ``__name__`` for a
             custom model, in which case :meth:`to_record` refuses (a
@@ -220,6 +237,9 @@ class DetrendEstimate:
     n_rejected: tuple[int, ...]
     rms: tuple[float, ...]
     window: tuple[float, float]
+    segments: tuple[tuple[float, float], ...]
+    segment_gaps: tuple[float, ...]
+    window_mask: NDArray[np.bool_]
     model: str
     step_epochs: FloatArray
     detrend_method: str
@@ -309,6 +329,19 @@ class DetrendEstimate:
             "detrend_method": self.detrend_method,
             "fitted_at": fitted_at,
             "window": [float(self.window[0]), float(self.window[1])],
+            # Additive at RECORD_VERSION 1, deliberately. `window` keeps its
+            # 2-tuple type and hull meaning because two readers index it
+            # positionally (geo_dataread's StationResult detail line formats
+            # window[0] with :.3f -> TypeError on a nested list; the workbench's
+            # _add_window_edges guards len(window) != 2 and would silently stop
+            # drawing). A NEW key cannot break either: trajectory_from_record
+            # reads only record_version/model/step_epochs/param_names/components,
+            # and TrajectoryParams.from_record ignores unknown keys -- so a
+            # segmented record and the 37 deployed single-window ones coexist in
+            # one document at the same version. Readers use .get("segments");
+            # None means "legacy, the hull in `window` is the whole story".
+            "segments": [[float(a), float(b)] for a, b in self.segments],
+            "segment_gaps": [float(g) for g in self.segment_gaps],
             "span_used": [float(self.span_used[0]), float(self.span_used[1])],
             "n_epochs": int(self.n_epochs),
             "n_rejected": [int(v) for v in self.n_rejected],
@@ -322,6 +355,46 @@ class DetrendEstimate:
 def _param_names(model: ModelFunc) -> list[str]:
     """Positional parameter names of ``model(t, *params)`` (after t)."""
     return list(inspect.signature(model).parameters)[1:]
+
+
+def _validate_segments(segs: Sequence[tuple[float | None, float | None]]) -> None:
+    """Reject a segment sequence that cannot mean one fit domain.
+
+    Three conditions, each preventing a distinct silent-wrong-science mode:
+
+    - **interior bounds must be finite.**  ``[(2002, None), (2008.7, 2019)]``
+      parses as an overlapping union, so the excision it was written to
+      express does not exist and the coverage below is meaningless.
+    - **strictly increasing and non-overlapping.**  Overlap makes the
+      summed coverage of ``min_span_years`` DOUBLE-COUNT, i.e. gameable:
+      ``[(2002, 2012), (2010, 2019)]`` would buy two years of span that no
+      data supports.  This is why the check is here and not a matter of
+      taste.
+    - **each end after its start** — also caught by
+      :func:`~gps_analysis.baseline.slice_windows`, deliberately duplicated
+      at this trust boundary so the message names the caller's argument.
+    """
+    for j, (a, b) in enumerate(segs):
+        if a is not None and b is not None and b <= a:
+            raise ValueError(f"segment {j} has end {b} <= start {a}")
+        if j > 0 and a is None:
+            raise ValueError(
+                f"segment {j} has an open start; only the FIRST segment may "
+                f"be open on the left, else the segments overlap"
+            )
+        if j < len(segs) - 1 and b is None:
+            raise ValueError(
+                f"segment {j} has an open end; only the LAST segment may be "
+                f"open on the right, else the segments overlap"
+            )
+        if j > 0:
+            prev_end = segs[j - 1][1]
+            if prev_end is not None and a is not None and a <= prev_end:
+                raise ValueError(
+                    f"segment {j} starts at {a} which is not after segment "
+                    f"{j - 1}'s end {prev_end}; segments must be strictly "
+                    f"increasing and non-overlapping"
+                )
 
 
 def _resolve_model(model: str | ModelFunc) -> tuple[ModelFunc, str]:
@@ -466,6 +539,7 @@ def estimate_detrend(
     sigma: ArrayLike | None = None,
     *,
     window: tuple[float | None, float | None] = (None, None),
+    segments: Sequence[tuple[float | None, float | None]] | None = None,
     step_epochs: ArrayLike | None = None,
     min_span_years: float = 2.0,
     min_epochs: int = 365,
@@ -538,11 +612,31 @@ def estimate_detrend(
             mutated.
         sigma: 1-σ uncertainties, shape of ``y`` [L]; optional.
         window: Requested fit window (start, end) [yr]; either bound
-            may be None (open).
+            may be None (open).  Sugar for ``segments=[(start, end)]``.
+        segments: Fit the union of these ``(start, end)`` intervals [yr]
+            instead of one window — the way to excise a post-seismic
+            transient while keeping the flanks on both sides, which is
+            what makes the coseismic step between them estimable.  Only
+            the FIRST start and the LAST end may be None; the intervals
+            must be strictly increasing and non-overlapping (overlap
+            would double-count ``min_span_years``).  Mutually exclusive
+            with a non-default ``window``.
+
+            **Not to be confused with ``protect_windows``**, which has
+            the same type and the opposite polarity: ``segments`` says
+            *fit only here*, ``protect_windows`` says *do not FLAG here*.
         step_epochs: Known step epochs [yr]; None/empty ⇒ plain model.
-        min_span_years: Window-span gate [yr].
-        min_epochs: Windowed-epoch-count gate.
-        max_gap_years: Largest-gap gate [yr].
+        min_span_years: Span gate [yr] — the SUMMED coverage of the
+            segments, not their hull (identical at J = 1, and uniformly
+            stricter beyond it: two 18-day nubs 17 yr apart clear a
+            2-yr hull while four seasonal terms fit 36 days of data).
+        min_epochs: Total kept-epoch gate across all segments.
+        max_gap_years: Largest-gap gate [yr], applied WITHIN each
+            segment.  The excision between segments is deliberate and
+            documented by the configuration, so it is not a gap in this
+            sense; keeping the gate per segment preserves its actual
+            meaning — no undocumented outage inside an interval the
+            caller claimed to fit.
         detect: Run the outlier stage (True, production default). False
             = plain WLS on all windowed epochs (legacy semantics,
             tagged :data:`DETREND_METHOD_PLAIN`).
@@ -626,16 +720,44 @@ def estimate_detrend(
             f"names has {len(names)} entries for {n_components} components"
         )
 
-    # --- window + validity gates (design §2.2 rule 3; hard errors) ---
-    mask = slice_window(tt, window[0], window[1], tol=tol)
+    # --- segments + validity gates (design §2.2 rule 3; hard errors) ---
+    if segments is not None and window != (None, None):
+        raise ValueError(
+            "pass either window= or segments=, not both; two sources of truth "
+            "for the fitted sample set is a silent-wrong-science hazard"
+        )
+    segs: tuple[tuple[float | None, float | None], ...] = (
+        (tuple(window),) if segments is None else tuple(tuple(s) for s in segments)  # type: ignore[assignment, misc]
+    )
+    _validate_segments(segs)
+
+    mask = slice_windows(tt, segs, tol=tol)
     n_epochs = int(np.count_nonzero(mask))
     if n_epochs == 0:
-        raise ValueError(f"fit window {window} contains no epochs")
+        raise ValueError(
+            f"fit window {segs if len(segs) > 1 else window} contains no epochs"
+        )
     t_win = tt[mask]
-    span = float(t_win[-1] - t_win[0])
+
+    # Per-segment accounting. Each segment's own mask comes from slice_window --
+    # the same function slice_windows just OR-ed -- so the parts and the union
+    # cannot disagree about a boundary epoch.
+    seg_masks = [slice_window(tt, a, b, tol=tol) for a, b in segs]
+    seg_epochs = [tt[m] for m in seg_masks]
+    for j, ts in enumerate(seg_epochs):
+        if ts.size == 0:
+            raise ValueError(
+                f"segment {j} {segs[j]} contains no epochs — it is a data gap "
+                f"or a mistyped bound, not a fit window"
+            )
+
+    # min_span_years on SUMMED coverage, not the hull: Σ_j ≤ hull always, so
+    # this rejects everything the hull rejects plus what it wrongly admits.
+    span = float(sum(float(ts[-1] - ts[0]) for ts in seg_epochs))
     if span < min_span_years:
         raise ValueError(
-            f"validity gate 'min_span_years' failed: window span "
+            f"validity gate 'min_span_years' failed: "
+            f"{'summed segment coverage' if len(segs) > 1 else 'window span'} "
             f"{span:.4f} yr < {min_span_years} yr"
         )
     if n_epochs < min_epochs:
@@ -643,22 +765,57 @@ def estimate_detrend(
             f"validity gate 'min_epochs' failed: window has {n_epochs} "
             f"epochs < {min_epochs}"
         )
-    if n_epochs > 1:
-        largest_gap = float(np.max(np.diff(t_win)))
-        if largest_gap > max_gap_years:
-            raise ValueError(
-                f"validity gate 'max_gap_years' failed: largest gap "
-                f"{largest_gap:.4f} yr > {max_gap_years} yr"
-            )
+    # max_gap_years WITHIN each segment. On the hull the deliberate excision
+    # would be the largest diff and reject every union; and the obvious
+    # workaround -- raising the threshold past it -- would simultaneously
+    # disable the gate inside every segment, so a genuine outage would sail
+    # through unremarked. Per segment the gate keeps meaning what it says.
+    for j, ts in enumerate(seg_epochs):
+        if ts.size > 1:
+            largest_gap = float(np.max(np.diff(ts)))
+            if largest_gap > max_gap_years:
+                where = f" in segment {j} {segs[j]}" if len(segs) > 1 else ""
+                raise ValueError(
+                    f"validity gate 'max_gap_years' failed: largest gap "
+                    f"{largest_gap:.4f} yr > {max_gap_years} yr{where}"
+                )
+    # REALIZED excised gaps -- reported, never gated. A boundary placed inside a
+    # real outage hides that outage from the per-segment gate above; surfacing
+    # the realized distance is the honest answer, and it adds no knob.
+    segment_gaps = tuple(
+        float(seg_epochs[j + 1][0] - seg_epochs[j][-1]) for j in range(len(segs) - 1)
+    )
     y_win = yy[:, mask]
     sigma_win = [None if s is None else s[mask] for s in sigma_rows]
 
     # --- step augmentation: only steps strictly inside the window ---
+    # The bounds are the HULL of the kept epochs, and under segments that is
+    # LOAD-BEARING rather than incidental: a coseismic epoch sitting inside an
+    # excised transient still passes this filter, and its amplitude is estimable
+    # precisely because the flanking segments constrain the level on both sides.
+    # Narrowing this to per-segment membership would delete exactly the offset
+    # the excision was performed to expose.
     if step_epochs is not None:
         all_steps = np.sort(np.asarray(step_epochs, dtype=np.float64).ravel())
         steps_in = all_steps[(all_steps > t_win[0]) & (all_steps <= t_win[-1])]
     else:
         steps_in = np.empty(0, dtype=np.float64)
+    # Degeneracy (MATH_STANDARDS §3): two retained steps with NO kept epoch
+    # between them build identical Heaviside columns over the fitted samples --
+    # 0 on every earlier epoch, 1 on every later one -- so the design matrix is
+    # rank-deficient and the amplitudes are individually meaningless. Reachable
+    # today for two steps inside one outage; segments make it ordinary.
+    if steps_in.size > 1:
+        edges = np.searchsorted(t_win, steps_in, side="right")
+        collide = np.flatnonzero(np.diff(edges) == 0)
+        if collide.size:
+            k = int(collide[0])
+            raise ValueError(
+                f"steps {steps_in[k]:.5f} and {steps_in[k + 1]:.5f} have no "
+                f"fitted epoch between them, so their step columns are "
+                f"identical and their amplitudes are not separable; declare "
+                f"one of them, or widen the segments so data separates them"
+            )
     fit_model = with_steps(model_func, steps_in) if steps_in.size else model_func
     n_steps = int(steps_in.size)
     guesses: list[FloatArray | None] = [
@@ -732,10 +889,17 @@ def estimate_detrend(
     used_any = np.any(inliers, axis=0)
     t_used = t_win[used_any]
     span_used = (float(t_used[0]), float(t_used[-1]))
-    resolved_window = (
-        float(t_win[0]) if window[0] is None else float(window[0]),
-        float(t_win[-1]) if window[1] is None else float(window[1]),
+    # Each segment's open bounds collapse to ITS OWN first/last kept epoch; the
+    # window is then the hull of the resolved segments, so J = 1 reproduces the
+    # previous expression exactly.
+    resolved_segments = tuple(
+        (
+            float(ts[0]) if a is None else float(a),
+            float(ts[-1]) if b is None else float(b),
+        )
+        for (a, b), ts in zip(segs, seg_epochs, strict=True)
     )
+    resolved_window = (resolved_segments[0][0], resolved_segments[-1][1])
 
     return DetrendEstimate(
         fits=tuple(fits),
@@ -747,6 +911,9 @@ def estimate_detrend(
         ),
         rms=tuple(rms),
         window=resolved_window,
+        segments=resolved_segments,
+        segment_gaps=segment_gaps,
+        window_mask=mask,
         model=model_name,
         step_epochs=steps_in,
         detrend_method=method,
@@ -798,14 +965,12 @@ def trajectory_from_record(
     version = record.get("record_version")
     if version != RECORD_VERSION:
         raise ValueError(
-            f"unknown record_version {version!r}; this reader supports "
-            f"{RECORD_VERSION}"
+            f"unknown record_version {version!r}; this reader supports {RECORD_VERSION}"
         )
     model_name = record.get("model")
     if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
         raise ValueError(
-            f"record model {model_name!r} is not a registry code "
-            f"{sorted(_MODEL_NAMES)}"
+            f"record model {model_name!r} is not a registry code {sorted(_MODEL_NAMES)}"
         )
     base_model = _MODEL_NAMES[model_name]
     step_epochs = np.asarray(record.get("step_epochs", []), dtype=np.float64)
