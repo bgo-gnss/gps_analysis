@@ -112,6 +112,21 @@ into the estimator — so the reader can follow the flow top-down before reading
 - **Koch 1999** — *Parameter Estimation and Hypothesis Testing in Linear Models*
   (2nd ed., Springer), ch. 3. (Helmert variance component estimation, partial
   redundancies — `variance_components`.)
+- **Golub & Pereyra 1973** — G.H. Golub & V. Pereyra, *The differentiation of
+  pseudo-inverses and nonlinear least squares problems whose variables separate*,
+  SIAM J. Numer. Anal. 10(2), 413–432. (the variable-projection method —
+  concentration of the linear amplitudes; `varpro`.)
+- **O'Leary & Rust 2013** — D.P. O'Leary & B.W. Rust, *Variable projection for
+  nonlinear least squares problems*, Comput. Optim. Appl. 54(3), 579–593, eq. (8)
+  (VARPRO Jacobian), §2.5 (bordered-matrix covariance — never JᵀJ, which conditions
+  on the amplitudes). (`varpro._varpro_jacobian`, `varpro._bordered_covariance`.)
+- **Kaufman 1975** — L. Kaufman, *A variable projection method for solving separable
+  nonlinear least squares problems*, BIT 15(1), 49–57. (the dropped-B-term Jacobian
+  approximation — cited as what `varpro` deliberately does NOT use; the gradient is
+  blind to the B term but Gauss–Newton iteration counts and the covariance are not.)
+- **Venzon & Moolgavkar 1988** — D.J. Venzon & S.H. Moolgavkar, *A method for
+  computing profile-likelihood-based confidence intervals*, J. R. Stat. Soc. C 37(1),
+  87–94. (the Δχ²=1 profile interval — `varpro._profile_interval`.)
 - Add domain refs (Hackl et al., Bevis & Brown trajectory model, Hector) as used —
   always with the specific equation/section.
 
