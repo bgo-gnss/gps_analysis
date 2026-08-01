@@ -10,7 +10,13 @@ delta-method sigma propagation, sliding-window recovery of piecewise-linear
 segment rates, the min-obs/gap policy (NaN with counts recorded), guard
 validation, purity (no input mutation), the wls method tag, the
 colored-noise MLE velocity (method="mle": noise-param + rate recovery,
-sigma_v inflation vs WLS, white-noise limit) and the detectability floor.
+sigma_v inflation vs WLS, white-noise limit), the detectability floor,
+and the MIDAS robust estimator (method="midas", Blewitt et al. 2016):
+pair selection incl. a hand-traced midas.f-parity case and the relaxed
+gapped/campaign path, the interannual seasonal cancellation vs ordinary
+all-pairs Theil-Sen, undeclared-step and gross-outlier immunity vs WLS,
+the eqs. 4-8 atoms against closed forms, and a 200-realization
+uncertainty-calibration check.
 
 Tolerances: noise-free/linear-in-parameters fits recover values at
 rtol <= 1e-6 (optimizer convergence, not float eps); analytic sigma
@@ -31,14 +37,20 @@ from gps_analysis.transient import _DELTA_T_YR, _powerlaw_psi, noise_covariance
 from gps_analysis.velocity import (
     SlidingVelocity,
     VelocityEstimate,
+    VelocityEstimateMIDAS,
     VelocityEstimateMLE,
     detectability_floor,
     estimate_velocity,
+    estimate_velocity_midas,
     estimate_velocity_mle,
     horizontal_azimuth,
     horizontal_azimuth_sigma,
     horizontal_magnitude,
     horizontal_magnitude_sigma,
+    midas_mad_sigma,
+    midas_pair_indices,
+    midas_rate_uncertainty,
+    midas_trimmed_median,
     sliding_velocity,
 )
 
@@ -641,3 +653,341 @@ class TestDetectabilityFloor:
             detectability_floor(1.0, 4.0, -1.0, 0.0)
         with pytest.raises(ValueError, match="3 epochs"):
             detectability_floor(1.0, 4.0, -1.0, 0.001)
+
+
+def _daily_t(n: int, start: float = 2015.0) -> np.ndarray:
+    """Daily epochs in fractional years (1 day = 1/365 yr; 1 yr pairs are
+    exactly 365 samples apart, dead-centre in the eq.-3 tolerance)."""
+    return start + np.arange(n) / 365.0
+
+
+class TestMidasPairIndices:
+    """MIDAS interannual pair selection (Blewitt et al. 2016 eq. 3 + §2.4)."""
+
+    def test_continuous_daily_series_all_one_year_pairs(self) -> None:
+        # Continuous daily data: every eligible epoch finds its exact 1-yr
+        # partner; forward and backward passes select the SAME pairs, so
+        # each appears twice (the origin of the eq.-7 pair-reuse factor 4).
+        n = 1200
+        t = _daily_t(n)
+        pairs = midas_pair_indices(t)
+        assert pairs.shape == (2 * (n - 365), 2)
+        dt = t[pairs[:, 1]] - t[pairs[:, 0]]
+        assert np.all(np.abs(dt - 1.0) < 1e-3)  # eq. (3) satisfied by all
+        assert len({tuple(row) for row in pairs.tolist()}) == n - 365
+
+    def test_fortran_parity_hand_traced_gapped_case(self) -> None:
+        # Hand trace of midas.f selectpair + tback on t=[0,.1,.2,1.5,1.6]:
+        # forward: i=0: first partner >= 0.999 is idx 3 (dt 1.5 > 1.001)
+        #   -> relaxed pair (0,3), pointer k -> 4;
+        #   i=1: partner idx 3 again but k=4 is the next unmatched -> (1,4),
+        #   pointer exhausted at the end -> reset; i=2: k re-catches its
+        #   closest >=1yr partner idx 3 -> (2,3); i=3: past the 1-yr horizon.
+        # backward (on -t reversed): (0,2),(1,3) -> mapped to (2,4),(1,3).
+        t = np.array([0.0, 0.1, 0.2, 1.5, 1.6])
+        expected = [[0, 3], [1, 4], [2, 3], [2, 4], [1, 3]]
+        assert midas_pair_indices(t).tolist() == expected
+
+    def test_backward_pass_contributes_distinct_pairs_on_gapped_data(self) -> None:
+        # Time symmetry (§2.4 principle 2) is achieved by the second pass;
+        # on gapped data it must contribute pairs the forward pass did not.
+        t = np.array([0.0, 0.1, 0.2, 1.5, 1.6])
+        pairs = {tuple(row) for row in midas_pair_indices(t).tolist()}
+        assert {(2, 4), (1, 3)} <= pairs  # backward-only pairs present
+
+    def test_relaxed_selection_exercised_by_a_long_gap(self) -> None:
+        # A 1.7-yr gap: epochs in the year before the gap have no 1-yr
+        # partner, so the §2.4 relaxation must produce >1-yr pairs (and
+        # never a pair below the 1-yr horizon).
+        t_full = _daily_t(6 * 365)
+        t = t_full[(t_full < 2016.4) | (t_full > 2018.1)]
+        pairs = midas_pair_indices(t)
+        dt = t[pairs[:, 1]] - t[pairs[:, 0]]
+        assert int(np.sum(dt > 1.0 + 1e-3)) > 0  # relaxed pairs exist
+        assert np.all(dt >= 1.0 - 1e-3)  # never closer than 1 yr - tol
+        assert np.all(pairs[:, 0] < pairs[:, 1])
+
+    def test_guards(self) -> None:
+        with pytest.raises(ValueError, match="sorted ascending"):
+            midas_pair_indices(np.array([0.0, 2.0, 1.0]))
+        with pytest.raises(ValueError, match="finite"):
+            midas_pair_indices(np.array([0.0, np.nan, 2.0]))
+        with pytest.raises(ValueError, match="1-D"):
+            midas_pair_indices(np.zeros((2, 2)))
+        with pytest.raises(ValueError, match="pair_tol"):
+            midas_pair_indices(_daily_t(800), pair_tol=0.6)
+        # sub-year span: no pair can exist -> empty (0, 2), not an error here
+        assert midas_pair_indices(_daily_t(100)).shape == (0, 2)
+
+
+class TestMidasAtoms:
+    """The eq. 4/5/6-8 atoms against closed forms."""
+
+    def test_mad_sigma_small_sample_closed_form(self) -> None:
+        # values [0,1,2,3,100] about center 2: deviations [2,1,0,1,98],
+        # median 1 -> sigma = 1.4826 (the outlier 98 never enters).
+        assert midas_mad_sigma([0.0, 1.0, 2.0, 3.0, 100.0], 2.0) == pytest.approx(
+            1.4826, rel=1e-12
+        )
+        assert midas_mad_sigma([5.0, 5.0, 5.0], 5.0) == 0.0
+
+    def test_mad_sigma_gaussian_consistency(self) -> None:
+        # 1.4826*MAD is a consistent sigma estimator for a Gaussian:
+        # n=1e5 fixed seed, sampling error ~ sigma/sqrt(n) level -> 2%.
+        rng = np.random.default_rng(19)
+        x = rng.normal(0.0, 3.0, size=100_000)
+        assert midas_mad_sigma(x, float(np.median(x))) == pytest.approx(3.0, rel=0.02)
+
+    def test_trimmed_median_removes_one_sided_step_tail(self) -> None:
+        # Gaussian core + a one-sided 20% tail at +10 (the step-spanning
+        # slope signature, §2.3): the plain median is dragged up, the
+        # trimmed re-median must sit on the core to ~its own SE.
+        rng = np.random.default_rng(23)
+        core = rng.normal(0.0, 1.0, size=800)
+        v = np.concatenate([core, np.full(200, 10.0)])
+        plain = float(np.median(v))
+        v_hat, sigma, n_used = midas_trimmed_median(v)
+        assert abs(plain) > 0.15  # the tail visibly biases the plain median
+        assert abs(v_hat) < 0.1  # the trim removes the bias
+        assert 750 <= n_used <= 850  # tail gone, core mostly intact
+        assert sigma == pytest.approx(1.0, abs=0.15)
+
+    def test_trimmed_median_degenerate_zero_scale(self) -> None:
+        # sigma = 0 (majority of identical slopes): the strict <2*sigma rule
+        # of midas.f would empty the sample; the documented degenerate rule
+        # keeps the exact ties, so noise-free series stay well-defined.
+        v_hat, sigma, n_used = midas_trimmed_median(np.full(50, 2.5))
+        assert (v_hat, sigma, n_used) == (2.5, 0.0, 50)
+        v_hat, sigma, n_used = midas_trimmed_median([1.0, 1.0, 1.0, 1.0, 7.0])
+        assert (v_hat, sigma, n_used) == (1.0, 0.0, 4)
+
+    def test_rate_uncertainty_closed_form(self) -> None:
+        # s_v = 3 * sqrt(pi/2) * sigma / sqrt(N_actual/4)  (eqs. 6-8)
+        got = midas_rate_uncertainty(2.0, 400)
+        assert got == pytest.approx(3.0 * math.sqrt(math.pi / 2.0) * 2.0 / 10.0)
+        # the two corrections are separate knobs
+        assert midas_rate_uncertainty(2.0, 400, error_scale=1.0) == pytest.approx(
+            got / 3.0
+        )
+        assert midas_rate_uncertainty(2.0, 400, pair_reuse=1.0) == pytest.approx(
+            got / 2.0
+        )
+
+    def test_atom_guards(self) -> None:
+        with pytest.raises(ValueError, match="non-empty"):
+            midas_mad_sigma([], 0.0)
+        with pytest.raises(ValueError, match="finite"):
+            midas_mad_sigma([1.0, np.nan], 0.0)
+        with pytest.raises(ValueError, match="non-empty"):
+            midas_trimmed_median([])
+        with pytest.raises(ValueError, match="trim_sigmas"):
+            midas_trimmed_median([1.0, 2.0], trim_sigmas=0.0)
+        with pytest.raises(ValueError, match="sigma"):
+            midas_rate_uncertainty(-1.0, 100)
+        with pytest.raises(ValueError, match="n_actual"):
+            midas_rate_uncertainty(1.0, 0)
+
+
+class TestEstimateVelocityMIDAS:
+    """MIDAS robust velocity (method='midas', Blewitt et al. 2016)."""
+
+    def test_exact_rate_recovery_noise_free(self) -> None:
+        # Analytic check: exact linear series -> every interannual slope is
+        # exactly the rate, the median recovers it to float eps (~1e-12 of
+        # the slope magnitude; the trim hits the documented sigma=0 branch).
+        t = _daily_t(1200)
+        y = 3.0 + 5.0 * (t - t[0])
+        result = estimate_velocity_midas(t, y)
+        assert isinstance(result, VelocityEstimateMIDAS)
+        assert result.rates[0] == pytest.approx(5.0, abs=1e-11)
+        assert result.sigmas[0] == 0.0  # zero slope scatter -> zero s_v
+        assert result.method == "midas"
+        assert result.n_pairs == 2 * (1200 - 365)
+        assert result.n_used == (result.n_pairs,)  # nothing trimmed
+        assert result.fraction_removed[0] == 0.0
+        # fits carry [intercept at t_ref, rate]; t_ref is the first epoch
+        assert result.t_ref == t[0]
+        assert result.fits[0].params[0] == pytest.approx(3.0, abs=1e-10)
+        assert result.fits[0].params[1] == result.rates[0]
+
+    def test_seasonal_cancellation_beats_ordinary_theil_sen(self) -> None:
+        # THE defining property: 1-yr pairs difference away any period-1
+        # signal exactly, so on a noise-free line + annual term MIDAS is
+        # exact while ordinary all-pairs Theil-Sen (scipy.stats.theilslopes)
+        # aliases the seasonal into the rate on a non-integer 2.3-yr span
+        # (measured bias 1.42 mm/yr at amplitude 10 mm, phase 2.0).
+        t = _daily_t(int(2.3 * 365))
+        y = 2.0 + 5.0 * (t - t[0]) + 10.0 * np.sin(2 * np.pi * t + 2.0)
+        result = estimate_velocity_midas(t, y)
+        ts_slope = float(stats.theilslopes(y, t).slope)
+        midas_err = abs(result.rates[0] - 5.0)
+        ts_err = abs(ts_slope - 5.0)
+        assert midas_err < 1e-9  # exact cancellation (float eps level)
+        assert ts_err > 0.5  # ordinary Theil-Sen is visibly biased
+        assert midas_err < 1e-6 * ts_err
+
+    def test_undeclared_step_immunity_vs_wls(self) -> None:
+        # THE headline property (the Askja JONC/KASC/TANC case): a 40-mm
+        # UNDECLARED step in a 6-yr series. Only pairs spanning the step
+        # (<= 2*365 of ~3800) carry it, and the 2-sigma trim removes them;
+        # WLS absorbs the step into the rate (measured: ~+9.9 mm/yr bias).
+        rng = np.random.default_rng(31)
+        t = _daily_t(6 * 365)
+        y = 1.0 + 4.0 * (t - t[0]) + 1.5 * rng.standard_normal(t.size)
+        y = y + np.where(t >= 2018.3, 40.0, 0.0)
+        midas = estimate_velocity_midas(t, y)
+        wls = estimate_velocity(t, y, model="linear")
+        assert abs(midas.rates[0] - 4.0) < 0.2  # measured 0.073
+        assert abs(wls.rates[0] - 4.0) > 5.0  # measured 9.93
+        # the step-spanning slopes were actually trimmed (~20% of pairs)
+        assert midas.fraction_removed[0] > 0.1
+
+    def test_gross_outlier_resistance(self) -> None:
+        # 15 gross blunders (+300 mm) shift the MIDAS rate by (nearly)
+        # nothing relative to the same noise realization without them.
+        rng = np.random.default_rng(37)
+        t = _daily_t(6 * 365)
+        clean = 1.0 + 4.0 * (t - t[0]) + 1.5 * rng.standard_normal(t.size)
+        dirty = clean.copy()
+        dirty[rng.choice(t.size, 15, replace=False)] += 300.0
+        r_clean = estimate_velocity_midas(t, clean)
+        r_dirty = estimate_velocity_midas(t, dirty)
+        assert abs(r_dirty.rates[0] - r_clean.rates[0]) < 0.15
+        assert abs(r_dirty.rates[0] - 4.0) < 0.2
+
+    def test_gapped_series_uses_relaxed_pairs_and_recovers_rate(self) -> None:
+        # The §2.4 relaxation path end-to-end: with a 1.7-yr gap the strict
+        # eq.-3 rule would discard the pre-gap year entirely; the estimate
+        # must still be accurate and must actually contain >1-yr pairs.
+        rng = np.random.default_rng(41)
+        t_full = _daily_t(6 * 365)
+        keep = (t_full < 2016.4) | (t_full > 2018.1)
+        t = t_full[keep]
+        y = (1.0 + 4.0 * (t_full - t_full[0]) + 1.0 * rng.standard_normal(t_full.size))[
+            keep
+        ]
+        result = estimate_velocity_midas(t, y)
+        pairs = midas_pair_indices(t)
+        dt = t[pairs[:, 1]] - t[pairs[:, 0]]
+        assert int(np.sum(dt > 1.0 + 1e-3)) > 0  # relaxed path exercised
+        assert abs(result.rates[0] - 4.0) < 0.15  # measured 0.025
+
+    def test_campaign_style_clusters(self) -> None:
+        # Five 10-day campaigns, one per year: strict selection would find
+        # almost nothing; the relaxed algorithm uses all clusters.
+        t = np.concatenate([_daily_t(10, start=2015.0 + k) for k in range(5)])
+        rng = np.random.default_rng(7)
+        y = 2.0 + 3.0 * (t - t[0]) + 0.3 * rng.standard_normal(t.size)
+        result = estimate_velocity_midas(t, y)
+        assert abs(result.rates[0] - 3.0) < 0.1  # measured 0.003
+        assert result.n_pairs >= 2 * 4 * 10 - 10  # ~one pair per epoch/pass
+
+    def test_uncertainty_calibration_white_noise(self) -> None:
+        # 200 seeded realizations, 2-yr daily, white sigma_w = 2 mm, so the
+        # 365 forward slopes are INDEPENDENT (each datum enters one pair per
+        # pass): SE(median) = sqrt(pi/2)*sqrt(2)*sigma_w/sqrt(365) = 0.186.
+        # (a) The empirical RMS error must match that closed form (+-40%:
+        #     trim + finite-sample MAD scatter; measured ratio 1.11).
+        # (b) The reported s_v must OVERBOUND the white-noise scatter by
+        #     roughly the eq.-8 factor 3 x the eq.-7 reuse mismatch (the /4
+        #     counts each slope twice here) -- s_v is calibrated to real,
+        #     autocorrelated GPS noise, NOT to white synthetics; measured
+        #     ratio 3.7, asserted in [2, 6]. A ratio near 1 would mean the
+        #     x3 was dropped; >> 6 would mean N or sigma is wrong.
+        n, sigma_w, rate = 730, 2.0, 5.0
+        t = _daily_t(n)
+        errors, s_hats = [], []
+        for seed in range(200):
+            rng = np.random.default_rng(1000 + seed)
+            y = 1.0 + rate * (t - t[0]) + sigma_w * rng.standard_normal(n)
+            est = estimate_velocity_midas(t, y)
+            errors.append(float(est.rates[0]) - rate)
+            s_hats.append(float(est.sigmas[0]))
+        rms = float(np.sqrt(np.mean(np.square(errors))))
+        s_med = float(np.median(s_hats))
+        se_closed_form = math.sqrt(math.pi / 2.0) * sigma_w * math.sqrt(2.0 / 365.0)
+        assert rms == pytest.approx(se_closed_form, rel=0.4)
+        assert 2.0 < s_med / rms < 6.0
+
+    def test_window_names_and_horizontal_products(self) -> None:
+        # Window selects the post-break segment; names wire the horizontal
+        # products exactly as in the WLS/MLE estimators.
+        t = _daily_t(6 * 365)
+        rates = {"north": 3.0, "east": 4.0, "up": -1.0}
+        y = np.vstack([r * (t - t[0]) for r in rates.values()])
+        y[:, t >= 2018.0] += 25.0  # same undeclared step in all components
+        result = estimate_velocity_midas(
+            t, y, names=("north", "east", "up"), window=(2018.01, None)
+        )
+        assert result.components == ("north", "east", "up")
+        assert result.rates == pytest.approx([3.0, 4.0, -1.0], abs=1e-9)
+        assert result.magnitude == pytest.approx(5.0, abs=1e-9)
+        assert result.azimuth == pytest.approx(
+            math.degrees(math.atan2(4.0, 3.0)), abs=1e-9
+        )
+        assert result.n_obs < t.size
+        assert result.span[0] >= 2018.0
+        # covariance carries s_v^2 in the rate slot, NaN intercept slot
+        assert result.fits[0].covariance[1, 1] == pytest.approx(
+            float(result.sigmas[0]) ** 2
+        )
+        assert np.isnan(result.fits[0].covariance[0, 0])
+
+    def test_guards(self) -> None:
+        t = _daily_t(800)
+        y = 2.0 * (t - t[0])
+        # < 1 yr of data: no interannual pair can exist
+        with pytest.raises(ValueError, match="interannual"):
+            estimate_velocity_midas(t[:200], y[:200])
+        # all-identical epochs is the same degeneracy (span 0)
+        with pytest.raises(ValueError, match="interannual"):
+            estimate_velocity_midas(np.full(50, 2015.0), np.zeros(50))
+        with pytest.raises(ValueError, match="sorted ascending"):
+            estimate_velocity_midas(t[::-1], y)
+        with pytest.raises(ValueError, match="t must be finite"):
+            estimate_velocity_midas(np.array([0.0, np.nan, 2.0]), np.zeros(3))
+        # an all-NaN component is named in the error
+        y2 = np.vstack([y, np.full(t.size, np.nan)])
+        with pytest.raises(ValueError, match=r"component\(s\) \[1\]"):
+            estimate_velocity_midas(t, y2)
+        with pytest.raises(ValueError, match="names"):
+            estimate_velocity_midas(t, y, names=("north", "east"))
+        with pytest.raises(ValueError, match="at least 2 epochs"):
+            estimate_velocity_midas(t, y, window=(2015.0, 2015.001))
+        # sparse epochs: pairs exist but fewer than min_pairs (midas.f minn)
+        t_sparse = np.array([2015.0, 2015.3, 2015.6, 2015.9, 2016.05, 2016.2])
+        with pytest.raises(ValueError, match="slope pairs"):
+            estimate_velocity_midas(t_sparse, np.arange(6.0))
+        # min_pairs is floored at 2 - and 2 pairs always exist once the
+        # span reaches 1 yr (one per pass), so min_pairs=0 still estimates
+        two = estimate_velocity_midas(
+            np.array([2015.0, 2016.0]), np.array([1.0, 4.0]), min_pairs=0
+        )
+        assert two.n_pairs == 2
+        assert two.rates[0] == pytest.approx(3.0)
+
+    def test_result_dataclass_validation(self) -> None:
+        base = estimate_velocity_midas(_daily_t(500), np.arange(500.0))
+        with pytest.raises(ValueError, match="n_used"):
+            VelocityEstimateMIDAS(
+                rates=base.rates,
+                sigmas=base.sigmas,
+                fits=base.fits,
+                components=None,
+                n_obs=base.n_obs,
+                t_ref=base.t_ref,
+                span=base.span,
+                n_pairs=base.n_pairs,
+                n_used=(1, 2),  # wrong length for 1 component
+                scale_sigmas=base.scale_sigmas,
+                fraction_removed=base.fraction_removed,
+            )
+
+    def test_does_not_mutate_inputs(self) -> None:
+        rng = np.random.default_rng(43)
+        t = _daily_t(900)
+        y = 4.0 * (t - t[0]) + rng.standard_normal(t.size)
+        t0, y0 = t.copy(), y.copy()
+        estimate_velocity_midas(t, y)
+        np.testing.assert_array_equal(t, t0)
+        np.testing.assert_array_equal(y, y0)

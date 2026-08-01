@@ -63,6 +63,11 @@ into the estimator — so the reader can follow the flow top-down before reading
   GRL, 2023GL103432 (+ Supporting Information, Table S2 priors). (GBIS4TS.)
 - **Blewitt & Lavallée 2002** — *Effect of annual signals on geodetic velocity*,
   JGR 107(B7). (annual/semiannual terms in `lineperiodic`; why window length matters.)
+- **Blewitt et al. 2016** — G. Blewitt, C. Kreemer, W.C. Hammond, J. Gazeaux, *MIDAS
+  robust trend estimator for accurate GPS station velocities without step detection*,
+  JGR Solid Earth 121, 2054–2068, doi:10.1002/2015JB012552. (eqs. (1)–(8) + §2.4
+  relaxed pair selection — `estimate_velocity_midas` and its atomic pieces; the
+  §2.4 bookkeeping ported for parity with the reference `midas.f`, MIDAS4.)
 - **Segall 2010** — *Earthquake and Volcano Deformation* (Princeton). (Mogi/Okada,
   trajectory models — backburnered lane, cite when it revives.)
 - **Hosking 1981** — J.R.M. Hosking, *Fractional differencing*, Biometrika 68(1),
