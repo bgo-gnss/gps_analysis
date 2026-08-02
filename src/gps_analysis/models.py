@@ -265,19 +265,43 @@ def exp_linear(
         Model positions x(t) [L], float64, same shape as ``t``.
 
     Reference:
-        ⚠ UNRESOLVED — this previously cited "Bevis & Brown 2014, J. Geodesy
-        88, eq. (6)–(7) (exponential transient term of the extended
-        trajectory model)". That attribution is false and was struck
-        2026-08-02 after reading the paper (now in ``reference/papers/``):
-        its eq. (6) is the sub-model decomposition
-        ``x = x_trend + x_jumps + x_cycle``, eq. (7) is the polynomial
-        trend, and the paper contains **no exponential transient at all** —
-        its only transient is logarithmic, ``d = A·log(1 + Δt/T)`` (eq. 9),
-        composed into the ETM at eq. (10). The word "exponential" does not
-        occur anywhere in its 23 pages. This form is also not postseismic in
-        origin (see the legacy use below), so the 2020 viscoelastic
-        literature is not an automatic substitute. Supply a reference that
-        matches the actual use before citing one — MATH_STANDARDS §2.4.
+        Reverso et al. 2014, *A two-magma chamber model as a source of
+        deformation at Grímsvötn Volcano, Iceland*, JGR Solid Earth 119,
+        4666–4683, doi:10.1002/2013JB010569, **eq. (20)** — the fitted
+        surface-displacement form for posteruptive volcanic inflation,
+        written there as
+
+            ``U_R(t) = Φ·(1 − e^(−t/τ)) + U̇_∞·t + C``
+
+        which is this function reparameterized: ``x₀ = C + Φ``,
+        ``v = U̇_∞``, ``A = −Φ``, ``k = 1/τ``. (Note the sign: A < 0 for
+        inflation approaching the asymptote from below, as documented
+        above.) The physics behind the form is their eqs. (11)–(12), where
+        the shallow and deep reservoir overpressures ``ΔP_s(t)``, ``ΔP_d(t)``
+        are each "the sum of an exponential function and a linear function"
+        — the exponential being interreservoir pressure re-equilibration
+        with time constant ``τ = 1/ξ``, the linear term set by the
+        **constant basal magma inflow** — and eq. (17), by which surface
+        displacement is linear in those overpressures. Measured at GFUM:
+        ``τ = 0.33 ± 0.08 yr`` (2004) and ``0.13 ± 0.04 yr`` (2011),
+        i.e. ``k ≈ 3–8 yr⁻¹``, bracketing the Svartsengi use below.
+
+        ⚠ The exponential form does **not** identify the mechanism: a
+        reservoir fed at constant pressure through a hydraulic connection
+        and one surrounded by a viscous shell explain the decaying inflation
+        rate equally well (Dzurisin et al. 2009, cited in Reverso §5), as
+        does constant-rate fluid injection in a thermo-poro-elastic
+        hydrothermal system (Fournier & Chardot 2012). Earlier observations
+        of the same exp-then-linear shape: Nooner & Chadwick 2009 (Axial
+        Seamount, τ ≈ 21–48 d, then linear); Lu et al. 2003 (Westdahl),
+        2010 (Okmok); Sturkell et al. 2006 (Iceland).
+
+        NOT Bevis & Brown 2014 — this docstring cited that paper's
+        "eq. (6)–(7)" until 2026-08-02, which is wrong twice over: those are
+        its sub-model decomposition and polynomial trend, and it contains no
+        exponential transient at all (only the logarithmic ``A·log(1+Δt/T)``,
+        its eq. 9). See ``reference/papers/README.md``.
+
         Legacy sources:
         ``svartsengi_model.fitting.expf_long`` ≡
         ``exp_linear(t, p0, 0, p1, p2)`` (steady-state magma-inflow
