@@ -63,6 +63,7 @@ __all__ = [
     "compose_held",
     "estimate_staged",
     "fit_held_partition",
+    "group_parameter_mask",
 ]
 
 
@@ -451,6 +452,42 @@ def _group_masks(
     return {g: _term_keep_mask(model, g) for g in groups}
 
 
+def group_parameter_mask(model: str | ModelFunc, group: str) -> NDArray[np.bool_]:
+    """Which parameters of ``model`` belong to term group ``group``.
+
+    Equation:
+        ``mask[j] = [param_names[j] ∈ group]`` — a pure membership
+        predicate over the model's parameter vector, no arithmetic.
+
+    Symbols → args:
+        - ``f`` → ``model``: registry code or registered callable
+        - group name → ``group``: ``"secular"`` | ``"periodic"`` |
+          ``"step"`` | … (dimensionless label)
+
+    Returns:
+        Boolean mask of shape ``(P,)``, aligned with the model's
+        ``param_names`` and therefore with a stored record's per-component
+        parameter vector.
+
+    Public because a *caller outside this package* needs it to slice one
+    group out of a donor station's stored record when resolving a borrow
+    (``geo_dataread.stage_plan``).  Exposed here rather than duplicated
+    there so "secular" keeps exactly one definition — the same classifier
+    :func:`gps_analysis.detrend.select_terms` and :func:`estimate_staged`
+    use.
+
+    Numerical notes:
+        Membership only; it does not check that the group is non-empty for
+        this model.  An all-False mask means the model has no such term,
+        which the caller should treat as an error rather than as an empty
+        borrow.
+    """
+    from .detrend import _resolve_model, _term_keep_mask
+
+    model_func, _ = _resolve_model(model)
+    return _term_keep_mask(model_func, group)
+
+
 def estimate_staged(
     model: str | ModelFunc,
     t: ArrayLike,
@@ -623,9 +660,11 @@ def estimate_staged(
                     blocks.append(
                         (
                             gm,
-                            None
-                            if src.covariance is None
-                            else np.asarray(src.covariance, dtype=np.float64),
+                            (
+                                None
+                                if src.covariance is None
+                                else np.asarray(src.covariance, dtype=np.float64)
+                            ),
                         )
                     )
             if blocks and all(b is not None for _m, b in blocks):
