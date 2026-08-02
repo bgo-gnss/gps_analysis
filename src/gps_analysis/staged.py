@@ -53,6 +53,7 @@ from numpy.typing import ArrayLike, NDArray
 
 from .fitting import ModelFunc, _wls_solve
 from .models import FloatArray, TrajectoryParams
+from .terms import GROUP_ORDER
 
 __all__ = [
     "HeldExplicit",
@@ -438,18 +439,67 @@ def _held_provenance(held: Held) -> str:
     return f"explicit:{held.source}"
 
 
+#: Parameter-name prefixes of the transient amplitudes (``terms.py``).
+_TRANSIENT_AMP_PREFIXES = ("log_amp", "exp_amp")
+
+#: Named secular parameters of the polynomial trend, by degree.
+_SECULAR_NAMES = frozenset({"offset", "rate", "curvature"})
+
+
+def _staged_group_of(name: str) -> str:
+    """Classify one parameter name into a :data:`terms.GROUP_ORDER` group.
+
+    Equation:
+        A pure predicate ``name ↦ group``, no arithmetic.
+
+    Symbols → args:
+        - parameter name → ``name``: an entry of the model's
+          ``param_names`` (dimensionless label)
+
+    Returns:
+        One of ``"secular"``, ``"periodic"``, ``"step"``, ``"transient"``.
+
+    **This is deliberately NOT** ``detrend._term_keep_mask``.  That one is an
+    APPLY-time selector (design §5.3: which terms to *remove* when
+    detrending) and folds step amplitudes INTO ``"secular"``, because a
+    Heaviside jump is background rather than seasonal.  Changing it would
+    change what ``apply_detrend(terms="secular")`` removes, and 37 deployed
+    records plus the workbench's ``--terms`` depend on that meaning.
+
+    Staged estimation asks a different question — *which parameters does
+    this stage estimate?* — and there ``step`` must be separable from
+    ``rate``: a stage whose window excludes a step epoch cannot estimate its
+    amplitude, and folding the two together made that design rank-deficient
+    (measured on SELF, 2026-08-02).  So the two classifiers coexist on
+    purpose, and this one matches
+    :meth:`gps_analysis.terms.TrajectoryModel.group_mask`.
+
+    Raises:
+        ValueError: on a name it has not been taught.  Closed-world by
+            design: a new term kind must fail loudly here rather than be
+            silently dropped from every partition.
+    """
+    from .detrend import _PERIODIC_PARAM_NAMES, _STEP_AMP_PREFIX
+
+    if name in _SECULAR_NAMES or name.startswith("poly_"):
+        return "secular"
+    if name in _PERIODIC_PARAM_NAMES:
+        return "periodic"
+    if name.startswith(_STEP_AMP_PREFIX):
+        return "step"
+    if any(name.startswith(p) for p in _TRANSIENT_AMP_PREFIXES):
+        return "transient"
+    raise ValueError(
+        f"cannot classify model parameter {name!r} into a term group; "
+        f"known groups: {list(GROUP_ORDER)}"
+    )
+
+
 def _group_masks(
     model: ModelFunc, groups: Sequence[str]
 ) -> dict[str, NDArray[np.bool_]]:
-    """Term-group membership masks, via the existing classifier.
-
-    Reuses ``detrend._term_keep_mask`` rather than restating which
-    parameter names belong to which group — one definition of "secular",
-    in one place, shared with :func:`gps_analysis.detrend.select_terms`.
-    """
-    from .detrend import _term_keep_mask
-
-    return {g: _term_keep_mask(model, g) for g in groups}
+    """Term-group membership masks over the four :data:`GROUP_ORDER` groups."""
+    return {g: group_parameter_mask(model, g) for g in groups}
 
 
 def group_parameter_mask(model: str | ModelFunc, group: str) -> NDArray[np.bool_]:
@@ -482,10 +532,13 @@ def group_parameter_mask(model: str | ModelFunc, group: str) -> NDArray[np.bool_
         which the caller should treat as an error rather than as an empty
         borrow.
     """
-    from .detrend import _resolve_model, _term_keep_mask
+    from .detrend import _param_names, _resolve_model
 
+    if group not in GROUP_ORDER:
+        raise ValueError(f"unknown term group {group!r}; known: {list(GROUP_ORDER)}")
     model_func, _ = _resolve_model(model)
-    return _term_keep_mask(model_func, group)
+    names = _param_names(model_func)
+    return np.array([_staged_group_of(n) == group for n in names], dtype=np.bool_)
 
 
 def estimate_staged(

@@ -600,3 +600,132 @@ class TestEstimateStaged:
             estimate_staged(
                 exp_linear, t, y[0], plan=[Stage("a", ("secular", "periodic"))]
             )
+
+
+class TestGroupVocabulary:
+    """Staged estimation and select_terms classify groups DIFFERENTLY, on purpose.
+
+    ``detrend._term_keep_mask`` is an apply-time selector (design §5.3) and
+    folds step amplitudes into "secular", because a Heaviside jump is
+    background rather than seasonal. 37 deployed records and the workbench's
+    ``--terms`` depend on that meaning.
+
+    Staged estimation asks which parameters a STAGE estimates, and there
+    ``step`` must be separable from ``rate``: a stage whose window excludes a
+    step epoch cannot estimate its amplitude, and folding them together made
+    that design rank-deficient (measured on SELF).
+    """
+
+    @staticmethod
+    def _stepped():
+        import numpy as np
+
+        from gps_analysis import with_steps
+        from gps_analysis.detrend import _resolve_model
+
+        base, _ = _resolve_model("lineperiodic")
+        return with_steps(base, np.array([2008.4085]))
+
+    def test_staged_separates_step_from_secular(self) -> None:
+        from gps_analysis.staged import group_parameter_mask
+
+        m = self._stepped()
+        assert list(group_parameter_mask(m, "secular")) == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            False,
+        ]
+        assert list(group_parameter_mask(m, "step")) == [
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+        ]
+
+    def test_select_terms_still_folds_step_into_secular(self) -> None:
+        # The compatibility pin. Changing this changes what
+        # apply_detrend(terms="secular") REMOVES from 37 deployed records.
+        from gps_analysis.detrend import _term_keep_mask
+
+        assert list(_term_keep_mask(self._stepped(), "secular")) == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            True,
+        ]
+
+    def test_the_two_classifiers_disagree_only_about_steps(self) -> None:
+        import numpy as np
+
+        from gps_analysis.detrend import _term_keep_mask
+        from gps_analysis.staged import group_parameter_mask
+
+        m = self._stepped()
+        staged_secular = group_parameter_mask(m, "secular")
+        apply_secular = _term_keep_mask(m, "secular")
+        diff = staged_secular != apply_secular
+        assert np.array_equal(diff, group_parameter_mask(m, "step"))
+
+    def test_every_group_is_addressable(self) -> None:
+        from gps_analysis import GROUP_ORDER
+        from gps_analysis.staged import group_parameter_mask
+
+        for g in GROUP_ORDER:
+            group_parameter_mask(self._stepped(), g)  # must not raise
+
+    def test_unknown_group_raises(self) -> None:
+        import pytest
+
+        from gps_analysis.staged import group_parameter_mask
+
+        with pytest.raises(ValueError, match="unknown term group"):
+            group_parameter_mask(self._stepped(), "bogus")
+
+    def test_unclassifiable_parameter_raises(self) -> None:
+        # Closed-world by design: a new term kind must fail loudly rather than
+        # be silently dropped from every partition.
+        import pytest
+
+        from gps_analysis.staged import _staged_group_of
+
+        with pytest.raises(ValueError, match="cannot classify"):
+            _staged_group_of("mystery_param")
+
+    def test_matches_trajectory_model_group_mask(self) -> None:
+        # The name classifier and terms.py's structural one must agree, or the
+        # picker would offer groups the estimator cannot address.
+        import numpy as np
+
+        from gps_analysis import (
+            ExpTransient,
+            GROUP_ORDER,
+            LogTransient,
+            Polynomial,
+            Seasonal,
+            Step,
+            TrajectoryModel,
+        )
+        from gps_analysis.staged import group_parameter_mask
+
+        tm = TrajectoryModel(
+            (
+                Polynomial(degree=1),
+                Seasonal(n_harmonics=2),
+                Step(epoch=2008.4),
+                LogTransient(epoch=2008.4, tau=1.0),
+                ExpTransient(epoch=2010.0, tau=0.5),
+            )
+        )
+        mf = tm.as_modelfunc()
+        for g in GROUP_ORDER:
+            assert np.array_equal(tm.group_mask(g), group_parameter_mask(mf, g)), g
