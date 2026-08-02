@@ -189,9 +189,18 @@ class TestSerialization:
         with pytest.raises(ValueError, match="known:"):
             term_from_spec({"kind": "wormhole"})
 
-    def test_transient_kinds_are_absent_until_the_citation_is_verified(self) -> None:
-        """MATH_STANDARDS §2.4 needs a specific equation number, and Bevis &
-        Brown 2014 is not in reference/ yet. Deliberate, not an oversight."""
+    def test_transient_kinds_are_registered_now_that_citations_are_verified(
+        self,
+    ) -> None:
+        """DELIBERATE pin inversion (Phase 3): the transient kinds were absent
+        until Bevis & Brown 2014 eq. (9)/(10) and Reverso et al. 2014 eq. (20)
+        were verified against the primary PDFs (reference/papers/README.md).
+        They are registered now; the loose historical spellings still raise —
+        a stored record must name the exact registered kind."""
+        for kind in ("log_transient", "exp_transient"):
+            term = term_from_spec({"kind": kind, "epoch": 2008.4, "tau": 0.1})
+            assert term.kind == kind
+            assert term.group == "transient"
         for kind in ("exponential", "log", "logarithmic"):
             with pytest.raises(ValueError, match="unknown term kind"):
                 term_from_spec({"kind": kind, "epoch": 2008.4, "tau": 0.1})

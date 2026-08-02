@@ -8,12 +8,13 @@ parameter θ,
     ``y = Φ(θ)·c + ε``,  ``ε ~ N(0, diag(σᵢ²))``,
 
 with the caller supplying Φ(θ) as a callable that builds the full (N, P)
-design. In the intended transient application θ is ``ln τ`` (the log
-e-folding time), but nothing here knows that: the module is deliberately
-**term-agnostic**, so the transient terms (blocked on the Bevis & Brown
-2014 amplitude convention) can adopt it later without this solver
-changing. VARPRO **is** the concentration of the linear parameters, not a
-special optimizer (Golub & Pereyra 1973).
+design. In the transient application θ is ``ln τ`` (the log e-folding
+time), but nothing here knows that: the module is deliberately
+**term-agnostic** — the term-aware caller is
+:func:`gps_analysis.terms.profile_transient_tau`, which owns the
+span/SNR identification checks this module cannot make. VARPRO **is**
+the concentration of the linear parameters, not a special optimizer
+(Golub & Pereyra 1973).
 
 Derivation chain (MATH_STANDARDS §2, module contract)
 -----------------------------------------------------

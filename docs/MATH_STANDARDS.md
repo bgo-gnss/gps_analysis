@@ -134,8 +134,38 @@ into the estimator — so the reader can follow the flow top-down before reading
 - **Venzon & Moolgavkar 1988** — D.J. Venzon & S.H. Moolgavkar, *A method for
   computing profile-likelihood-based confidence intervals*, J. R. Stat. Soc. C 37(1),
   87–94. (the Δχ²=1 profile interval — `varpro._profile_interval`.)
-- Add domain refs (Hackl et al., Bevis & Brown trajectory model, Hector) as used —
-  always with the specific equation/section.
+- **Bevis & Brown 2014** — M. Bevis & A. Brown, *Trajectory models and reference
+  frames for crustal motion geodesy*, J. Geodesy 88(3), 283–311,
+  doi:10.1007/s00190-013-0685-5. (eq. (3) Heaviside `H(0)=1/2` — documented
+  divergence: this package's `terms.Step` pins `H(0)=1` for `with_steps`
+  byte-parity; eq. (8) SLTM; eq. (9) the logarithmic transient
+  `A·log(1+Δt/T)`; eq. (10) ETM composition + the `Δt = 0 for t < t_EQ`
+  convention; §5.2 τ as station metadata, default `T = 1 yr` (the ELTM),
+  refined per station by a 1-D nonlinear search; Appendix 1 the
+  T-insensitivity of the composed fit — `terms.LogTransient`,
+  `terms.profile_transient_tau`. ⚠ The paper contains **no exponential
+  transient** — do not cite it for one; see `reference/papers/README.md`.)
+- **Reverso et al. 2014** — T. Reverso, J. Vandemeulebrouck, F. Jouanne,
+  V. Pinel, T. Villemin, E. Sturkell & P. Bascou, *A two-magma chamber model
+  as a source of deformation at Grímsvötn Volcano, Iceland*, JGR Solid Earth
+  119, 4666–4683, doi:10.1002/2013JB010569. (eq. (20) the fitted
+  posteruptive form `Φ·(1−e^(−t/τ)) + U̇_∞·t + C` — `terms.ExpTransient`,
+  and `models.exp_linear` reparameterized (`A_expl = −Φ`, `k = 1/τ`,
+  `x₀ = C + Φ`); eqs. (11)–(12) each reservoir overpressure = exponential +
+  linear, `τ = 1/ξ` from inter-reservoir re-equilibration; eq. (17)
+  displacement linear in overpressure; measured `τ = 0.33 ± 0.08` /
+  `0.13 ± 0.04 yr` at Grímsvötn.)
+- **Belsley, Kuh & Welsch 1980** — *Regression Diagnostics: Identifying
+  Influential Data and Sources of Collinearity* (Wiley), ch. 3. (condition
+  indices + variance-decomposition proportions; the η ≥ 30 with two π ≥ 0.5
+  near-dependency reading — `terms.bkw_dependencies`, the localizer attached
+  to `terms.check_transient_identifiability` failures.)
+- **Belsley 1984** — D.A. Belsley, *Demeaning conditioning diagnostics through
+  centering*, Am. Stat. 38(2), 73–77. (the diagnosis must run on the
+  **uncentered**, column-equilibrated design — centering hides every
+  dependency the intercept participates in.)
+- Add domain refs (Hackl et al., Hector) as used — always with the specific
+  equation/section.
 
 ## 6. Derived products
 Any product written to the store (velocities, break epochs, detrended series, model
