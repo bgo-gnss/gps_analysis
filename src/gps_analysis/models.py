@@ -265,36 +265,43 @@ def exp_linear(
         Model positions x(t) [L], float64, same shape as ``t``.
 
     Reference:
-        Reverso et al. 2014, *A two-magma chamber model as a source of
-        deformation at Grímsvötn Volcano, Iceland*, JGR Solid Earth 119,
-        4666–4683, doi:10.1002/2013JB010569, **eq. (20)** — the fitted
-        surface-displacement form for posteruptive volcanic inflation,
-        written there as
+        **Elementary, and deliberately not attributed to any process.**
+        This is the general solution of a first-order linear ODE whose
+        equilibrium drifts linearly. Substituting ``u(t) = x(t) − (x₀ + v·t)``
+        for the departure from the linear asymptote,
 
-            ``U_R(t) = Φ·(1 − e^(−t/τ)) + U̇_∞·t + C``
+            ``du/dt = −k·u``   ⟹   ``u(t) = A·e^(−k·t)``
 
-        which is this function reparameterized: ``x₀ = C + Φ``,
-        ``v = U̇_∞``, ``A = −Φ``, ``k = 1/τ``. (Note the sign: A < 0 for
-        inflation approaching the asymptote from below, as documented
-        above.) The physics behind the form is their eqs. (11)–(12), where
-        the shallow and deep reservoir overpressures ``ΔP_s(t)``, ``ΔP_d(t)``
-        are each "the sum of an exponential function and a linear function"
-        — the exponential being interreservoir pressure re-equilibration
-        with time constant ``τ = 1/ξ``, the linear term set by the
-        **constant basal magma inflow** — and eq. (17), by which surface
-        displacement is linear in those overpressures. Measured at GFUM:
-        ``τ = 0.33 ± 0.08 yr`` (2004) and ``0.13 ± 0.04 yr`` (2011),
-        i.e. ``k ≈ 3–8 yr⁻¹``, bracketing the Svartsengi use below.
+        so ``x(t) = x₀ + v·t + A·e^(−k·t)`` and, equivalently,
 
-        ⚠ The exponential form does **not** identify the mechanism: a
-        reservoir fed at constant pressure through a hydraulic connection
-        and one surrounded by a viscous shell explain the decaying inflation
-        rate equally well (Dzurisin et al. 2009, cited in Reverso §5), as
-        does constant-rate fluid injection in a thermo-poro-elastic
-        hydrothermal system (Fournier & Chardot 2012). Earlier observations
-        of the same exp-then-linear shape: Nooner & Chadwick 2009 (Axial
-        Seamount, τ ≈ 21–48 d, then linear); Lu et al. 2003 (Westdahl),
-        2010 (Okmok); Sturkell et al. 2006 (Iceland).
+            ``dx/dt = v − k·(x − x₀ − v·t)``.
+
+        The derivation is given in full here rather than cited because it is
+        two lines of textbook ODE theory, and because naming a source would
+        misrepresent where the form comes from.
+
+        ⚠ **The form carries NO information about the mechanism.** Relaxation
+        toward a linearly-moving equilibrium is one of the most common
+        behaviours in nature: Newton's law of cooling, an RC circuit charging
+        under a ramp input, decay with constant resupply, compartmental and
+        biological kinetics, and any number of unrelated geophysical systems
+        all produce this identical curve. A good fit therefore says only that
+        *something* relaxes at rate ``k`` toward a trend ``v`` — it does not
+        identify what, and nothing about the underlying process may be
+        inferred from it without independent knowledge of that system.
+
+        Instances of use — **examples, never the derivation, and never
+        evidence about mechanism**: Reverso et al. 2014, JGR Solid Earth 119,
+        4666–4683, doi:10.1002/2013JB010569, eq. (20), fit posteruptive GNSS
+        displacement at Grímsvötn with ``Φ·(1 − e^(−t/τ)) + U̇_∞·t + C``
+        (this function under ``x₀ = C + Φ``, ``v = U̇_∞``, ``A = −Φ``,
+        ``k = 1/τ`` — the mapping is why A < 0 approaching the asymptote from
+        below), measuring ``τ = 0.33 ± 0.08`` and ``0.13 ± 0.04 yr``. Their
+        own §5 makes the same point from the other side: a hydraulically-fed
+        reservoir and one in a viscous shell fit equally well (Dzurisin et
+        al. 2009), as does thermo-poro-elastic injection (Fournier & Chardot
+        2012). The same shape appears at Axial Seamount (Nooner & Chadwick
+        2009), Westdahl and Okmok (Lu et al. 2003, 2010).
 
         NOT Bevis & Brown 2014 — this docstring cited that paper's
         "eq. (6)–(7)" until 2026-08-02, which is wrong twice over: those are
