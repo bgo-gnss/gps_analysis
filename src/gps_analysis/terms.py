@@ -71,6 +71,8 @@ from .varpro import VarproFit, estimate_varpro
 
 __all__ = [
     "GROUP_ORDER",
+    "TERM_SPEC_ATTR",
+    "model_term_spec",
     "BkwDependency",
     "ExpTransient",
     "LogTransient",
@@ -87,6 +89,11 @@ __all__ = [
 ]
 
 GROUP_ORDER: tuple[str, ...] = ("secular", "periodic", "step", "transient")
+
+TERM_SPEC_ATTR = "_gps_analysis_term_spec"
+"""Attribute under which :meth:`TrajectoryModel.as_modelfunc` stashes its
+term spec, so a stored record can reconstruct the model. Same hook pattern
+as ``fitting._LINEAR_DESIGN_ATTR``."""
 """Canonical term ordering, and the reason it is not merely tidy.
 
 :class:`TrajectoryModel` stable-sorts by this rank so a model carrying a
@@ -489,6 +496,17 @@ renumbers globally, one counter per family (``step_amp_1``, ``log_amp_1``,
 …).  ``step_amp`` numbering is byte-pinned against ``fitting.with_steps``."""
 
 
+def model_term_spec(model: Any) -> list[dict[str, Any]] | None:
+    """The term spec of a model callable, or None if it has none.
+
+    None means "an ordinary registry model (+ ``with_steps``)", which a
+    record expresses with a model code and ``step_epochs`` alone. A spec
+    means the model carries terms that vocabulary cannot describe.
+    """
+    spec = getattr(model, TERM_SPEC_ATTR, None)
+    return list(spec) if spec is not None else None
+
+
 def term_from_spec(spec: Mapping[str, Any]) -> Term:
     """Rebuild a term from its :meth:`Term.to_spec` description."""
     kind = spec.get("kind")
@@ -646,6 +664,11 @@ class TrajectoryModel:
             intercept_column=None if poly is None else poly[1].start,
         )
         setattr(evaluate, _LINEAR_DESIGN_ATTR, design)
+        # The term spec rides on the callable so a RECORD can carry it. A
+        # registry code plus step epochs cannot express a transient, so
+        # without this a transient model could be fitted and never stored
+        # -- see detrend.RECORD_VERSION_TERMS.
+        setattr(evaluate, TERM_SPEC_ATTR, self.to_spec())
         return evaluate
 
     def to_spec(self) -> list[dict[str, Any]]:

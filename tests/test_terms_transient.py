@@ -540,3 +540,165 @@ class TestProfiledTau:
         one = TrajectoryModel([Polynomial(1), LogTransient(epoch=2010.0, tau=0.5)])
         with pytest.raises(ValueError, match="tau_bounds"):
             profile_transient_tau(one, t, y, tau_bounds=(-1.0, 2.0))
+
+
+class TestRecordV2:
+    """A transient model must round-trip through a record, and v1 must not move."""
+
+    @staticmethod
+    def _fit():
+        import numpy as np
+
+        from gps_analysis import (
+            LogTransient,
+            Polynomial,
+            Seasonal,
+            Step,
+            TrajectoryModel,
+            estimate_detrend,
+        )
+
+        rng = np.random.default_rng(0)
+        t = np.linspace(2006.0, 2026.0, 3000)
+        dt = np.clip(t - 2008.4, 0, None)
+        y = (
+            10
+            + 2 * (t - 2006)
+            + 3 * np.cos(2 * np.pi * t)
+            + np.where(t > 2008.4, -40.0, 0.0)
+            + 25 * np.log1p(dt / 1.0)
+            + rng.normal(0, 1.5, t.size)
+        )
+        tm = TrajectoryModel(
+            (
+                Polynomial(degree=1),
+                Seasonal(n_harmonics=2),
+                Step(epoch=2008.4),
+                LogTransient(epoch=2008.4, tau=1.0),
+            )
+        )
+        est = estimate_detrend(
+            tm.as_modelfunc(),
+            t,
+            y,
+            np.full(t.size, 1.5),
+            detect=False,
+            max_gap_years=3.0,
+        )
+        return est, t, y
+
+    def test_version_is_content_determined(self) -> None:
+        # The 37 deployed records and every new PLAIN record stay v1 and
+        # byte-identical; only a record that NEEDS the richer shape gets v2.
+        import numpy as np
+
+        from gps_analysis import estimate_detrend
+
+        t = np.linspace(2006.0, 2026.0, 2000)
+        y = 2 * (t - 2006) + np.random.default_rng(0).normal(0, 1, t.size)
+        plain = estimate_detrend(
+            "lineperiodic", t, y, np.ones(t.size), detect=False, max_gap_years=3.0
+        ).to_record()
+        assert plain["record_version"] == 1
+        assert "terms" not in plain
+
+        stepped = estimate_detrend(
+            "lineperiodic",
+            t,
+            y,
+            np.ones(t.size),
+            step_epochs=[2010.0],
+            detect=False,
+            max_gap_years=3.0,
+        ).to_record()
+        assert stepped["record_version"] == 1
+        assert "terms" not in stepped
+
+        assert self._fit()[0].to_record()["record_version"] == 2
+
+    def test_transient_record_reconstructs_exactly(self) -> None:
+        import numpy as np
+
+        from gps_analysis import trajectory_from_record
+
+        est, _t, _y = self._fit()
+        rec = est.to_record()
+        assert rec["terms"][-1]["kind"] == "log_transient"
+        _mf, fits = trajectory_from_record(rec)
+        # Pure reconstruction: parameters pass through bit-exactly.
+        assert np.array_equal(fits[0].params, est.fits[0].params)
+
+    def test_recovers_the_injected_transient(self) -> None:
+        est, _t, _y = self._fit()
+        p = est.fits[0].params
+        assert p[1] == pytest.approx(2.0, abs=0.05)  # rate
+        assert p[6] == pytest.approx(-40.0, abs=1.0)  # step
+        assert p[7] == pytest.approx(25.0, abs=1.0)  # log amplitude
+
+    def test_terms_selectors_on_a_transient_record(self) -> None:
+        import numpy as np
+
+        from gps_analysis import evaluate_record
+
+        est, _t, _y = self._fit()
+        rec = est.to_record()
+        at = np.array([2020.0])
+        allv = float(np.ravel(evaluate_record(rec, at))[0])
+        sec = float(np.ravel(evaluate_record(rec, at, terms="secular"))[0])
+        tra = float(np.ravel(evaluate_record(rec, at, terms="transient"))[0])
+        # "secular" must NOT reach the transient: the decision of 2026-08-03
+        # is that a postseismic signal survives unless asked for by name.
+        assert abs(allv - sec) > 1.0
+        assert tra == pytest.approx(allv - sec, abs=5.0)
+
+    def test_secular_excludes_transient_by_mask(self) -> None:
+        from gps_analysis.detrend import _term_keep_mask
+
+        est, _t, _y = self._fit()
+        from gps_analysis import (
+            LogTransient,
+            Polynomial,
+            Seasonal,
+            Step,
+            TrajectoryModel,
+        )
+
+        mf = TrajectoryModel(
+            (
+                Polynomial(degree=1),
+                Seasonal(n_harmonics=2),
+                Step(epoch=2008.4),
+                LogTransient(epoch=2008.4, tau=1.0),
+            )
+        ).as_modelfunc()
+        assert list(_term_keep_mask(mf, "secular")) == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            True,
+            False,
+        ]
+        assert list(_term_keep_mask(mf, "transient")) == [
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            False,
+            True,
+        ]
+        # tuple = union, so a call site can decide explicitly
+        assert list(_term_keep_mask(mf, ("secular", "transient"))) == [
+            True,
+            True,
+            False,
+            False,
+            False,
+            False,
+            True,
+            True,
+        ]

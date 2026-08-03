@@ -124,7 +124,18 @@ Keeping the two separate is what lets a future shape ship without a flag day
 for the deployed documents: the writer advances, the reader keeps the older
 branch, and both live in one file (design §3.2 rules)."""
 
-SUPPORTED_RECORD_VERSIONS: frozenset[int] = frozenset({RECORD_VERSION})
+RECORD_VERSION_TERMS = 2
+"""Version emitted when the model carries a TERM SPEC — i.e. terms a model
+code plus ``step_epochs`` cannot express (transients).
+
+Content-determined, not writer-determined: an ordinary model still emits
+:data:`RECORD_VERSION` 1, so the 37 deployed records and every new plain
+record stay byte-identical. Only a record that NEEDS the richer shape gets
+it, which is what keeps v1 readers correct rather than merely tolerated."""
+
+SUPPORTED_RECORD_VERSIONS: frozenset[int] = frozenset(
+    {RECORD_VERSION, RECORD_VERSION_TERMS}
+)
 """Record versions :func:`trajectory_from_record` can reconstruct.
 
 An exact-equality check would make every shape change a coordinated
@@ -157,13 +168,32 @@ _PERIODIC_PARAM_NAMES = frozenset(
 )
 """Model parameter names of the seasonal group."""
 
+_TRANSIENT_AMP_PREFIXES = ("log_amp", "exp_amp")
+"""Parameter-name prefixes of the transient amplitudes (``terms.py``) —
+their own group, NOT folded into ``"secular"``: a postseismic decay is
+signal, where a Heaviside jump is background."""
+
 _STEP_AMP_PREFIX = "step_amp_"
 """Parameter-name prefix of :func:`~gps_analysis.fitting.with_steps`
 amplitude parameters — classified with the secular group (a Heaviside
 jump is background, not seasonal)."""
 
-_TERMS = ("all", "secular", "periodic")
-"""Valid ``terms`` selectors of :func:`select_terms`."""
+_TERMS = ("all", "secular", "periodic", "transient")
+"""Valid ``terms`` selectors of :func:`select_terms`.
+
+``"transient"`` joined the vocabulary on 2026-08-03, when transient terms
+became fittable. The three original selectors keep their EXACT meanings —
+``"secular"`` is still {offset, rate} ∪ {step amplitudes} (design §5.3: a
+Heaviside jump is background, not seasonal) and does **not** reach a
+transient. A postseismic decay is signal many analyses exist to study, so
+removing it silently under an existing spelling would change what the
+detrended view means for every future record; you ask for it by name, or
+with ``"all"``.
+
+:func:`select_terms` also accepts a TUPLE of these names (their union), so
+a call site can say ``("secular", "transient")`` and decide for itself.
+All 37 deployed records are byte-identical under this change: they carry no
+transient terms, so no mask they produce can differ."""
 
 _DEFAULT_TOL = 1e-3
 """Window boundary tolerance [yr] — the ``slice_window`` legacy default
@@ -259,6 +289,10 @@ class DetrendEstimate:
     frame: str | None = None
     outlier_abort: bool = False
     detection: OutlierDetection | None = None
+    term_spec: list[dict[str, Any]] | None = None
+    """Term spec when the model carries terms a registry code cannot express
+    (transients). None for ordinary models, which keeps their records at
+    :data:`RECORD_VERSION` 1 and byte-identical."""
 
     def __post_init__(self) -> None:
         n_components = len(self.fits)
@@ -327,16 +361,29 @@ class DetrendEstimate:
             :meth:`~gps_analysis.models.TrajectoryParams.to_record` for
             the covariance round-trip contract.
         """
-        if self.model not in _MODEL_NAMES:
+        term_spec = self.term_spec
+        if term_spec is None and self.model not in _MODEL_NAMES:
             raise ValueError(
                 f"model {self.model!r} is not a registry code "
                 f"{sorted(_MODEL_NAMES)} - the record would not be re-evaluable"
             )
+        if term_spec is not None:
+            from .terms import TrajectoryModel
+
+            param_names = list(TrajectoryModel.from_spec(term_spec).param_names)
+        else:
+            param_names = _param_names(_MODEL_NAMES[self.model]) + [
+                f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)
+            ]
         return {
-            "record_version": RECORD_VERSION,
+            "record_version": (
+                RECORD_VERSION if term_spec is None else RECORD_VERSION_TERMS
+            ),
             "model": self.model,
-            "param_names": _param_names(_MODEL_NAMES[self.model])
-            + [f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)],
+            "param_names": param_names,
+            # The terms list is what makes a transient record re-evaluable;
+            # absent at v1, so a v1 reader never sees a key it must ignore.
+            **({} if term_spec is None else {"terms": term_spec}),
             "step_epochs": [float(v) for v in self.step_epochs],
             "frame": self.frame,
             "detrend_method": self.detrend_method,
@@ -425,6 +472,13 @@ def _resolve_model(model: str | ModelFunc) -> tuple[ModelFunc, str]:
         ) from None
 
 
+def _model_term_spec(model: ModelFunc) -> list[dict[str, Any]] | None:
+    """Term spec of the fitted model, or None for an ordinary registry one."""
+    from .terms import model_term_spec
+
+    return model_term_spec(model)
+
+
 def _term_keep_mask(model: ModelFunc, terms: str) -> NDArray[np.bool_]:
     """Build the parameter keep-mask of a term selection (design §5.3).
 
@@ -446,6 +500,7 @@ def _term_keep_mask(model: ModelFunc, terms: str) -> NDArray[np.bool_]:
             "linear-in-parameters models (and their with_steps "
             f"augmentations); got {getattr(model, '__name__', model)!r}"
         )
+    wanted = {terms} if isinstance(terms, str) else set(terms)
     names = _param_names(model)
     keep = np.zeros(len(names), dtype=np.bool_)
     for j, name in enumerate(names):
@@ -453,11 +508,14 @@ def _term_keep_mask(model: ModelFunc, terms: str) -> NDArray[np.bool_]:
             group = "secular"
         elif name in _PERIODIC_PARAM_NAMES:
             group = "periodic"
+        elif any(name.startswith(pre) for pre in _TRANSIENT_AMP_PREFIXES):
+            group = "transient"
         else:
             raise ValueError(
-                f"cannot classify model parameter {name!r} as secular/periodic"
+                f"cannot classify model parameter {name!r} as "
+                f"secular/periodic/transient"
             )
-        keep[j] = group == terms
+        keep[j] = group in wanted
     return keep
 
 
@@ -497,8 +555,9 @@ def select_terms(
         model: Model callable the fits belong to.
         fits: One :class:`~gps_analysis.models.TrajectoryParams` or a
             sequence of them.
-        terms: Term selector — ``"all"``, ``"secular"`` or
-            ``"periodic"``.
+        terms: Term selector — ``"all"``, ``"secular"``, ``"periodic"``,
+            ``"transient"``, or a tuple of those (their union).
+            ``"secular"`` does NOT include a transient; see :data:`_TERMS`.
 
     Returns:
         New :class:`~gps_analysis.models.TrajectoryParams` list (inputs
@@ -520,10 +579,12 @@ def select_terms(
         a could-not-estimate covariance: 0·inf would be NaN, so the
         mask is applied by assignment, not multiplication).
     """
-    if terms not in _TERMS:
+    wanted = (terms,) if isinstance(terms, str) else tuple(terms)
+    unknown = [t for t in wanted if t not in _TERMS]
+    if unknown:
         raise ValueError(f"terms must be one of {_TERMS}, got {terms!r}")
     fit_list = [fits] if isinstance(fits, TrajectoryParams) else list(fits)
-    if terms == "all":
+    if "all" in wanted:
         return fit_list
     keep = _term_keep_mask(model, terms)
     out: list[TrajectoryParams] = []
@@ -932,6 +993,7 @@ def estimate_detrend(
         detrend_method=method,
         frame=frame,
         outlier_abort=outlier_abort,
+        term_spec=_model_term_spec(model_func),
         detection=detection,
     )
 
@@ -982,16 +1044,32 @@ def trajectory_from_record(
             f"{sorted(SUPPORTED_RECORD_VERSIONS)}"
         )
     model_name = record.get("model")
-    if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
-        raise ValueError(
-            f"record model {model_name!r} is not a registry code {sorted(_MODEL_NAMES)}"
-        )
-    base_model = _MODEL_NAMES[model_name]
+    term_spec = record.get("terms")
     step_epochs = np.asarray(record.get("step_epochs", []), dtype=np.float64)
-    model_func = with_steps(base_model, step_epochs) if step_epochs.size else base_model
-    expected_names = _param_names(base_model) + [
-        f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(step_epochs.size)
-    ]
+
+    if term_spec is not None:
+        # v2: the record carries its own terms, because a registry code plus
+        # step epochs cannot express a transient. Reconstruction is exact --
+        # the same TrajectoryModel the fit used, rebuilt from its own spec.
+        from .terms import TrajectoryModel
+
+        traj = TrajectoryModel.from_spec(term_spec)
+        model_func = traj.as_modelfunc()
+        expected_names = list(traj.param_names)
+    else:
+        # v1, byte-identical: registry code + with_steps, as before.
+        if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
+            raise ValueError(
+                f"record model {model_name!r} is not a registry code "
+                f"{sorted(_MODEL_NAMES)}"
+            )
+        base_model = _MODEL_NAMES[model_name]
+        model_func = (
+            with_steps(base_model, step_epochs) if step_epochs.size else base_model
+        )
+        expected_names = _param_names(base_model) + [
+            f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(step_epochs.size)
+        ]
     stored_names = record.get("param_names")
     if stored_names is not None and list(stored_names) != expected_names:
         raise ValueError(
