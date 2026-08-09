@@ -370,7 +370,16 @@ class DetrendEstimate:
         if term_spec is not None:
             from .terms import TrajectoryModel
 
-            param_names = list(TrajectoryModel.from_spec(term_spec).param_names)
+            # Steps are appended here for the same reason as on the v1 branch:
+            # the spec describes the UNAUGMENTED model, and with_steps supplies
+            # the rest. This mirrors trajectory_from_record exactly -- writer
+            # and reader must agree on the order or every v2 record fails its
+            # own param_names check. Pre-2026-08-09 records baked steps into
+            # the spec and carry an empty step_epochs, so they append nothing
+            # and keep the names they were written with.
+            param_names = list(TrajectoryModel.from_spec(term_spec).param_names) + [
+                f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)
+            ]
         else:
             param_names = _param_names(_MODEL_NAMES[self.model]) + [
                 f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)
@@ -1048,14 +1057,25 @@ def trajectory_from_record(
     step_epochs = np.asarray(record.get("step_epochs", []), dtype=np.float64)
 
     if term_spec is not None:
-        # v2: the record carries its own terms, because a registry code plus
-        # step epochs cannot express a transient. Reconstruction is exact --
-        # the same TrajectoryModel the fit used, rebuilt from its own spec.
+        # v2: the record carries its own terms, because a registry code alone
+        # cannot express a transient. Steps are NOT among them -- they live in
+        # step_epochs and re-augment here exactly as in v1, because the writer
+        # stores the UNAUGMENTED model's spec (`_model_term_spec(model_func)`)
+        # beside `step_epochs=steps_in`. One augmentation site, one screen.
+        #
+        # Records written before 2026-08-09 baked their steps INTO the spec
+        # and carry an empty step_epochs, so they reconstruct unchanged --
+        # with_steps only applies when there is something to apply.
         from .terms import TrajectoryModel
 
         traj = TrajectoryModel.from_spec(term_spec)
-        model_func = traj.as_modelfunc()
-        expected_names = list(traj.param_names)
+        base_traj = traj.as_modelfunc()
+        model_func = (
+            with_steps(base_traj, step_epochs) if step_epochs.size else base_traj
+        )
+        expected_names = list(traj.param_names) + [
+            f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(step_epochs.size)
+        ]
     else:
         # v1, byte-identical: registry code + with_steps, as before.
         if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
