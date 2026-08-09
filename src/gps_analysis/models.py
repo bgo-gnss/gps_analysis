@@ -352,8 +352,14 @@ def exp_linear_rate(
         Instantaneous rate dx/dt [L/yr], float64, same shape as ``t``.
 
     Reference:
-        Analytic derivative of :func:`exp_linear` (Bevis & Brown 2014,
-        eq. 6). Legacy sources: ``svartsengi_model.fitting.dexpf`` ≡
+        Analytic derivative of :func:`exp_linear` — see that function's
+        Reference block for what the form does and does not imply.
+        NOT Bevis & Brown 2014 eq. 6: this docstring carried that
+        citation until 2026-08-09, inherited from the parent's
+        since-corrected one, and it is wrong for the same reason — that
+        paper's eq. 6 is a sub-model decomposition, and it contains no
+        exponential transient at all. Legacy sources:
+        ``svartsengi_model.fitting.dexpf`` ≡
         ``exp_linear_rate(t, 0, p1, p2)``; ``dexpf_short`` ≡
         ``exp_linear_rate(t, 0, p0, 1/p1)``.
 
