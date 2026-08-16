@@ -857,3 +857,80 @@ class TestComposedCovarianceOwnership:
         assert np.array_equal(composed[[0, 1]], b[[0, 1]])  # held -> final stage
         assert np.allclose(composed[[0, 1]], a[[0, 1]])  # == what A fitted
         assert np.array_equal(composed[2:], b[2:])
+
+
+class TestGroupClassifiersCoverTheWholeTermAlgebra:
+    """A model the term algebra can BUILD must be one the classifiers can read.
+
+    Both classifiers matched the seasonal group against a frozen set of four
+    names, but ``Seasonal`` labels only harmonics 1 and 2 (annual,
+    semiannual) and spells the rest ``cos_harmonic3``, ``sin_harmonic3``, ...
+    ``Seasonal(n_harmonics=3)`` therefore produced parameters neither could
+    place: staged estimation, ``select_terms`` and every donor borrow raised
+    on a model ``TrajectoryModel`` accepts without complaint. ``select_terms``
+    had the same hole on the secular side — ``Polynomial(degree=2)`` names a
+    ``curvature`` it did not know, and degree 3+ adds ``poly_3``.
+    """
+
+    @pytest.mark.parametrize("n_harmonics", [1, 2, 3, 5])
+    @pytest.mark.parametrize("degree", [1, 2, 4])
+    def test_name_classifier_agrees_with_the_structural_one(
+        self, n_harmonics: int, degree: int
+    ) -> None:
+        from gps_analysis import (
+            GROUP_ORDER,
+            LogTransient,
+            Polynomial,
+            Seasonal,
+            Step,
+            TrajectoryModel,
+        )
+        from gps_analysis.staged import group_parameter_mask
+
+        tm = TrajectoryModel(
+            (
+                Polynomial(degree=degree),
+                Seasonal(n_harmonics=n_harmonics),
+                Step(epoch=2008.4),
+                LogTransient(epoch=2008.4, tau=1.0),
+            )
+        )
+        mf = tm.as_modelfunc()
+        for g in GROUP_ORDER:
+            assert np.array_equal(tm.group_mask(g), group_parameter_mask(mf, g)), g
+
+    def test_select_terms_classifies_high_degree_and_high_harmonic_models(
+        self,
+    ) -> None:
+        from gps_analysis import Polynomial, Seasonal, Step, TrajectoryModel
+        from gps_analysis.detrend import _param_names, _term_keep_mask
+
+        mf = TrajectoryModel(
+            (Polynomial(degree=4), Seasonal(n_harmonics=5), Step(epoch=2008.4))
+        ).as_modelfunc()
+        names = _param_names(mf)
+        keep = _term_keep_mask(mf, "secular")
+        # steps still fold into "secular" here — that is the ON-PURPOSE
+        # difference from the staged classifier, and 37 deployed records
+        # depend on it
+        secular = {n for n, k in zip(names, keep, strict=True) if k}
+        assert secular == {
+            "offset",
+            "rate",
+            "curvature",
+            "poly_3",
+            "poly_4",
+            "step_amp_1",
+        }
+        periodic = {
+            n for n, k in zip(names, _term_keep_mask(mf, "periodic"), strict=True) if k
+        }
+        assert len(periodic) == 10
+        assert all(n.startswith(("cos_", "sin_")) for n in periodic)
+
+    def test_an_unknown_name_is_still_refused(self) -> None:
+        """Closed-world by design: the prefixes widened, the rule did not go open."""
+        from gps_analysis.staged import _staged_group_of
+
+        with pytest.raises(ValueError, match="cannot classify"):
+            _staged_group_of("tidal_k1")

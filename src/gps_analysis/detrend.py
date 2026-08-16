@@ -160,13 +160,45 @@ _MODEL_NAMES: dict[str, ModelFunc] = {
 Only these house models can appear in a stored record — a record must
 be re-evaluable from its ``model`` string alone (design §3.2)."""
 
-_SECULAR_PARAM_NAMES = frozenset({"offset", "rate"})
-"""Model parameter names of the secular (non-seasonal) group."""
+_SECULAR_PARAM_NAMES = frozenset({"offset", "rate", "curvature"})
+"""Model parameter names of the secular (non-seasonal) group.
+
+Not exhaustive on its own — :func:`_is_secular_param` adds the ``poly_``
+prefix, since :class:`~gps_analysis.terms.Polynomial` names only the first
+three coefficients and falls back to ``poly_3``, ``poly_4``, ... above that."""
 
 _PERIODIC_PARAM_NAMES = frozenset(
     {"cos_annual", "sin_annual", "cos_semiannual", "sin_semiannual"}
 )
-"""Model parameter names of the seasonal group."""
+"""Model parameter names of the seasonal group at the production
+``n_harmonics=2`` — see :func:`_is_periodic_param` for the general rule."""
+
+_SECULAR_PARAM_PREFIX = "poly_"
+_PERIODIC_PARAM_PREFIXES = ("cos_", "sin_")
+
+
+def _is_secular_param(name: str) -> bool:
+    """Whether a parameter name belongs to the polynomial (secular) group."""
+    return name in _SECULAR_PARAM_NAMES or name.startswith(_SECULAR_PARAM_PREFIX)
+
+
+def _is_periodic_param(name: str) -> bool:
+    """Whether a parameter name belongs to the seasonal group.
+
+    A membership test against the four production names was not enough:
+    :class:`~gps_analysis.terms.Seasonal` labels only harmonics 1 and 2
+    (``annual``/``semiannual``) and spells the rest ``cos_harmonic3``,
+    ``sin_harmonic3``, ... so ``n_harmonics=3`` produced parameters that
+    NEITHER classifier could place, and both raised.  ``cos_``/``sin_`` is
+    the seasonal namespace -- no other term generates those prefixes -- so
+    the rule generalises without widening what it claims.
+
+    Shared by :func:`_term_keep_mask` and
+    :func:`gps_analysis.staged._staged_group_of` so the two, which
+    deliberately differ on where STEPS go, cannot also drift on this.
+    """
+    return name in _PERIODIC_PARAM_NAMES or name.startswith(_PERIODIC_PARAM_PREFIXES)
+
 
 _TRANSIENT_AMP_PREFIXES = ("log_amp", "exp_amp")
 """Parameter-name prefixes of the transient amplitudes (``terms.py``) —
@@ -513,9 +545,9 @@ def _term_keep_mask(model: ModelFunc, terms: str) -> NDArray[np.bool_]:
     names = _param_names(model)
     keep = np.zeros(len(names), dtype=np.bool_)
     for j, name in enumerate(names):
-        if name in _SECULAR_PARAM_NAMES or name.startswith(_STEP_AMP_PREFIX):
+        if _is_secular_param(name) or name.startswith(_STEP_AMP_PREFIX):
             group = "secular"
-        elif name in _PERIODIC_PARAM_NAMES:
+        elif _is_periodic_param(name):
             group = "periodic"
         elif any(name.startswith(pre) for pre in _TRANSIENT_AMP_PREFIXES):
             group = "transient"

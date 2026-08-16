@@ -443,7 +443,9 @@ def _held_provenance(held: Held) -> str:
 _TRANSIENT_AMP_PREFIXES = ("log_amp", "exp_amp")
 
 #: Named secular parameters of the polynomial trend, by degree.
-_SECULAR_NAMES = frozenset({"offset", "rate", "curvature"})
+# The secular/periodic membership rules now live in `detrend`, shared with
+# `_term_keep_mask` so the two classifiers -- which differ ON PURPOSE only
+# in where STEP amplitudes go -- cannot silently drift anywhere else.
 
 
 def _staged_group_of(name: str) -> str:
@@ -479,11 +481,11 @@ def _staged_group_of(name: str) -> str:
             design: a new term kind must fail loudly here rather than be
             silently dropped from every partition.
     """
-    from .detrend import _PERIODIC_PARAM_NAMES, _STEP_AMP_PREFIX
+    from .detrend import _STEP_AMP_PREFIX, _is_periodic_param, _is_secular_param
 
-    if name in _SECULAR_NAMES or name.startswith("poly_"):
+    if _is_secular_param(name):
         return "secular"
-    if name in _PERIODIC_PARAM_NAMES:
+    if _is_periodic_param(name):
         return "periodic"
     if name.startswith(_STEP_AMP_PREFIX):
         return "step"
