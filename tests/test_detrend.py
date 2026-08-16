@@ -35,6 +35,7 @@ from gps_analysis.detrend import (
     DETREND_METHOD_PLAIN,
     DETREND_METHOD_ROBUST,
     RECORD_VERSION,
+    RECORD_VERSION_TERMS,
     DetrendEstimate,
     apply_detrend,
     estimate_detrend,
@@ -511,6 +512,64 @@ def test_record_validation_rejects_bad_documents() -> None:
             step_epochs=est.step_epochs,
             detrend_method=est.detrend_method,
         ).to_record()
+
+
+def test_record_version_must_match_structure() -> None:
+    """The version is a structural claim, not a decoration.
+
+    Dispatch is on the terms key, so before this check a mislabeled record
+    read by content with the version claim silently ignored — and the
+    dangerous corner was real: ``param_names`` is validated only when
+    present, so a v1 record with a spurious 6-parameter ``Polynomial(5)``
+    spec evaluated lineperiodic parameters against the wrong basis,
+    ~2e16 mm off, without a word.
+    """
+    from gps_analysis.terms import TrajectoryModel
+
+    t, y, sigma = _white_series(1096, seed=29)
+    good = estimate_detrend(lineperiodic, t, y, sigma, detect=False).to_record()
+    assert good["record_version"] == RECORD_VERSION
+
+    # v1 label + terms key: refused whatever the terms say, even a spec
+    # whose names and math match the registry model exactly.
+    matching = [
+        {"kind": "polynomial", "degree": 1},
+        {"kind": "seasonal", "n_harmonics": 2},
+    ]
+    with pytest.raises(ValueError, match="carries a 'terms' key"):
+        trajectory_from_record(dict(good, terms=matching))
+
+    # The silent-wrong-numbers corner: same parameter COUNT, different
+    # meaning, param_names absent (it is optional).
+    bad = dict(good, terms=[{"kind": "polynomial", "degree": 5}])
+    del bad["param_names"]
+    with pytest.raises(ValueError, match="carries a 'terms' key"):
+        trajectory_from_record(bad)
+
+    # v2 label without terms: refused — v2 exists because the model cannot
+    # be rebuilt from its code alone.
+    with pytest.raises(ValueError, match="no 'terms' list"):
+        trajectory_from_record(dict(good, record_version=RECORD_VERSION_TERMS))
+
+    # A genuine v2 record relabeled v1 is the mislabel seen from the other
+    # side; it must be refused too, not read by content.
+    v2 = estimate_detrend(
+        TrajectoryModel.from_spec(matching).as_modelfunc(),
+        t,
+        y,
+        sigma,
+        detect=False,
+    ).to_record()
+    assert v2["record_version"] == RECORD_VERSION_TERMS
+    with pytest.raises(ValueError, match="carries a 'terms' key"):
+        trajectory_from_record(dict(v2, record_version=RECORD_VERSION))
+
+    # "terms": null means absent — a hand-edited v1 record stays readable,
+    # and identically to the keyless one.
+    _mf, fits = trajectory_from_record(dict(good, terms=None))
+    np.testing.assert_array_equal(
+        fits[0].params, trajectory_from_record(good)[1][0].params
+    )
 
 
 # ------------------------------------------------- conventions / method tag

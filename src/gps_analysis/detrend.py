@@ -1045,10 +1045,13 @@ def trajectory_from_record(
     """Reconstruct (model, fits) from a stored station record.
 
     Validation + reconstruction (design §3.2 rules — a reader must
-    raise, never fudge): known ``record_version``, model code in the
-    registry, ``param_names`` (when present) verified against the
-    model's positional signature, per-component parameter vectors of
-    the right length with finite values
+    raise, never fudge): ``record_version`` known AND structurally
+    consistent with the content (v1 asserts "no terms", v2 asserts
+    "terms present" — a record whose version contradicts its shape is
+    refused, not read by content with the claim ignored), model code
+    in the registry, ``param_names`` (when present) verified against
+    the model's positional signature, per-component parameter vectors
+    of the right length with finite values
     (:meth:`~gps_analysis.models.TrajectoryParams.from_record`). Step
     epochs re-augment the model via
     :func:`~gps_analysis.fitting.with_steps`, so the returned callable
@@ -1067,9 +1070,11 @@ def trajectory_from_record(
         ready for :func:`~gps_analysis.fitting.remove_trend`.
 
     Raises:
-        ValueError: On an unknown ``record_version``, an unregistered
-            model code, a ``param_names`` mismatch, no components, a
-            parameter-count mismatch, or non-finite parameters.
+        ValueError: On an unknown ``record_version``, a version that
+            contradicts the record's structure (v1 with a ``terms``
+            key, v2 without one), an unregistered model code, a
+            ``param_names`` mismatch, no components, a parameter-count
+            mismatch, or non-finite parameters.
 
     Reference:
         Design spec ``docs/DESIGN_live_detrending.md`` §3.2/§4.1/§5.2.
@@ -1086,6 +1091,27 @@ def trajectory_from_record(
         )
     model_name = record.get("model")
     term_spec = record.get("terms")
+    # The version must MATCH the structure, not merely be a supported number.
+    # The branch below dispatches on the terms key, so without this check the
+    # version claim was decorative: a v1 record that acquired a terms list was
+    # evaluated FROM those terms -- and with param_names absent (it is checked
+    # only "when present") and the parameter counts agreeing, a degree-5
+    # polynomial spec read against lineperiodic parameters evaluated without
+    # complaint, ~2e16 mm wrong (measured). The stripped-terms converse only
+    # raised by the naming accident that "+"-joined term kinds never collide
+    # with a registry code.
+    if term_spec is not None and version != RECORD_VERSION_TERMS:
+        raise ValueError(
+            f"record_version {version!r} record carries a 'terms' key; a "
+            f"record with terms must declare record_version "
+            f"{RECORD_VERSION_TERMS}"
+        )
+    if term_spec is None and version == RECORD_VERSION_TERMS:
+        raise ValueError(
+            f"record_version {RECORD_VERSION_TERMS} record has no 'terms' "
+            f"list; version {RECORD_VERSION_TERMS} exists precisely because "
+            f"such a model cannot be rebuilt from its code alone"
+        )
     step_epochs = np.asarray(record.get("step_epochs", []), dtype=np.float64)
 
     if term_spec is not None:
