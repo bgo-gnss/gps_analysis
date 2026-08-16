@@ -753,10 +753,6 @@ def estimate_staged(
                 p, cov = full_p, full_c
             stage_params.append(p)
             stage_cov.append(cov)
-            # the last stage that FREED a term owns its value
-            composed[c][free_mask] = p[free_mask]
-            fi = np.flatnonzero(free_mask)
-            composed_cov[c][np.ix_(fi, fi)] = cov[np.ix_(fi, fi)]
 
         result = StageResult(
             name=stage.name,
@@ -772,12 +768,40 @@ def estimate_staged(
         by_stage[stage.name] = result
         results.append(result)
 
-    # anything only ever HELD in the final stage keeps that stage's value
-    final = results[-1]
+    # Composition is by OWNERSHIP: the last stage that freed a coefficient owns
+    # it, and anything only ever HELD in the final stage is owned by that stage
+    # (which is what the `owner.all()` check above guarantees is exhaustive).
+    #
+    # Values were previously written stage-by-stage and the covariance with
+    # them, block by block -- which quietly composed ONE matrix out of SEVERAL
+    # estimators.  A cross-block between two coefficients owned by different
+    # stages was left holding whatever an earlier stage wrote, even when both
+    # of its own diagonal blocks had since been overwritten: an off-diagonal
+    # from a fit whose parameters were discarded.  Measured on a two-stage
+    # lineperiodic plan (A frees secular+periodic, B re-frees periodic holding
+    # A's secular), composed cov[rate, cos_annual] was A's -0.0031 while the
+    # cos_annual variance was B's -- B's own value is +0.356, a factor 100 and
+    # a sign away.
+    #
+    # An off-diagonal is only meaningful when ONE estimator produced both
+    # coefficients, so it survives only when the owners agree.  Where they do
+    # -- the ordinary case, since `fit_held_partition` returns a full P x P
+    # covariance spanning the final stage's free AND held blocks -- the whole
+    # joint block is taken from that stage, cross terms included.  Where they
+    # do not, no estimator ever formed the covariance and zero is the honest
+    # answer: it understates (asserts independence across stages), the same
+    # direction as the conditional-covariance caveat documented on
+    # `fit_held_partition`, and it never asserts a number nothing computed.
+    owner = np.full(n_params, -1, dtype=np.int64)
+    for k, r in enumerate(results):
+        owner[r.free_mask] = k
+    owner[results[-1].held_mask] = len(results) - 1
     for c in range(n_components):
-        composed[c][final.held_mask] = final.params[c][final.held_mask]
-        hi = np.flatnonzero(final.held_mask)
-        composed_cov[c][np.ix_(hi, hi)] = final.covariance[c][np.ix_(hi, hi)]
+        for k, r in enumerate(results):
+            sel = np.flatnonzero(owner == k)
+            if sel.size:
+                composed[c][sel] = r.params[c][sel]
+                composed_cov[c][np.ix_(sel, sel)] = r.covariance[c][np.ix_(sel, sel)]
 
     label: list[str | None] = (
         list(names) if names is not None else [None] * n_components

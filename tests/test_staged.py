@@ -707,8 +707,8 @@ class TestGroupVocabulary:
         import numpy as np
 
         from gps_analysis import (
-            ExpTransient,
             GROUP_ORDER,
+            ExpTransient,
             LogTransient,
             Polynomial,
             Seasonal,
@@ -729,3 +729,131 @@ class TestGroupVocabulary:
         mf = tm.as_modelfunc()
         for g in GROUP_ORDER:
             assert np.array_equal(tm.group_mask(g), group_parameter_mask(mf, g)), g
+
+
+class TestComposedCovarianceOwnership:
+    """One composed matrix must not be assembled from several estimators.
+
+    The composed covariance used to be written block by block as the stages
+    ran, so a cross-block between two coefficients owned by DIFFERENT stages
+    kept whatever an earlier stage had written there — even after both of its
+    diagonal blocks were overwritten. The result was an off-diagonal from a
+    fit whose parameters had been discarded, in a matrix whose variances came
+    from somewhere else. Diagonals looked right, which is why it survived.
+    """
+
+    @staticmethod
+    def _series(n: int = 900) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        rng = np.random.default_rng(3)
+        t = 2020.0 + np.arange(n) / 365.25
+        y = -8.0 + 4.0 * (t - 2020.0) + 2.0 * np.cos(2 * np.pi * t)
+        y = y + rng.normal(0.0, 0.5, t.size)
+        return t, y, np.full_like(y, 0.5)
+
+    def test_cross_block_comes_from_the_owning_stage_not_a_discarded_one(
+        self,
+    ) -> None:
+        t, y, s = self._series()
+        plan = (
+            Stage(name="A", free=("secular", "periodic"), held={}, segments=None),
+            Stage(
+                name="B",
+                free=("periodic",),
+                held={"secular": HeldFromStage("A")},
+                segments=((2020.5, None),),
+            ),
+        )
+        est = estimate_staged("lineperiodic", t, y, s, plan=plan, absolute_sigma=True)
+        cov = est.fits[0].covariance
+        a_cov, b_cov = est.stages[0].covariance[0], est.stages[1].covariance[0]
+        sec, per = [0, 1], [2, 3, 4, 5]
+
+        # B owns everything here: it freed the periodic terms and holds the
+        # secular ones, so `fit_held_partition`'s full P x P covariance IS the
+        # joint one for the composed values.
+        assert np.array_equal(cov[np.ix_(sec, per)], b_cov[np.ix_(sec, per)])
+        assert not np.allclose(
+            cov[np.ix_(sec, per)], a_cov[np.ix_(sec, per)], atol=1e-4
+        )
+        # and the two really do disagree — this is not a distinction without
+        # a difference (offset x sin_annual: A -0.0031 vs B +0.356, a factor
+        # 100 and a sign apart)
+        assert a_cov[0, 3] * b_cov[0, 3] < 0
+        assert abs(b_cov[0, 3]) > 50 * abs(a_cov[0, 3])
+
+    def test_held_free_cross_terms_survive_composition(self) -> None:
+        """The Askja plan's cross-block used to be dropped, not merely stale.
+
+        With A freeing secular and B freeing periodic while holding it, the
+        old block-by-block write touched only [secular, secular] and
+        [periodic, periodic], so the secular x periodic terms stayed at their
+        initialized zero — discarding exactly the coupling
+        ``fit_held_partition`` had propagated. Taking B's whole joint block
+        keeps it (offset x sin_semiannual: 0 -> -0.75).
+        """
+        t, y, s = self._series()
+        plan = (
+            Stage(name="A", free=("secular",), held={}, segments=((2020.0, 2021.5),)),
+            Stage(
+                name="B",
+                free=("periodic",),
+                held={"secular": HeldFromStage("A")},
+                segments=None,
+            ),
+        )
+        est = estimate_staged("lineperiodic", t, y, s, plan=plan, absolute_sigma=True)
+        cov = est.fits[0].covariance
+        sec, per = [0, 1], [2, 3, 4, 5]
+        assert np.any(cov[np.ix_(sec, per)] != 0.0)
+        assert np.array_equal(
+            cov[np.ix_(sec, per)], est.stages[1].covariance[0][np.ix_(sec, per)]
+        )
+
+    def test_disjoint_owners_get_zero_rather_than_a_borrowed_number(self) -> None:
+        """No estimator formed that covariance, so nothing may be asserted.
+
+        Zero understates (it claims independence across stages), the same
+        direction as the documented conditional-covariance caveat — but it
+        never states a number that no fit computed.
+        """
+        t, y, s = self._series()
+        plan = (
+            Stage(name="A", free=("secular",), held={}, segments=((2020.0, 2021.5),)),
+            Stage(name="B", free=("periodic",), held={}, segments=None),
+        )
+        est = estimate_staged("lineperiodic", t, y, s, plan=plan, absolute_sigma=True)
+        cov = est.fits[0].covariance
+        sec, per = [0, 1], [2, 3, 4, 5]
+        assert np.all(cov[np.ix_(sec, per)] == 0.0)
+        # the diagonal blocks still come from their own owners
+        assert np.array_equal(
+            cov[np.ix_(sec, sec)], est.stages[0].covariance[0][np.ix_(sec, sec)]
+        )
+        assert np.array_equal(
+            cov[np.ix_(per, per)], est.stages[1].covariance[0][np.ix_(per, per)]
+        )
+
+    def test_values_are_untouched_by_the_covariance_fix(self) -> None:
+        """Ownership was already right for the PARAMETERS; only cov was not.
+
+        Pinned because the rewrite derives both from one ``owner`` array: if
+        that array were wrong, the stored science would move, and this is the
+        assertion that would say so.
+        """
+        t, y, s = self._series()
+        plan = (
+            Stage(name="A", free=("secular",), held={}, segments=((2020.0, 2021.5),)),
+            Stage(
+                name="B",
+                free=("periodic",),
+                held={"secular": HeldFromStage("A")},
+                segments=None,
+            ),
+        )
+        est = estimate_staged("lineperiodic", t, y, s, plan=plan, absolute_sigma=True)
+        a, b = est.stages[0].params[0], est.stages[1].params[0]
+        composed = est.fits[0].params
+        # secular from the stage that freed it, periodic from the one that did
+        assert np.array_equal(composed[[0, 1]], b[[0, 1]])  # held -> final stage
+        assert np.allclose(composed[[0, 1]], a[[0, 1]])  # == what A fitted
+        assert np.array_equal(composed[2:], b[2:])
