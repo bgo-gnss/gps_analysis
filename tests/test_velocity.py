@@ -991,3 +991,79 @@ class TestEstimateVelocityMIDAS:
         estimate_velocity_midas(t, y)
         np.testing.assert_array_equal(t, t0)
         np.testing.assert_array_equal(y, y0)
+
+
+class TestRateSlotIsCheckedByName:
+    """``params[1]`` is the rate only for a model carrying a polynomial.
+
+    ``GROUP_ORDER``'s stable sort guarantees ``param_names[1] == "rate"`` for
+    a model that HAS a polynomial term; a model without one has whatever its
+    first term put there. The guard tested only ``n_params >= 2``, so a
+    seasonal-only model (four parameters) sailed through and every velocity
+    product built on it returned ``sin_annual`` — a seasonal amplitude in mm
+    — as a secular rate in mm/yr, with ``sqrt(C_11)`` as its formal sigma.
+    Right units, right order of magnitude, wrong quantity.
+
+    Reachable only through the CALLABLE path: ``estimate_velocity``'s string
+    API knows just ``linear`` and ``lineperiodic``, both of which do carry a
+    polynomial. The registry's ``"periodic"`` reaches the estimators via
+    ``detrend``/``staged``, not by name here.
+    """
+
+    @staticmethod
+    def _seasonal_series() -> tuple[np.ndarray, np.ndarray]:
+        t = np.linspace(2020.0, 2024.0, 400)
+        return t, 2.0 * np.cos(2 * np.pi * t)
+
+    def test_the_registry_periodic_model_has_no_velocity_to_estimate(self) -> None:
+        from gps_analysis.detrend import _resolve_model
+
+        model_func, _ = _resolve_model("periodic")
+        t, y = self._seasonal_series()
+        with pytest.raises(ValueError, match="no secular rate"):
+            estimate_velocity(t, y, model=model_func)
+
+    def test_a_composed_model_without_a_polynomial_is_refused_too(self) -> None:
+        """Not a registry special case — the same hole via TrajectoryModel."""
+        from gps_analysis import Seasonal, Step, TrajectoryModel
+
+        model = TrajectoryModel((Seasonal(n_harmonics=2), Step(epoch=2022.0)))
+        t, y = self._seasonal_series()
+        with pytest.raises(ValueError, match="no secular rate"):
+            estimate_velocity(t, y, model=model.as_modelfunc())
+
+    def test_models_that_do_carry_a_polynomial_still_pass(self) -> None:
+        from gps_analysis import Polynomial, Seasonal, Step, TrajectoryModel
+
+        t = np.linspace(2020.0, 2024.0, 400)
+        y = 1.0 + 3.0 * (t - 2020.0)
+        for model in ("linear", "lineperiodic"):
+            est = estimate_velocity(t, y, model=model)
+            assert est.rates[0] == pytest.approx(3.0, rel=0.05)
+        # the composed case is asserted on the guard itself: a full estimate
+        # here would be measuring absolute-yearf conditioning, not the check
+        from gps_analysis.velocity import _rate_param_count
+
+        composed = TrajectoryModel(
+            (Polynomial(degree=1), Seasonal(n_harmonics=2), Step(epoch=2022.0))
+        )
+        assert _rate_param_count(composed.as_modelfunc()) == 7
+
+    def test_an_unintrospectable_callable_keeps_the_old_count_contract(self) -> None:
+        """Only models whose names CAN be read are name-checked.
+
+        A caller passing its own ``model(t, a, b)`` is not broken by
+        tightening the guard — the names are read, they are simply not
+        ``"rate"``-by-convention, so anything spelled ``rate`` still passes
+        and a bare positional model still reports on the count.
+        """
+        t = np.linspace(2020.0, 2024.0, 400)
+        # a little noise: an EXACT fit leaves curve_fit no residual to form a
+        # covariance from, and this path has no linear-design fast lane
+        y = 1.0 + 3.0 * (t - 2020.0) + np.random.default_rng(1).normal(0, 0.1, t.size)
+
+        def own_model(tt, offset, rate):  # type: ignore[no-untyped-def]
+            return offset + rate * (np.asarray(tt) - 2020.0)
+
+        est = estimate_velocity(t, y, model=own_model)
+        assert est.rates[0] == pytest.approx(3.0, rel=0.05)

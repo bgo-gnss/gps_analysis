@@ -200,11 +200,40 @@ def _resolve_model(model: str | ModelFunc) -> ModelFunc:
 
 
 def _rate_param_count(model_func: ModelFunc) -> int:
-    """Parameter count P of the model, requiring the rate slot to exist."""
+    """Parameter count P of the model, requiring slot 1 to BE the rate.
+
+    Counting parameters is not the check.  ``terms.GROUP_ORDER``'s guarantee
+    is that a model *carrying a polynomial* has ``param_names[1] == "rate"``;
+    a model without one has whatever its first term put there.  The registry's
+    ``"periodic"`` is exactly that case — four parameters, so the old
+    ``n_params >= 2`` test passed, and ``params[1]`` is ``sin_annual``.  Every
+    velocity product built on it then reported a seasonal sine amplitude [mm]
+    as a secular rate [mm/yr], with ``sqrt(C_11)`` as its formal sigma, in the
+    right units and the right order of magnitude.
+
+    So the slot is checked by NAME.  A model whose signature does not expose
+    names is accepted on the count alone — the same contract as before for
+    callers passing their own ``model(t, *p)``; only the ones that can be
+    checked are.
+    """
     n_params = _n_model_params(model_func)
     if n_params < _RATE_INDEX + 1:
         raise ValueError(
             "model must have at least 2 parameters - params[1] is the secular rate"
+        )
+    from .detrend import _param_names
+
+    try:
+        names = _param_names(model_func)
+    except (TypeError, ValueError):  # pragma: no cover - unintrospectable callable
+        return n_params
+    if len(names) == n_params and names[_RATE_INDEX] != "rate":
+        raise ValueError(
+            f"model has no secular rate: params[{_RATE_INDEX}] is "
+            f"{names[_RATE_INDEX]!r}, not 'rate'. A velocity is the secular "
+            f"term's coefficient, so a model without a polynomial (e.g. the "
+            f"registry's 'periodic') has no velocity to estimate — the value "
+            f"in that slot has different units. Parameter names: {names}"
         )
     return n_params
 
