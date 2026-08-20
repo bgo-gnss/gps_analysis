@@ -50,6 +50,7 @@ from gps_analysis.outliers import (
     REASON_LOCAL,
     OutlierParams,
     candidate_clusters,
+    clip_sigma,
     detect_outliers,
     hampel_mask,
     mad_scale,
@@ -368,6 +369,84 @@ class TestStepEvidence:
             step_evidence(t, r, 5, 3, window=1.0, scale=1.0)
         with pytest.raises(ValueError, match="scale"):
             step_evidence(t, r, 3, 5, window=1.0, scale=0.0)
+        with pytest.raises(ValueError, match="max_reach"):
+            step_evidence(t, r, 3, 5, window=1.0, scale=1.0, max_reach=-1.0)
+
+
+class TestFlankNearestK:
+    """§3.4.2a — nearest-k flank fallback, for DATA GAPS only."""
+
+    @staticmethod
+    def _gapped(post_gap_days: float) -> tuple[FloatArr, FloatArr]:
+        """Daily series, spike at index 30, a gap immediately after it."""
+        t = np.concatenate(
+            [
+                _daily_t(31),
+                _daily_t(30, start=2015.0 + (31 + post_gap_days) * DAY),
+            ]
+        )
+        r = np.zeros(t.size)
+        r[30] = 100.0
+        return t, r
+
+    def test_gap_flank_is_nan_without_reach(self) -> None:
+        # 8-day post gap: < 3 epochs inside W = 10 d -> indeterminate. This
+        # is the RHOF 2013.977 shape, and the pre-fix behavior.
+        t, r = self._gapped(8.0)
+        assert math.isnan(step_evidence(t, r, 30, 30, window=10 * DAY, scale=2.0))
+
+    def test_gap_flank_determinate_with_reach(self) -> None:
+        # same series: the fallback reaches past the gap, the series returns
+        # to the model, D ~ 0 -> a blunder, not a step
+        t, r = self._gapped(8.0)
+        d = step_evidence(t, r, 30, 30, window=10 * DAY, scale=2.0, max_reach=60 * DAY)
+        assert d == pytest.approx(0.0)
+
+    def test_reach_beyond_data_stays_nan(self) -> None:
+        # cluster at the series end: no data beyond, the fallback finds
+        # nothing, NaN preserved (test_step_at_series_end depends on this)
+        t = _daily_t(40)
+        r = np.zeros(40)
+        assert math.isnan(
+            step_evidence(t, r, 39, 39, window=10 * DAY, scale=1.0, max_reach=60 * DAY)
+        )
+
+    def test_determinate_flank_untouched_by_reach(self) -> None:
+        # a flank with >= 3 in-window samples must give the IDENTICAL median
+        # whether or not the fallback is enabled
+        t = _daily_t(60)
+        r = np.where(t >= t[30], 5.0, 0.0)
+        fixed = step_evidence(t, r, 30, 30, window=10 * DAY, scale=2.0)
+        reached = step_evidence(
+            t, r, 30, 30, window=10 * DAY, scale=2.0, max_reach=60 * DAY
+        )
+        assert reached == fixed == pytest.approx(2.5)
+
+    def test_excluded_flank_stays_nan(self) -> None:
+        """The transient discriminator: EXCLUDED is not ABSENT.
+
+        A flank whose epochs are all candidates is the signature of a fast
+        transient -- exactly the §3.4 case that must keep protecting.
+        Reaching past them would sample a different part of the signal and
+        manufacture a verdict, so only a genuine data gap earns the
+        fallback.  (Caught by test_transient_survives[10.0] regressing.)
+        """
+        t = _daily_t(60)
+        r = np.zeros(60)
+        exclude = np.zeros(60, dtype=np.bool_)
+        exclude[31:41] = True  # every post-window epoch is a candidate
+        assert math.isnan(
+            step_evidence(
+                t,
+                r,
+                30,
+                30,
+                window=10 * DAY,
+                scale=1.0,
+                exclude=exclude,
+                max_reach=60 * DAY,
+            )
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -498,19 +577,103 @@ class TestDetectionQuality:
         assert sum(counts) <= 15  # measured 9 over these seeds
         assert max(counts) <= 6
 
-    def test_sigma_weighting(self) -> None:
-        # same raw residual: large formal sigma -> not flagged, small
-        # formal sigma -> flagged (studentization works, §3.1)
+    @staticmethod
+    def _coinflated_fixture():
+        """Same raw residual, one epoch carrying an inflated formal sigma.
+
+        Proportions follow the real case this exists for — RHOF 2023-02-28
+        Up: an 83 mm residual (~26x the median sigma) at a sigma 4.1x the
+        median. A spike only ~6x the median sigma is too small to clear k_g
+        once capped, so a fixture built at that scale would pin nothing.
+        """
         t, y = _white_series(1000, 6)
-        sigma = np.full(1000, WN)
         i_noisy, i_quiet = 300, 700
         y2 = y.copy()
-        y2[[i_noisy, i_quiet]] += 6 * WN
-        sigma2 = sigma.copy()
-        sigma2[i_noisy] = 6 * WN
-        res = detect_outliers(lineperiodic, t, y2, sigma2)
+        y2[[i_noisy, i_quiet]] += 15 * WN
+        sigma2 = np.full(1000, WN)
+        sigma2[i_noisy] = 4 * WN
+        return t, y2, sigma2, i_noisy, i_quiet
+
+    def test_sigma_weighting_default(self) -> None:
+        # §3.1 as originally specified: large formal sigma -> not flagged,
+        # small -> flagged. Kept, with the clip made EXPLICIT rather than
+        # implicit, because this behaviour is still correct at the default —
+        # it is only the DESIRABILITY of the default that §13 disputes.
+        t, y2, sigma2, i_noisy, i_quiet = self._coinflated_fixture()
+        res = detect_outliers(
+            lineperiodic, t, y2, sigma2, params=OutlierParams(whiten_sigma_clip=0.0)
+        )
         assert not bool(res.flags[i_noisy])
         assert bool(res.flags[i_quiet])
+
+    def test_sigma_clip_releases_coinflated_epoch(self) -> None:
+        # §13: the SAME fixture with the whitening denominator capped. The
+        # co-inflated epoch is no longer excused by its own sigma. This is the
+        # behaviour DoD 2 requires, pinned separately rather than by editing
+        # the assertion above — both are true, at different settings.
+        t, y2, sigma2, i_noisy, i_quiet = self._coinflated_fixture()
+        res = detect_outliers(
+            lineperiodic, t, y2, sigma2, params=OutlierParams(whiten_sigma_clip=1.5)
+        )
+        assert bool(res.flags[i_noisy]), "capped sigma must stop the self-pardon"
+        assert bool(res.flags[i_quiet])
+
+    def test_clip_sigma_primitive(self) -> None:
+        sigma = np.array([1.0, 1.0, 1.0, 10.0, np.nan, 0.0])
+        out = clip_sigma(sigma, 2.0)
+        assert out is not None
+        # median over FINITE POSITIVE entries only (1.0) -> cap 2.0
+        np.testing.assert_allclose(out[:4], [1.0, 1.0, 1.0, 2.0])
+        assert np.isnan(out[4]) and out[5] == 0.0  # sentinels untouched
+        # disabled forms are pass-through
+        np.testing.assert_array_equal(clip_sigma(sigma, 0.0), sigma)
+        assert clip_sigma(None, 1.5) is None
+
+    def test_stage_gating_is_first_class(self) -> None:
+        """§14: each identifier can be switched off explicitly.
+
+        Previously the only way was a sentinel threshold
+        (``global_n_sigma=1e9``) — which does not express intent, cannot be
+        asserted on, and for the protection stage could not express "off" at
+        all, because its indeterminate arm ignored every threshold (§3.4.2a).
+        """
+        t, y = _white_series(1200, 11)
+        idx = _spike_indices(6, 200, 150)
+        y2 = _inject_spikes(y, idx, np.full(6, 12.0 * WN))
+
+        allon = detect_outliers(lineperiodic, t, y2)
+        no_g = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(enable_global=False)
+        )
+        no_w = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(enable_window=False)
+        )
+        neither = detect_outliers(
+            lineperiodic,
+            t,
+            y2,
+            params=OutlierParams(enable_global=False, enable_window=False),
+        )
+        # every subset is a subset of all-on; disabling both leaves nothing
+        assert set(np.flatnonzero(no_g.flags)) <= set(np.flatnonzero(allon.flags))
+        assert set(np.flatnonzero(no_w.flags)) <= set(np.flatnonzero(allon.flags))
+        assert int(neither.candidates.sum()) == 0
+        assert int(neither.flags.sum()) == 0
+        # diagnostics stay populated for a disabled stage -- attribution is
+        # the point, and blanking them would defeat it
+        assert np.isfinite(neither.z).any()
+        assert float(neither.scale_global[0]) > 0.0
+
+    def test_protection_off_promotes_every_candidate(self) -> None:
+        """§14: with S5 off, flags == candidates exactly."""
+        t, y = _white_series(1500, 12)
+        i0 = 900
+        y2 = _inject_step(t, y, float(t[i0]), 40.0)  # would normally protect
+        res = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(enable_protection=False)
+        )
+        np.testing.assert_array_equal(res.flags, res.candidates)
+        assert int(res.protected.sum()) == 0
 
     def test_qn_matches_mad_flags(self) -> None:
         # identical flag sets for well-separated spikes (§8.2)
@@ -743,6 +906,122 @@ class TestSignalProtection:
         assert not res.excess_flag_abort
         assert np.all(res.flags[idx])  # blunder cluster flagged
         assert not np.any(res.protected[idx] & PROTECT_RUN)  # run-rule released
+
+
+class TestIndeterminatePolicy:
+    """§3.4.2a — the NaN arm is a policy, separate from the threshold."""
+
+    @staticmethod
+    def _spike_before_gap() -> tuple[FloatArr, FloatArr, int]:
+        """Isolated spike on the last epoch before an 8-day data gap.
+
+        The RHOF 2013.977 shape in miniature: span 0 (so the run rule
+        cannot fire) and a post-flank too thin to measure, so D is NaN
+        and only the indeterminate policy decides.
+        """
+        n1, gap = 400, 8.0
+        t = np.concatenate(
+            [_daily_t(n1), _daily_t(400, start=2015.0 + (n1 + gap) * DAY)]
+        )
+        rng = np.random.default_rng(9)
+        y = lineperiodic(t, *TRUE_LP) + rng.normal(0.0, WN, t.size)
+        i = n1 - 1
+        y[i] += 140.0
+        return t, y, i
+
+    def test_indeterminate_protects_by_default(self) -> None:
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(step_flank_max_reach_days=0.0)
+        )
+        assert res.candidates[i] and not res.flags[i]
+        assert res.protected[i] & PROTECT_STEP
+
+    def test_threshold_alone_cannot_disable_the_nan_arm(self) -> None:
+        """The defect this switch exists for: k_step -> inf still protects."""
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(
+            lineperiodic,
+            t,
+            y,
+            params=OutlierParams(
+                step_flank_max_reach_days=0.0, step_evidence_sigma=1e6
+            ),
+        )
+        assert not res.flags[i]
+        assert res.protected[i] & PROTECT_STEP
+
+    def test_switch_off_flags_the_spike(self) -> None:
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(
+            lineperiodic,
+            t,
+            y,
+            params=OutlierParams(
+                step_flank_max_reach_days=0.0, protect_on_indeterminate=False
+            ),
+        )
+        assert res.flags[i]
+        assert not (res.protected[i] & PROTECT_STEP)
+
+    def test_nearest_k_fallback_reaches_the_same_verdict(self) -> None:
+        """§3.4.2a: with the gap bridged, D is measurable and ~0 -> flagged.
+
+        The point of fix 2 over fix 1: the spike is flagged because the
+        evidence says "returns to the model", not because protection was
+        switched off wholesale.
+        """
+        t, y, i = self._spike_before_gap()
+        res = detect_outliers(lineperiodic, t, y)  # 60 d reach is the default
+        assert res.flags[i]
+
+
+class TestMagnitudeRatioRelease:
+    """§3.4.2b — release a step protection the excursion dwarfs."""
+
+    @staticmethod
+    def _spike_on_step(step_amp: float, spike: float) -> tuple[FloatArr, FloatArr, int]:
+        rng = np.random.default_rng(11)
+        n = 1500
+        t = _daily_t(n)
+        y = lineperiodic(t, *TRUE_LP) + rng.normal(0.0, WN, n)
+        i0 = 900
+        y = y + step_amp * (t >= t[i0])
+        y[i0] += spike
+        return t, y, i0
+
+    def test_off_by_default(self) -> None:
+        assert OutlierParams().step_magnitude_ratio == 0.0
+
+    def test_big_spike_on_small_step_is_released(self) -> None:
+        # 250 mm spike on a 16 mm step: D = 3.09 clears k_step and protects
+        # the spike by a step it dwarfs (~30x)
+        t, y, i0 = self._spike_on_step(16.0, 250.0)
+        protected_run = detect_outliers(lineperiodic, t, y)
+        assert not protected_run.flags[i0]
+        assert protected_run.protected[i0] & PROTECT_STEP
+
+        released = detect_outliers(
+            lineperiodic, t, y, params=OutlierParams(step_magnitude_ratio=5.0)
+        )
+        assert released.flags[i0]
+        assert not (released.protected[i0] & PROTECT_STEP)
+
+    def test_silent_on_the_indeterminate_branch(self) -> None:
+        """No measured step => nothing to compare => protection stands.
+
+        A real step at the series end has D = NaN (no post flank at all),
+        which is where genuine steps are protected; the ratio rule must
+        not touch it.
+        """
+        n = 2000
+        t, y = _white_series(n, 3)
+        i0 = 1920
+        y2 = _inject_step(t, y, float(t[i0]), 40.0)
+        res = detect_outliers(
+            lineperiodic, t, y2, params=OutlierParams(step_magnitude_ratio=5.0)
+        )
+        assert int(res.flags[i0 - 30 :].sum()) == 0
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from gps_analysis.baseline import (
     estimate_step_offset,
     remove_offset,
     slice_window,
+    slice_windows,
 )
 from gps_analysis.fitting import fit_components
 from gps_analysis.models import TrajectoryParams, linear
@@ -175,3 +176,62 @@ class TestEstimateStepOffset:
         (fit_after,) = fit_components(linear, t[after_mask] - 2020.0, y[after_mask])
         step = estimate_step_offset(linear, fit_before, fit_after, epoch=1.0)
         assert step == pytest.approx(true_step, abs=0.3)
+
+
+class TestSliceWindows:
+    """The union of J windows (MATH_STANDARDS §4)."""
+
+    def test_single_segment_is_bit_identical_to_slice_window(self) -> None:
+        """The whole backward-compatibility argument, asserted exactly.
+
+        Every existing single-window caller keeps its behaviour only if
+        ``slice_windows(t, [(a, b)])`` IS ``slice_window(t, a, b)`` -- not
+        approximately, not usually. Exact boolean equality, no tolerance,
+        across open bounds and bounds that fall exactly on a sample.
+        """
+        t = 2000.0 + np.arange(4000) / 365.25
+        for a, b in [
+            (None, None),
+            (2003.0, None),
+            (None, 2007.5),
+            (2002.25, 2008.75),
+            (float(t[10]), float(t[900])),
+        ]:
+            assert np.array_equal(slice_windows(t, [(a, b)]), slice_window(t, a, b))
+
+    def test_is_the_or_of_its_segments(self) -> None:
+        """Property: the union is exactly the OR, for any segment set."""
+        rng = np.random.default_rng(11)
+        t = 2000.0 + np.arange(2000) / 365.25
+        for _ in range(20):
+            bounds = np.sort(rng.uniform(2000.0, 2005.5, size=6))
+            segs = [(bounds[0], bounds[3]), (bounds[2], bounds[5])]  # overlapping
+            expected = np.logical_or.reduce([slice_window(t, a, b) for a, b in segs])
+            assert np.array_equal(slice_windows(t, segs), expected)
+
+    def test_overlapping_segments_are_idempotent(self) -> None:
+        t = 2000.0 + np.arange(1000) / 365.25
+        merged = slice_windows(t, [(2000.5, 2002.0)])
+        split = slice_windows(t, [(2000.5, 2001.4), (2001.2, 2002.0)])
+        assert np.array_equal(merged, split)
+
+    def test_excised_gap_is_excluded(self) -> None:
+        t = 2000.0 + np.arange(2000) / 365.25
+        mask = slice_windows(t, [(2000.5, 2002.0), (2003.0, 2005.0)])
+        inside_gap = (t > 2002.0 + 1e-3) & (t < 3000.0) & (t < 2003.0 - 1e-3)
+        assert not mask[inside_gap].any()
+
+    def test_empty_sequence_raises_rather_than_meaning_everything(self) -> None:
+        """The trap this guard exists for.
+
+        The union of zero sets is the empty mask, but a caller who lost its
+        segments to a config typo would read an all-False mask as "no epochs"
+        and an all-True one as "no restriction". Neither is a fit anyone
+        asked for, so refuse; the identity element is ``[(None, None)]``.
+        """
+        with pytest.raises(ValueError, match=r"\[\(None, None\)\]"):
+            slice_windows(np.arange(10.0), [])
+
+    def test_inverted_segment_raises_naming_the_index(self) -> None:
+        with pytest.raises(ValueError, match="segment 1"):
+            slice_windows(np.arange(10.0), [(1.0, 2.0), (5.0, 3.0)])

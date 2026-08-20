@@ -48,6 +48,7 @@ __all__ = [
     "estimate_step_offset",
     "remove_offset",
     "slice_window",
+    "slice_windows",
 ]
 
 #: Legacy window tolerance of ``dPeriod``: 0.001 yr ≈ 8.77 h.
@@ -104,6 +105,76 @@ def slice_window(
         mask &= tt > start - tol
     if end is not None:
         mask &= tt < end + tol
+    return mask
+
+
+def slice_windows(
+    t: ArrayLike,
+    segments: Sequence[tuple[float | None, float | None]],
+    *,
+    tol: float = _DEFAULT_TOL,
+) -> NDArray[np.bool_]:
+    """Compute the sample mask of a UNION of J time windows.
+
+    Equation:
+        ``mᵢ = ⋁_{j=1..J} [ (tᵢ > a_j − δ) ∧ (tᵢ < b_j + δ) ]``
+
+    (either bound of any segment may be absent, in which case that
+    conjunct is dropped, exactly as in :func:`slice_window`).
+
+    Symbols → args:
+        - ``tᵢ``       → ``t``: epochs, fractional years (``yearf``) [yr]
+        - ``a_j, b_j`` → ``segments[j]``: segment bounds [yr]; ``None`` =
+          open
+        - ``δ``        → ``tol``: boundary tolerance [yr]
+
+    Args:
+        t: Epochs, shape (N,) [yr].
+        segments: Non-empty sequence of ``(start, end)`` bounds [yr]. The
+            identity element — "no restriction" — is ``[(None, None)]``,
+            NOT the empty sequence; see Raises.
+        tol: Boundary tolerance δ [yr], applied per segment bound.
+
+    Returns:
+        Boolean mask, shape (N,) — True inside the union.
+
+    Raises:
+        ValueError: On an empty ``segments`` (the union of zero sets is
+            the empty mask, but reading that as "no restriction" would
+            turn a config typo into a silent full-series fit), or a
+            segment whose ``end <= start``, naming the index.
+
+    Reference:
+        J-fold composition of :func:`slice_window` (legacy ``dPeriod``
+        semantics), by the same union-of-intervals idiom used for the
+        protect windows of :mod:`gps_analysis.outliers`.
+
+    Numerical notes:
+        Pure comparison, O(J·N); ``t`` need not be sorted. NaN epochs
+        compare False in every segment and are excluded. Overlapping
+        segments are idempotent under ``∨``. The tolerance is applied per
+        segment bound, so an epoch within δ of an interior boundary is
+        kept by BOTH flanking segments — harmless under ``∨``, but it
+        means the per-segment masks may overlap by up to δ even when the
+        intervals do not.
+
+        **J = 1 is bit-identical to** ``slice_window(t, a, b, tol=tol)``
+        — this function delegates rather than re-deriving the
+        comparisons, and that identity is the backward-compatibility
+        contract every single-window caller relies on.
+    """
+    if len(segments) == 0:
+        raise ValueError(
+            "segments must not be empty; the identity element is [(None, None)], not []"
+        )
+    mask = np.zeros(np.asarray(t, dtype=np.float64).shape, dtype=np.bool_)
+    for j, (start, end) in enumerate(segments):
+        if start is not None and end is not None and end <= start:
+            raise ValueError(
+                f"segment {j} has end {end} <= start {start}; segment bounds "
+                f"must be increasing"
+            )
+        mask |= slice_window(t, start, end, tol=tol)
     return mask
 
 

@@ -63,6 +63,11 @@ into the estimator — so the reader can follow the flow top-down before reading
   GRL, 2023GL103432 (+ Supporting Information, Table S2 priors). (GBIS4TS.)
 - **Blewitt & Lavallée 2002** — *Effect of annual signals on geodetic velocity*,
   JGR 107(B7). (annual/semiannual terms in `lineperiodic`; why window length matters.)
+- **Blewitt et al. 2016** — G. Blewitt, C. Kreemer, W.C. Hammond, J. Gazeaux, *MIDAS
+  robust trend estimator for accurate GPS station velocities without step detection*,
+  JGR Solid Earth 121, 2054–2068, doi:10.1002/2015JB012552. (eqs. (1)–(8) + §2.4
+  relaxed pair selection — `estimate_velocity_midas` and its atomic pieces; the
+  §2.4 bookkeeping ported for parity with the reference `midas.f`, MIDAS4.)
 - **Segall 2010** — *Earthquake and Volcano Deformation* (Princeton). (Mogi/Okada,
   trajectory models — backburnered lane, cite when it revives.)
 - **Hosking 1981** — J.R.M. Hosking, *Fractional differencing*, Biometrika 68(1),
@@ -112,8 +117,55 @@ into the estimator — so the reader can follow the flow top-down before reading
 - **Koch 1999** — *Parameter Estimation and Hypothesis Testing in Linear Models*
   (2nd ed., Springer), ch. 3. (Helmert variance component estimation, partial
   redundancies — `variance_components`.)
-- Add domain refs (Hackl et al., Bevis & Brown trajectory model, Hector) as used —
-  always with the specific equation/section.
+- **Golub & Pereyra 1973** — G.H. Golub & V. Pereyra, *The differentiation of
+  pseudo-inverses and nonlinear least squares problems whose variables separate*,
+  SIAM J. Numer. Anal. 10(2), 413–432. (the variable-projection method —
+  concentration of the linear amplitudes; `varpro`.)
+- **O'Leary & Rust 2013** — D.P. O'Leary & B.W. Rust, *Variable projection for
+  nonlinear least squares problems*, Comput. Optim. Appl. 54(3), 579–593, eq. (8)
+  p. 585 (VARPRO Jacobian `J = −(A + B)`), §2.5 pp. 586–587 (`H = W[Φ, J]`
+  bordered-matrix covariance — never JᵀJ, which conditions on the amplitudes; dof
+  `m−n−q`), §3.1 pp. 588–589 (cost of the Kaufman approximation) — verified against
+  the primary source. (`varpro._varpro_jacobian`, `varpro._bordered_covariance`.)
+- **Kaufman 1975** — L. Kaufman, *A variable projection method for solving separable
+  nonlinear least squares problems*, BIT 15(1), 49–57. (the dropped-B-term Jacobian
+  approximation — cited as what `varpro` deliberately does NOT use; the gradient is
+  blind to the B term but Gauss–Newton iteration counts and the covariance are not.)
+- **Venzon & Moolgavkar 1988** — D.J. Venzon & S.H. Moolgavkar, *A method for
+  computing profile-likelihood-based confidence intervals*, J. R. Stat. Soc. C 37(1),
+  87–94. (the Δχ²=1 profile interval — `varpro._profile_interval`.)
+- **Bevis & Brown 2014** — M. Bevis & A. Brown, *Trajectory models and reference
+  frames for crustal motion geodesy*, J. Geodesy 88(3), 283–311,
+  doi:10.1007/s00190-013-0685-5. (eq. (3) Heaviside `H(0)=1/2` — documented
+  divergence: this package's `terms.Step` pins `H(0)=1` for `with_steps`
+  byte-parity; eq. (8) SLTM; eq. (9) the logarithmic transient
+  `A·log(1+Δt/T)`; eq. (10) ETM composition + the `Δt = 0 for t < t_EQ`
+  convention; §5.2 τ as station metadata, default `T = 1 yr` (the ELTM),
+  refined per station by a 1-D nonlinear search; Appendix 1 the
+  T-insensitivity of the composed fit — `terms.LogTransient`,
+  `terms.profile_transient_tau`. ⚠ The paper contains **no exponential
+  transient** — do not cite it for one; see `reference/papers/README.md`.)
+- **Reverso et al. 2014** — T. Reverso, J. Vandemeulebrouck, F. Jouanne,
+  V. Pinel, T. Villemin, E. Sturkell & P. Bascou, *A two-magma chamber model
+  as a source of deformation at Grímsvötn Volcano, Iceland*, JGR Solid Earth
+  119, 4666–4683, doi:10.1002/2013JB010569. (eq. (20) the fitted
+  posteruptive form `Φ·(1−e^(−t/τ)) + U̇_∞·t + C` — `terms.ExpTransient`,
+  and `models.exp_linear` reparameterized (`A_expl = −Φ`, `k = 1/τ`,
+  `x₀ = C + Φ`); eqs. (11)–(12) each reservoir overpressure = exponential +
+  linear, `τ = 1/ξ` from inter-reservoir re-equilibration; eq. (17)
+  displacement linear in overpressure; measured `τ = 0.33 ± 0.08` /
+  `0.13 ± 0.04 yr` at Grímsvötn.)
+- **Belsley, Kuh & Welsch 1980** — *Regression Diagnostics: Identifying
+  Influential Data and Sources of Collinearity* (Wiley), ch. 3. (condition
+  indices + variance-decomposition proportions; the η ≥ 30 with two π ≥ 0.5
+  near-dependency reading — `terms.bkw_dependencies`, the localizer attached
+  to `terms.check_transient_identifiability` failures.)
+- **Belsley 1984** — D.A. Belsley, *Demeaning conditioning diagnostics through
+  centering*, Am. Stat. 38(2), 73–77. (the diagnosis must run on the
+  **uncentered**, column-equilibrated design — centering hides every
+  dependency the intercept participates in.)
+- Add domain refs (Hackl et al., Hector) as used — always with the specific
+  equation/section.
 
 ## 6. Derived products
 Any product written to the store (velocities, break epochs, detrended series, model

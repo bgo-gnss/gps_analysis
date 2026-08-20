@@ -88,7 +88,7 @@ import numpy as np
 from numpy.typing import ArrayLike, NDArray
 
 from . import models
-from .baseline import slice_window
+from .baseline import slice_window, slice_windows
 from .fitting import (
     ModelFunc,
     _components_2d,
@@ -107,6 +107,7 @@ __all__ = [
     "DETREND_METHOD_PLAIN",
     "DETREND_METHOD_ROBUST",
     "RECORD_VERSION",
+    "SUPPORTED_RECORD_VERSIONS",
     "DetrendEstimate",
     "apply_detrend",
     "estimate_detrend",
@@ -116,8 +117,31 @@ __all__ = [
 ]
 
 RECORD_VERSION = 1
-"""Version of the leaf's station-record shape (the ``record_version``
-key). Readers must reject unknown versions (design §3.2 rules)."""
+"""Version this writer EMITS for the leaf's station-record shape.
+
+Distinct from what the reader accepts (:data:`SUPPORTED_RECORD_VERSIONS`).
+Keeping the two separate is what lets a future shape ship without a flag day
+for the deployed documents: the writer advances, the reader keeps the older
+branch, and both live in one file (design §3.2 rules)."""
+
+RECORD_VERSION_TERMS = 2
+"""Version emitted when the model carries a TERM SPEC — i.e. terms a model
+code plus ``step_epochs`` cannot express (transients).
+
+Content-determined, not writer-determined: an ordinary model still emits
+:data:`RECORD_VERSION` 1, so the 37 deployed records and every new plain
+record stay byte-identical. Only a record that NEEDS the richer shape gets
+it, which is what keeps v1 readers correct rather than merely tolerated."""
+
+SUPPORTED_RECORD_VERSIONS: frozenset[int] = frozenset(
+    {RECORD_VERSION, RECORD_VERSION_TERMS}
+)
+"""Record versions :func:`trajectory_from_record` can reconstruct.
+
+An exact-equality check would make every shape change a coordinated
+migration of every stored document at once.  Membership makes it additive:
+add the new version here together with its reconstruction branch, and old
+records keep reading BY CONSTRUCTION rather than by argument."""
 
 DETREND_METHOD_ROBUST = "step_augmented_robust"
 """``detrend_method`` provenance tag (design §0.2): outlier-robust
@@ -136,21 +160,72 @@ _MODEL_NAMES: dict[str, ModelFunc] = {
 Only these house models can appear in a stored record — a record must
 be re-evaluable from its ``model`` string alone (design §3.2)."""
 
-_SECULAR_PARAM_NAMES = frozenset({"offset", "rate"})
-"""Model parameter names of the secular (non-seasonal) group."""
+_SECULAR_PARAM_NAMES = frozenset({"offset", "rate", "curvature"})
+"""Model parameter names of the secular (non-seasonal) group.
+
+Not exhaustive on its own — :func:`_is_secular_param` adds the ``poly_``
+prefix, since :class:`~gps_analysis.terms.Polynomial` names only the first
+three coefficients and falls back to ``poly_3``, ``poly_4``, ... above that."""
 
 _PERIODIC_PARAM_NAMES = frozenset(
     {"cos_annual", "sin_annual", "cos_semiannual", "sin_semiannual"}
 )
-"""Model parameter names of the seasonal group."""
+"""Model parameter names of the seasonal group at the production
+``n_harmonics=2`` — see :func:`_is_periodic_param` for the general rule."""
+
+_SECULAR_PARAM_PREFIX = "poly_"
+_PERIODIC_PARAM_PREFIXES = ("cos_", "sin_")
+
+
+def _is_secular_param(name: str) -> bool:
+    """Whether a parameter name belongs to the polynomial (secular) group."""
+    return name in _SECULAR_PARAM_NAMES or name.startswith(_SECULAR_PARAM_PREFIX)
+
+
+def _is_periodic_param(name: str) -> bool:
+    """Whether a parameter name belongs to the seasonal group.
+
+    A membership test against the four production names was not enough:
+    :class:`~gps_analysis.terms.Seasonal` labels only harmonics 1 and 2
+    (``annual``/``semiannual``) and spells the rest ``cos_harmonic3``,
+    ``sin_harmonic3``, ... so ``n_harmonics=3`` produced parameters that
+    NEITHER classifier could place, and both raised.  ``cos_``/``sin_`` is
+    the seasonal namespace -- no other term generates those prefixes -- so
+    the rule generalises without widening what it claims.
+
+    Shared by :func:`_term_keep_mask` and
+    :func:`gps_analysis.staged._staged_group_of` so the two, which
+    deliberately differ on where STEPS go, cannot also drift on this.
+    """
+    return name in _PERIODIC_PARAM_NAMES or name.startswith(_PERIODIC_PARAM_PREFIXES)
+
+
+_TRANSIENT_AMP_PREFIXES = ("log_amp", "exp_amp")
+"""Parameter-name prefixes of the transient amplitudes (``terms.py``) —
+their own group, NOT folded into ``"secular"``: a postseismic decay is
+signal, where a Heaviside jump is background."""
 
 _STEP_AMP_PREFIX = "step_amp_"
 """Parameter-name prefix of :func:`~gps_analysis.fitting.with_steps`
 amplitude parameters — classified with the secular group (a Heaviside
 jump is background, not seasonal)."""
 
-_TERMS = ("all", "secular", "periodic")
-"""Valid ``terms`` selectors of :func:`select_terms`."""
+_TERMS = ("all", "secular", "periodic", "transient")
+"""Valid ``terms`` selectors of :func:`select_terms`.
+
+``"transient"`` joined the vocabulary on 2026-08-03, when transient terms
+became fittable. The three original selectors keep their EXACT meanings —
+``"secular"`` is still {offset, rate} ∪ {step amplitudes} (design §5.3: a
+Heaviside jump is background, not seasonal) and does **not** reach a
+transient. A postseismic decay is signal many analyses exist to study, so
+removing it silently under an existing spelling would change what the
+detrended view means for every future record; you ask for it by name, or
+with ``"all"``.
+
+:func:`select_terms` also accepts a TUPLE of these names (their union), so
+a call site can say ``("secular", "transient")`` and decide for itself.
+All 37 deployed records are byte-identical under this change: they carry no
+transient terms, so no mask they produce can differ."""
 
 _DEFAULT_TOL = 1e-3
 """Window boundary tolerance [yr] — the ``slice_window`` legacy default
@@ -189,8 +264,25 @@ class DetrendEstimate:
         n_rejected: Outliers removed per component.
         rms: Inlier residual RMS per component [L] — drift-staleness
             baseline (design §6 T3); NaN for a component with no inliers.
-        window: Requested fit window (start, end) [yr]; open bounds are
-            resolved to the first/last windowed epoch.
+        window: Requested fit window (start, end) [yr] — the HULL when
+            the fit spans several segments; open bounds are resolved to
+            the first/last windowed epoch.
+        segments: The resolved fit segments, shape (J, 2) [yr], each
+            open bound collapsed to the first/last kept epoch OF THAT
+            SEGMENT.  ``(window,)`` when J = 1, a deliberate redundancy
+            that keeps consumers reading one field rather than branching.
+        segment_gaps: The REALIZED excised gaps, length J−1 [yr] — the
+            distance from the last kept epoch of segment j to the first
+            kept epoch of segment j+1.  Reported rather than gated: a
+            segment boundary placed inside a genuine data outage hides
+            that outage from ``max_gap_years`` (which is per segment),
+            and this is what makes "you excised 0.35 yr" and "you excised
+            1.02 yr" distinguishable without adding a threshold.
+        window_mask: The union mask over the INPUT ``t`` that the fit
+            actually used, shape (N,).  Returned so a caller lifting
+            results back to its own index space uses the mask the fit
+            used instead of re-deriving one that merely ought to agree.
+            Not serialized.
         model: Model registry code (``"lineperiodic"`` | ``"linear"`` |
             ``"periodic"``) — or the callable's ``__name__`` for a
             custom model, in which case :meth:`to_record` refuses (a
@@ -220,12 +312,19 @@ class DetrendEstimate:
     n_rejected: tuple[int, ...]
     rms: tuple[float, ...]
     window: tuple[float, float]
+    segments: tuple[tuple[float, float], ...]
+    segment_gaps: tuple[float, ...]
+    window_mask: NDArray[np.bool_]
     model: str
     step_epochs: FloatArray
     detrend_method: str
     frame: str | None = None
     outlier_abort: bool = False
     detection: OutlierDetection | None = None
+    term_spec: list[dict[str, Any]] | None = None
+    """Term spec when the model carries terms a registry code cannot express
+    (transients). None for ordinary models, which keeps their records at
+    :data:`RECORD_VERSION` 1 and byte-identical."""
 
     def __post_init__(self) -> None:
         n_components = len(self.fits)
@@ -294,21 +393,56 @@ class DetrendEstimate:
             :meth:`~gps_analysis.models.TrajectoryParams.to_record` for
             the covariance round-trip contract.
         """
-        if self.model not in _MODEL_NAMES:
+        term_spec = self.term_spec
+        if term_spec is None and self.model not in _MODEL_NAMES:
             raise ValueError(
                 f"model {self.model!r} is not a registry code "
                 f"{sorted(_MODEL_NAMES)} - the record would not be re-evaluable"
             )
+        if term_spec is not None:
+            from .terms import TrajectoryModel
+
+            # Steps are appended here for the same reason as on the v1 branch:
+            # the spec describes the UNAUGMENTED model, and with_steps supplies
+            # the rest. This mirrors trajectory_from_record exactly -- writer
+            # and reader must agree on the order or every v2 record fails its
+            # own param_names check. Pre-2026-08-09 records baked steps into
+            # the spec and carry an empty step_epochs, so they append nothing
+            # and keep the names they were written with.
+            param_names = list(TrajectoryModel.from_spec(term_spec).param_names) + [
+                f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)
+            ]
+        else:
+            param_names = _param_names(_MODEL_NAMES[self.model]) + [
+                f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)
+            ]
         return {
-            "record_version": RECORD_VERSION,
+            "record_version": (
+                RECORD_VERSION if term_spec is None else RECORD_VERSION_TERMS
+            ),
             "model": self.model,
-            "param_names": _param_names(_MODEL_NAMES[self.model])
-            + [f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(self.step_epochs.size)],
+            "param_names": param_names,
+            # The terms list is what makes a transient record re-evaluable;
+            # absent at v1, so a v1 reader never sees a key it must ignore.
+            **({} if term_spec is None else {"terms": term_spec}),
             "step_epochs": [float(v) for v in self.step_epochs],
             "frame": self.frame,
             "detrend_method": self.detrend_method,
             "fitted_at": fitted_at,
             "window": [float(self.window[0]), float(self.window[1])],
+            # Additive at RECORD_VERSION 1, deliberately. `window` keeps its
+            # 2-tuple type and hull meaning because two readers index it
+            # positionally (geo_dataread's StationResult detail line formats
+            # window[0] with :.3f -> TypeError on a nested list; the workbench's
+            # _add_window_edges guards len(window) != 2 and would silently stop
+            # drawing). A NEW key cannot break either: trajectory_from_record
+            # reads only record_version/model/step_epochs/param_names/components,
+            # and TrajectoryParams.from_record ignores unknown keys -- so a
+            # segmented record and the 37 deployed single-window ones coexist in
+            # one document at the same version. Readers use .get("segments");
+            # None means "legacy, the hull in `window` is the whole story".
+            "segments": [[float(a), float(b)] for a, b in self.segments],
+            "segment_gaps": [float(g) for g in self.segment_gaps],
             "span_used": [float(self.span_used[0]), float(self.span_used[1])],
             "n_epochs": int(self.n_epochs),
             "n_rejected": [int(v) for v in self.n_rejected],
@@ -324,6 +458,46 @@ def _param_names(model: ModelFunc) -> list[str]:
     return list(inspect.signature(model).parameters)[1:]
 
 
+def _validate_segments(segs: Sequence[tuple[float | None, float | None]]) -> None:
+    """Reject a segment sequence that cannot mean one fit domain.
+
+    Three conditions, each preventing a distinct silent-wrong-science mode:
+
+    - **interior bounds must be finite.**  ``[(2002, None), (2008.7, 2019)]``
+      parses as an overlapping union, so the excision it was written to
+      express does not exist and the coverage below is meaningless.
+    - **strictly increasing and non-overlapping.**  Overlap makes the
+      summed coverage of ``min_span_years`` DOUBLE-COUNT, i.e. gameable:
+      ``[(2002, 2012), (2010, 2019)]`` would buy two years of span that no
+      data supports.  This is why the check is here and not a matter of
+      taste.
+    - **each end after its start** — also caught by
+      :func:`~gps_analysis.baseline.slice_windows`, deliberately duplicated
+      at this trust boundary so the message names the caller's argument.
+    """
+    for j, (a, b) in enumerate(segs):
+        if a is not None and b is not None and b <= a:
+            raise ValueError(f"segment {j} has end {b} <= start {a}")
+        if j > 0 and a is None:
+            raise ValueError(
+                f"segment {j} has an open start; only the FIRST segment may "
+                f"be open on the left, else the segments overlap"
+            )
+        if j < len(segs) - 1 and b is None:
+            raise ValueError(
+                f"segment {j} has an open end; only the LAST segment may be "
+                f"open on the right, else the segments overlap"
+            )
+        if j > 0:
+            prev_end = segs[j - 1][1]
+            if prev_end is not None and a is not None and a <= prev_end:
+                raise ValueError(
+                    f"segment {j} starts at {a} which is not after segment "
+                    f"{j - 1}'s end {prev_end}; segments must be strictly "
+                    f"increasing and non-overlapping"
+                )
+
+
 def _resolve_model(model: str | ModelFunc) -> tuple[ModelFunc, str]:
     """Resolve a model spec to ``(callable, registry code or __name__)``."""
     if callable(model):
@@ -337,6 +511,13 @@ def _resolve_model(model: str | ModelFunc) -> tuple[ModelFunc, str]:
         raise ValueError(
             f"unknown model {model!r}; named models: {sorted(_MODEL_NAMES)}"
         ) from None
+
+
+def _model_term_spec(model: ModelFunc) -> list[dict[str, Any]] | None:
+    """Term spec of the fitted model, or None for an ordinary registry one."""
+    from .terms import model_term_spec
+
+    return model_term_spec(model)
 
 
 def _term_keep_mask(model: ModelFunc, terms: str) -> NDArray[np.bool_]:
@@ -360,18 +541,22 @@ def _term_keep_mask(model: ModelFunc, terms: str) -> NDArray[np.bool_]:
             "linear-in-parameters models (and their with_steps "
             f"augmentations); got {getattr(model, '__name__', model)!r}"
         )
+    wanted = {terms} if isinstance(terms, str) else set(terms)
     names = _param_names(model)
     keep = np.zeros(len(names), dtype=np.bool_)
     for j, name in enumerate(names):
-        if name in _SECULAR_PARAM_NAMES or name.startswith(_STEP_AMP_PREFIX):
+        if _is_secular_param(name) or name.startswith(_STEP_AMP_PREFIX):
             group = "secular"
-        elif name in _PERIODIC_PARAM_NAMES:
+        elif _is_periodic_param(name):
             group = "periodic"
+        elif any(name.startswith(pre) for pre in _TRANSIENT_AMP_PREFIXES):
+            group = "transient"
         else:
             raise ValueError(
-                f"cannot classify model parameter {name!r} as secular/periodic"
+                f"cannot classify model parameter {name!r} as "
+                f"secular/periodic/transient"
             )
-        keep[j] = group == terms
+        keep[j] = group in wanted
     return keep
 
 
@@ -411,8 +596,9 @@ def select_terms(
         model: Model callable the fits belong to.
         fits: One :class:`~gps_analysis.models.TrajectoryParams` or a
             sequence of them.
-        terms: Term selector — ``"all"``, ``"secular"`` or
-            ``"periodic"``.
+        terms: Term selector — ``"all"``, ``"secular"``, ``"periodic"``,
+            ``"transient"``, or a tuple of those (their union).
+            ``"secular"`` does NOT include a transient; see :data:`_TERMS`.
 
     Returns:
         New :class:`~gps_analysis.models.TrajectoryParams` list (inputs
@@ -434,10 +620,12 @@ def select_terms(
         a could-not-estimate covariance: 0·inf would be NaN, so the
         mask is applied by assignment, not multiplication).
     """
-    if terms not in _TERMS:
+    wanted = (terms,) if isinstance(terms, str) else tuple(terms)
+    unknown = [t for t in wanted if t not in _TERMS]
+    if unknown:
         raise ValueError(f"terms must be one of {_TERMS}, got {terms!r}")
     fit_list = [fits] if isinstance(fits, TrajectoryParams) else list(fits)
-    if terms == "all":
+    if "all" in wanted:
         return fit_list
     keep = _term_keep_mask(model, terms)
     out: list[TrajectoryParams] = []
@@ -466,6 +654,7 @@ def estimate_detrend(
     sigma: ArrayLike | None = None,
     *,
     window: tuple[float | None, float | None] = (None, None),
+    segments: Sequence[tuple[float | None, float | None]] | None = None,
     step_epochs: ArrayLike | None = None,
     min_span_years: float = 2.0,
     min_epochs: int = 365,
@@ -538,11 +727,31 @@ def estimate_detrend(
             mutated.
         sigma: 1-σ uncertainties, shape of ``y`` [L]; optional.
         window: Requested fit window (start, end) [yr]; either bound
-            may be None (open).
+            may be None (open).  Sugar for ``segments=[(start, end)]``.
+        segments: Fit the union of these ``(start, end)`` intervals [yr]
+            instead of one window — the way to excise a post-seismic
+            transient while keeping the flanks on both sides, which is
+            what makes the coseismic step between them estimable.  Only
+            the FIRST start and the LAST end may be None; the intervals
+            must be strictly increasing and non-overlapping (overlap
+            would double-count ``min_span_years``).  Mutually exclusive
+            with a non-default ``window``.
+
+            **Not to be confused with ``protect_windows``**, which has
+            the same type and the opposite polarity: ``segments`` says
+            *fit only here*, ``protect_windows`` says *do not FLAG here*.
         step_epochs: Known step epochs [yr]; None/empty ⇒ plain model.
-        min_span_years: Window-span gate [yr].
-        min_epochs: Windowed-epoch-count gate.
-        max_gap_years: Largest-gap gate [yr].
+        min_span_years: Span gate [yr] — the SUMMED coverage of the
+            segments, not their hull (identical at J = 1, and uniformly
+            stricter beyond it: two 18-day nubs 17 yr apart clear a
+            2-yr hull while four seasonal terms fit 36 days of data).
+        min_epochs: Total kept-epoch gate across all segments.
+        max_gap_years: Largest-gap gate [yr], applied WITHIN each
+            segment.  The excision between segments is deliberate and
+            documented by the configuration, so it is not a gap in this
+            sense; keeping the gate per segment preserves its actual
+            meaning — no undocumented outage inside an interval the
+            caller claimed to fit.
         detect: Run the outlier stage (True, production default). False
             = plain WLS on all windowed epochs (legacy semantics,
             tagged :data:`DETREND_METHOD_PLAIN`).
@@ -626,16 +835,44 @@ def estimate_detrend(
             f"names has {len(names)} entries for {n_components} components"
         )
 
-    # --- window + validity gates (design §2.2 rule 3; hard errors) ---
-    mask = slice_window(tt, window[0], window[1], tol=tol)
+    # --- segments + validity gates (design §2.2 rule 3; hard errors) ---
+    if segments is not None and window != (None, None):
+        raise ValueError(
+            "pass either window= or segments=, not both; two sources of truth "
+            "for the fitted sample set is a silent-wrong-science hazard"
+        )
+    segs: tuple[tuple[float | None, float | None], ...] = (
+        (tuple(window),) if segments is None else tuple(tuple(s) for s in segments)  # type: ignore[assignment, misc]
+    )
+    _validate_segments(segs)
+
+    mask = slice_windows(tt, segs, tol=tol)
     n_epochs = int(np.count_nonzero(mask))
     if n_epochs == 0:
-        raise ValueError(f"fit window {window} contains no epochs")
+        raise ValueError(
+            f"fit window {segs if len(segs) > 1 else window} contains no epochs"
+        )
     t_win = tt[mask]
-    span = float(t_win[-1] - t_win[0])
+
+    # Per-segment accounting. Each segment's own mask comes from slice_window --
+    # the same function slice_windows just OR-ed -- so the parts and the union
+    # cannot disagree about a boundary epoch.
+    seg_masks = [slice_window(tt, a, b, tol=tol) for a, b in segs]
+    seg_epochs = [tt[m] for m in seg_masks]
+    for j, ts in enumerate(seg_epochs):
+        if ts.size == 0:
+            raise ValueError(
+                f"segment {j} {segs[j]} contains no epochs — it is a data gap "
+                f"or a mistyped bound, not a fit window"
+            )
+
+    # min_span_years on SUMMED coverage, not the hull: Σ_j ≤ hull always, so
+    # this rejects everything the hull rejects plus what it wrongly admits.
+    span = float(sum(float(ts[-1] - ts[0]) for ts in seg_epochs))
     if span < min_span_years:
         raise ValueError(
-            f"validity gate 'min_span_years' failed: window span "
+            f"validity gate 'min_span_years' failed: "
+            f"{'summed segment coverage' if len(segs) > 1 else 'window span'} "
             f"{span:.4f} yr < {min_span_years} yr"
         )
     if n_epochs < min_epochs:
@@ -643,22 +880,57 @@ def estimate_detrend(
             f"validity gate 'min_epochs' failed: window has {n_epochs} "
             f"epochs < {min_epochs}"
         )
-    if n_epochs > 1:
-        largest_gap = float(np.max(np.diff(t_win)))
-        if largest_gap > max_gap_years:
-            raise ValueError(
-                f"validity gate 'max_gap_years' failed: largest gap "
-                f"{largest_gap:.4f} yr > {max_gap_years} yr"
-            )
+    # max_gap_years WITHIN each segment. On the hull the deliberate excision
+    # would be the largest diff and reject every union; and the obvious
+    # workaround -- raising the threshold past it -- would simultaneously
+    # disable the gate inside every segment, so a genuine outage would sail
+    # through unremarked. Per segment the gate keeps meaning what it says.
+    for j, ts in enumerate(seg_epochs):
+        if ts.size > 1:
+            largest_gap = float(np.max(np.diff(ts)))
+            if largest_gap > max_gap_years:
+                where = f" in segment {j} {segs[j]}" if len(segs) > 1 else ""
+                raise ValueError(
+                    f"validity gate 'max_gap_years' failed: largest gap "
+                    f"{largest_gap:.4f} yr > {max_gap_years} yr{where}"
+                )
+    # REALIZED excised gaps -- reported, never gated. A boundary placed inside a
+    # real outage hides that outage from the per-segment gate above; surfacing
+    # the realized distance is the honest answer, and it adds no knob.
+    segment_gaps = tuple(
+        float(seg_epochs[j + 1][0] - seg_epochs[j][-1]) for j in range(len(segs) - 1)
+    )
     y_win = yy[:, mask]
     sigma_win = [None if s is None else s[mask] for s in sigma_rows]
 
     # --- step augmentation: only steps strictly inside the window ---
+    # The bounds are the HULL of the kept epochs, and under segments that is
+    # LOAD-BEARING rather than incidental: a coseismic epoch sitting inside an
+    # excised transient still passes this filter, and its amplitude is estimable
+    # precisely because the flanking segments constrain the level on both sides.
+    # Narrowing this to per-segment membership would delete exactly the offset
+    # the excision was performed to expose.
     if step_epochs is not None:
         all_steps = np.sort(np.asarray(step_epochs, dtype=np.float64).ravel())
         steps_in = all_steps[(all_steps > t_win[0]) & (all_steps <= t_win[-1])]
     else:
         steps_in = np.empty(0, dtype=np.float64)
+    # Degeneracy (MATH_STANDARDS §3): two retained steps with NO kept epoch
+    # between them build identical Heaviside columns over the fitted samples --
+    # 0 on every earlier epoch, 1 on every later one -- so the design matrix is
+    # rank-deficient and the amplitudes are individually meaningless. Reachable
+    # today for two steps inside one outage; segments make it ordinary.
+    if steps_in.size > 1:
+        edges = np.searchsorted(t_win, steps_in, side="right")
+        collide = np.flatnonzero(np.diff(edges) == 0)
+        if collide.size:
+            k = int(collide[0])
+            raise ValueError(
+                f"steps {steps_in[k]:.5f} and {steps_in[k + 1]:.5f} have no "
+                f"fitted epoch between them, so their step columns are "
+                f"identical and their amplitudes are not separable; declare "
+                f"one of them, or widen the segments so data separates them"
+            )
     fit_model = with_steps(model_func, steps_in) if steps_in.size else model_func
     n_steps = int(steps_in.size)
     guesses: list[FloatArray | None] = [
@@ -732,10 +1004,17 @@ def estimate_detrend(
     used_any = np.any(inliers, axis=0)
     t_used = t_win[used_any]
     span_used = (float(t_used[0]), float(t_used[-1]))
-    resolved_window = (
-        float(t_win[0]) if window[0] is None else float(window[0]),
-        float(t_win[-1]) if window[1] is None else float(window[1]),
+    # Each segment's open bounds collapse to ITS OWN first/last kept epoch; the
+    # window is then the hull of the resolved segments, so J = 1 reproduces the
+    # previous expression exactly.
+    resolved_segments = tuple(
+        (
+            float(ts[0]) if a is None else float(a),
+            float(ts[-1]) if b is None else float(b),
+        )
+        for (a, b), ts in zip(segs, seg_epochs, strict=True)
     )
+    resolved_window = (resolved_segments[0][0], resolved_segments[-1][1])
 
     return DetrendEstimate(
         fits=tuple(fits),
@@ -747,11 +1026,15 @@ def estimate_detrend(
         ),
         rms=tuple(rms),
         window=resolved_window,
+        segments=resolved_segments,
+        segment_gaps=segment_gaps,
+        window_mask=mask,
         model=model_name,
         step_epochs=steps_in,
         detrend_method=method,
         frame=frame,
         outlier_abort=outlier_abort,
+        term_spec=_model_term_spec(model_func),
         detection=detection,
     )
 
@@ -762,10 +1045,13 @@ def trajectory_from_record(
     """Reconstruct (model, fits) from a stored station record.
 
     Validation + reconstruction (design §3.2 rules — a reader must
-    raise, never fudge): known ``record_version``, model code in the
-    registry, ``param_names`` (when present) verified against the
-    model's positional signature, per-component parameter vectors of
-    the right length with finite values
+    raise, never fudge): ``record_version`` known AND structurally
+    consistent with the content (v1 asserts "no terms", v2 asserts
+    "terms present" — a record whose version contradicts its shape is
+    refused, not read by content with the claim ignored), model code
+    in the registry, ``param_names`` (when present) verified against
+    the model's positional signature, per-component parameter vectors
+    of the right length with finite values
     (:meth:`~gps_analysis.models.TrajectoryParams.from_record`). Step
     epochs re-augment the model via
     :func:`~gps_analysis.fitting.with_steps`, so the returned callable
@@ -784,9 +1070,11 @@ def trajectory_from_record(
         ready for :func:`~gps_analysis.fitting.remove_trend`.
 
     Raises:
-        ValueError: On an unknown ``record_version``, an unregistered
-            model code, a ``param_names`` mismatch, no components, a
-            parameter-count mismatch, or non-finite parameters.
+        ValueError: On an unknown ``record_version``, a version that
+            contradicts the record's structure (v1 with a ``terms``
+            key, v2 without one), an unregistered model code, a
+            ``param_names`` mismatch, no components, a parameter-count
+            mismatch, or non-finite parameters.
 
     Reference:
         Design spec ``docs/DESIGN_live_detrending.md`` §3.2/§4.1/§5.2.
@@ -796,23 +1084,70 @@ def trajectory_from_record(
         re-fitting, no renormalization.
     """
     version = record.get("record_version")
-    if version != RECORD_VERSION:
+    if version not in SUPPORTED_RECORD_VERSIONS:
         raise ValueError(
             f"unknown record_version {version!r}; this reader supports "
-            f"{RECORD_VERSION}"
+            f"{sorted(SUPPORTED_RECORD_VERSIONS)}"
         )
     model_name = record.get("model")
-    if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
+    term_spec = record.get("terms")
+    # The version must MATCH the structure, not merely be a supported number.
+    # The branch below dispatches on the terms key, so without this check the
+    # version claim was decorative: a v1 record that acquired a terms list was
+    # evaluated FROM those terms -- and with param_names absent (it is checked
+    # only "when present") and the parameter counts agreeing, a degree-5
+    # polynomial spec read against lineperiodic parameters evaluated without
+    # complaint, ~2e16 mm wrong (measured). The stripped-terms converse only
+    # raised by the naming accident that "+"-joined term kinds never collide
+    # with a registry code.
+    if term_spec is not None and version != RECORD_VERSION_TERMS:
         raise ValueError(
-            f"record model {model_name!r} is not a registry code "
-            f"{sorted(_MODEL_NAMES)}"
+            f"record_version {version!r} record carries a 'terms' key; a "
+            f"record with terms must declare record_version "
+            f"{RECORD_VERSION_TERMS}"
         )
-    base_model = _MODEL_NAMES[model_name]
+    if term_spec is None and version == RECORD_VERSION_TERMS:
+        raise ValueError(
+            f"record_version {RECORD_VERSION_TERMS} record has no 'terms' "
+            f"list; version {RECORD_VERSION_TERMS} exists precisely because "
+            f"such a model cannot be rebuilt from its code alone"
+        )
     step_epochs = np.asarray(record.get("step_epochs", []), dtype=np.float64)
-    model_func = with_steps(base_model, step_epochs) if step_epochs.size else base_model
-    expected_names = _param_names(base_model) + [
-        f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(step_epochs.size)
-    ]
+
+    if term_spec is not None:
+        # v2: the record carries its own terms, because a registry code alone
+        # cannot express a transient. Steps are NOT among them -- they live in
+        # step_epochs and re-augment here exactly as in v1, because the writer
+        # stores the UNAUGMENTED model's spec (`_model_term_spec(model_func)`)
+        # beside `step_epochs=steps_in`. One augmentation site, one screen.
+        #
+        # Records written before 2026-08-09 baked their steps INTO the spec
+        # and carry an empty step_epochs, so they reconstruct unchanged --
+        # with_steps only applies when there is something to apply.
+        from .terms import TrajectoryModel
+
+        traj = TrajectoryModel.from_spec(term_spec)
+        base_traj = traj.as_modelfunc()
+        model_func = (
+            with_steps(base_traj, step_epochs) if step_epochs.size else base_traj
+        )
+        expected_names = list(traj.param_names) + [
+            f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(step_epochs.size)
+        ]
+    else:
+        # v1, byte-identical: registry code + with_steps, as before.
+        if not isinstance(model_name, str) or model_name not in _MODEL_NAMES:
+            raise ValueError(
+                f"record model {model_name!r} is not a registry code "
+                f"{sorted(_MODEL_NAMES)}"
+            )
+        base_model = _MODEL_NAMES[model_name]
+        model_func = (
+            with_steps(base_model, step_epochs) if step_epochs.size else base_model
+        )
+        expected_names = _param_names(base_model) + [
+            f"{_STEP_AMP_PREFIX}{k + 1}" for k in range(step_epochs.size)
+        ]
     stored_names = record.get("param_names")
     if stored_names is not None and list(stored_names) != expected_names:
         raise ValueError(

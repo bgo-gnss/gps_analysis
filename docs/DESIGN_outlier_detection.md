@@ -709,6 +709,242 @@ To preserve the §8.4 property invariants with despike on (`flags ⊆ candidates
 the Stage-0 despiked epochs (distinguished by `REASON_GROSS`), even though they
 are excluded from clustering, protection and the abort fraction.
 
+## 11. Addendum — step-protection repair (branch `outlier-step-protection-flanks`, 2026-07-27)
+
+The §3.4.2 step-evidence branch protected a **139 mm RHOF blunder** (2013.977,
+`ẑ = 13.4`) in all three components, and **no threshold could release it**.
+Three changes, ordered by how fundamental the defect is. Only §3.4.2a changes a
+default; §3.4.2b is opt-in, and §3.4.2a-i leaves every existing default intact.
+
+### §3.4.2a-i — indeterminate is a POLICY, not a threshold case (`protect_on_indeterminate`, default True)
+
+The rule was `step_rule = isnan(D) or D > k_step`. Folding the indeterminate arm
+into the threshold made it **unreachable**: `step_evidence_sigma = 1e6` — an
+unambiguous "stop protecting on step evidence" — still protected, because `D`
+was NaN. A knob that cannot express its own "off" is a defect, not conservatism,
+and it blocks isolating the protection stages when testing them separately (the
+`--outlier-param` lane in `gps_plot`).
+
+The two arms are now separate, with `protect_on_indeterminate` (default
+**True**) governing the NaN case. Defaults unchanged; `step_evidence_sigma`
+now actually works.
+
+### §3.4.2a — nearest-k flank fallback (`step_flank_max_reach_days`, default 60 d)
+
+A fixed window `W` measures **elapsed time, not evidence**. RHOF 2013.977 has an
+8-day gap immediately after the spike, so the post-flank held **1** epoch inside
+`W = 10 d`; `D` was NaN and the cluster was protected by a step nobody could
+measure — although perfectly good samples sat just past the gap.
+
+When a flank is thin, the 3 usable samples **nearest the cluster edge** within
+`R` (default 60 d) are used instead. Three cases, and the distinction between
+the last two is the whole point:
+
+| flank state | action | rationale |
+|---|---|---|
+| ≥ 3 usable in-window | plain in-window median | unchanged, bit-identical |
+| thin because epochs are **EXCLUDED** | stay NaN | a candidate-saturated neighbourhood is the signature of a fast transient (§3.4) — reaching past it samples a _different part of the signal_ and manufactures a verdict |
+| thin because data is **ABSENT** | nearest-k within `R` | a sampling artifact, not evidence |
+
+Conflating those two regressed `test_transient_survives[10.0]` during
+implementation. The discriminator is `in_window_present` vs `in_window_usable`,
+pinned by
+`tests/test_outliers.py::TestFlankNearestK::test_excluded_flank_stays_nan`.
+Where data is genuinely absent (a cluster at the series end) the fallback finds
+nothing and NaN is preserved, so `test_step_at_series_end` still holds.
+
+**Measured impact** (20 stations, full span, `ref="plate"`, live
+`/mnt_data/gpsdata`): **+168 flagged epochs, +10.8 %** (1557 → 1725). 14 stations
+up, 1 down (SENG −4), 2 unchanged, 3 abort either way (SAUD/HAMR/GFUM). The
+_down_ direction is expected, not a regression: `_flank_medians` also feeds the
+**elevated-background arm** and the **conclusive-blunder release**, so a newly
+determinate flank can add `PROTECT_RUN` as well as remove `PROTECT_STEP`.
+
+**Statistical caveat.** The fallback uses exactly 3 samples, where an adequate
+window typically has 10+. A gap-crossing `D` is therefore a materially noisier
+statistic than an in-window one, and `D > k_step` decisions taken on it are
+correspondingly less reliable. This is the price of answering at all instead of
+protecting by default; it is deliberate, but it means gap-adjacent verdicts
+deserve more operator scepticism than window-interior ones.
+
+**⚠ Downstream: stored detrend records change.** `detrend.estimate_detrend`
+runs `detect_outliers` **before** the fit (BGÓ hard rule), so more masked epochs
+give a different WLS solution and hence a different `DetrendEstimate` for the
+same station and window. Records fitted before this change and after it are
+**not comparable**, and nothing in `to_record` distinguishes them beyond
+`fitted_at` — `record_version` does not currently bump on a detector-behavior
+change. Either re-estimate a whole `detrend_params.json` at once or accept
+mixed-vintage records knowingly; deciding whether `record_version` should bump
+is a caller-side call, not a leaf one.
+
+### §3.4.2b — magnitude-vs-step release (`step_magnitude_ratio`, default 0 = off)
+
+`D` answers "did the level shift?" but never "by how much, **relative to the
+excursion that raised the question**". A 139 mm blunder sitting on a real 5 mm
+step yields `D > k_step` and is protected by a step it dwarfs.
+
+With `A = max|w_i − (r̄_pre + r̄_post)/2| / ŝ` over the cluster members:
+
+```
+release PROTECT_STEP   iff   A > k_ratio · D        (determinate D only)
+```
+
+A genuine step scores `A/D ≈ 0.5` (the members sit AT the offset, so the
+excursion about the mid-level is half of it); the RHOF-shaped case scores ≈ 30.
+The rule can only ever **release**, never protect, so it cannot mask signal the
+other rules would keep — and it is silent on the indeterminate branch, which is
+where genuine steps are protected
+(`TestMagnitudeRatioRelease::test_silent_on_the_indeterminate_branch`).
+
+Default **0.0 (off)**: it loosens detection and is the least validated of the
+three, so it stays opt-in until validated per network. 5.0 is the suggested
+starting value.
+
+
+## 12. Addendum — per-component abort (branch `outlier-abort-granularity`, 2026-07-28)
+
+### §3.5a — the abort is per COMPONENT, with an absolute floor
+
+§3.5 wrote the gate as a "per-component candidate fraction" but the ACTION
+was global: any component over `f_max` zeroed all three. The evidence is per
+component and so is the failure. Measured:
+
+| station | per-component candidate fraction | old result | new result |
+|---|---|---|---|
+| SAUD full | `[0.100, 0.009, 0.006]` | all three zeroed | `[True, False, False]` — E and U recover **38 flags** |
+| GFUM full | `[0.086, 0.076, 0.088]` | all three zeroed | all three abort — correct, genuine multi-year misfit |
+| GFUM 90 d | 4 candidates of **63** = 6.3 % | north zeroed | survives at `min_abort_candidates = 10` |
+
+Two changes:
+
+1. **Per-component action.** `OutlierDetection.component_abort` (shape `(C,)`).
+   An aborted component is DECIDED — skipped on later sweeps, keeping its
+   zeroed row — while healthy siblings continue to their own fixed point. Its
+   per-epoch diagnostics are those of the sweep in which IT aborted.
+   `epoch_policy="union"` unions over SURVIVORS only; folding an aborted
+   all-False row back in would reintroduce the blast radius this removes.
+2. **`min_abort_candidates`** (default 0 = unchanged). The fraction is
+   quantized at small N; 4 of 63 is noise in the counting, not evidence of a
+   wrong model.
+
+**`excess_flag_abort` keeps its meaning** as `component_abort.any()`. That is
+the compatibility hinge, and the reason this change moves **no stored detrend
+records**: `detrend.estimate_detrend` reads the scalar and takes the identical
+branch. Verified, not assumed.
+
+**Visibility (DoD 1).** An aborted component is served raw with only a
+`UserWarning`, so the figure was indistinguishable from a clean one — the
+worst failure mode for a monitoring product. `gps_plot` now badges the aborted
+component's AXIS (not a figure banner: a station where north aborted but east
+and up cleaned is a different object from one where all three failed), and the
+badge deliberately survives `--hide-outliers` — decluttering removes DECIDED
+outliers, and an abort is the opposite of decided.
+
+**Not fixed here, and not a side effect:** the abort's non-monotonicity
+(backlog #2 — RHOF `window_n_sigma` 2.5 → 414 flags, 2.0 → **0**) survives both
+changes untouched.
+
+## 13. Addendum — clipped whitening (`whiten_sigma_clip`, 2026-07-28)
+
+### §3.1 amendment — the formal σ is NOT a trustworthy quality ratio
+
+§3.1 asserts that σ contributes "the epoch-to-epoch quality *ratio*". Measured
+on RHOF full span, that is false: Spearman(σ, |r|) = **−0.06 / +0.24 / +0.12**
+(N/E/U). Worse, σ inflates at exactly the bad epochs — the same daily
+estimation produces both the blunder and its σ — so `r/σ` is near-invariant to
+how bad the solution was and **self-pardons gross excursions**:
+
+```
+RHOF 2023-02-28 Up:  residual +83.0 mm,  σ = 13.2 mm (4.1× median)
+  uncapped      |z| = 3.33   ← not even a candidate, against k_g = 5.0
+  c = 1.5       |z| = 8.82
+  c = 2.0       |z| = 6.74
+  c = 3.0       |z| = 4.53   ← fails the gate
+  drop σ        |z| = 12.85
+```
+
+**Mechanism: clipped whitening** (`clip_sigma`, §4.1), `σ'ᵢ = min(σᵢ, c·med σ)`,
+applied to the **identifiers only** — the robust fit keeps raw σ, so §3.1's WLS
+weighting survives and backlog #6 (`f_scale` not unit-agnostic on the σ=None
+path) stays out of scope.
+
+Chosen over the alternatives on measurement, not preference: clipping at
+c = 1.5 recovers **29 epochs over k_g fleet-wide against 30 for dropping σ
+entirely** — nearly all the recall, without landing on the non-unit-agnostic
+σ=None path.
+
+**Default 0.0 = off, bit-identical.** Flipping it is T2b, and that ticket
+DOES move stored detrend records (`estimate_detrend` detects before it fits).
+
+**A blind spot this exposed.** `test_golden_order0_fixture` passes **no σ**, so
+`whiten(r, None)` returns `r` and the entire σ path is invisible to it — the
+first version of the T2a pin table wrongly predicted that fixture would break.
+`test_golden_whitened_fixture` now pins a σ-bearing series. Note it is a value
+pin, not a clip-decisive one; the behavioural pin is
+`test_sigma_clip_releases_coinflated_epoch`.
+
+
+## 14. Addendum — stage isolation (`enable_*` / `--stages`, 2026-07-28)
+
+Each stage can now be switched off explicitly:
+
+| flag | stage |
+|---|---|
+| `despike` | S0 gross-blunder despike |
+| `enable_global` | S3 global identifier |
+| `enable_window` | S4 windowed Hampel |
+| `enable_protection` | S5 signal protection |
+
+S1 (robust fit) and S2 (whitening) are **structural** — every later stage is
+defined on their residuals — so they always run.
+
+Previously the only way to disable a stage was a sentinel threshold
+(`global_n_sigma = 1e9`). That does not express intent, cannot be asserted on,
+and **for the protection stage could not express "off" at all**: its
+indeterminate arm ignored every threshold (§3.4.2a).
+
+A disabled stage's **diagnostics stay populated** (`z`, `scale_global`,
+`scale_local`) — the purpose of isolation is attribution, and blanking them
+would defeat it. With S5 off, `flags == candidates` exactly; that is an
+attribution tool, never a production setting.
+
+### Why this matters: the abort measures window composition, not model error
+
+SELF (Selfoss) carries an **undeclared 143 mm coseismic offset** from the
+Ölfus M6.3 of 2008-05-29. Measured candidate fraction against the fraction of
+the window lying *before* that step:
+
+| window start | pre-step fraction | candidate fraction | abort |
+|---|---|---|---|
+| 2005 | 0.083 | 0.091 | **yes** |
+| 2006 | 0.058 | 0.067 | **yes** |
+| 2007 | 0.036 | 0.044 | no |
+| 2009 | 0.000 | 0.009 | no |
+
+`cand_frac ≈ pre_frac + 0.009`. The robust fit **adopts the majority segment**
+and marks the entire minority as candidates, so the abort statistic is
+essentially *how much of the window sits on the wrong side of the step* — plus
+the station's baseline rate. **Same data, same earthquake, different verdict
+purely from where the plot starts.** This is backlog #2's non-monotonicity in
+another guise, and it is why an undeclared step is not merely "over-flagging".
+
+Stage isolation makes the mechanism visible and gives a way around it:
+
+| config (SELF from 2005) | candidate fraction | result |
+|---|---|---|
+| all stages | 0.091 / 0.089 / 0.083 | abort, 0 flags |
+| **S0 only** | **0.004 / 0.004 / 0.001** | **clean, 19 / 16 / 3 flags** |
+| S0 + S3 (global only) | 0.087 / 0.086 / 0.080 | abort |
+| S0 + S4 (windowed only) | 0.069 / 0.066 / 0.061 | abort |
+
+Both model-based identifiers independently exceed `f_max` — they ride the same
+contaminated residuals. **S0 does not**: it works on local first differences
+with no global fit, and its verdict is unchanged across window starts
+(19/16/3, 19/15/3, 18/15/3 for 2005/2007/2009). S0 is therefore the only stage
+that is robust to undeclared steps *without prior knowledge* — which is the
+property BGÓ asked for, and the reason declared steps, while still valuable,
+are not a precondition for useful detection.
+
 ---
 
 _Spec created 2026-07-13 (analysis lane). §10 addendum implemented 2026-07-14

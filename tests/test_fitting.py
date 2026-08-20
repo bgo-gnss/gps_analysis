@@ -29,6 +29,7 @@ from gps_analysis.fitting import (
     fit_components,
     reject_outliers,
     remove_trend,
+    with_steps,
 )
 from gps_analysis.models import (
     TrajectoryParams,
@@ -448,3 +449,111 @@ class TestRejectOutliers:
         reject_outliers(linear, t, y)
         np.testing.assert_array_equal(t, t0)
         np.testing.assert_array_equal(y, y0)
+
+
+# ---------------------------------------------------------------------------
+# Phase 0 prerequisites for the term algebra
+# ---------------------------------------------------------------------------
+
+
+class TestDesignWidthGuard:
+    def test_a_design_narrower_than_the_model_raises_at_the_fit(self) -> None:
+        """The mismatch used to be silent until it detonated far away.
+
+        A design whose column count disagrees with the model's parameter
+        count returns a vector of the DESIGN's width; ``TrajectoryParams``
+        only checks cov against params, so the failure surfaced in
+        ``remove_trend`` as ``model(t, *params)`` missing an argument —
+        arbitrarily far from the registration that caused it. Term
+        composition makes that mismatch ordinary, so it must fail here.
+        """
+        from gps_analysis.fitting import _LINEAR_DESIGN_ATTR, _LinearDesign
+
+        def four_params(t, a, b, c, d):  # noqa: ANN001, ANN202
+            return a + b * np.asarray(t) + c + d
+
+        setattr(
+            four_params,
+            _LINEAR_DESIGN_ATTR,
+            _LinearDesign(lambda tt: np.column_stack([np.ones_like(tt), tt, tt**2])),
+        )
+        t = np.arange(2000.0, 2005.0, 0.01)
+        with pytest.raises(ValueError, match="3 columns for a 4-parameter model"):
+            fit_components(four_params, t, 2.0 * t)
+
+
+class TestWithStepsNesting:
+    def test_nesting_continues_the_amplitude_numbering(self) -> None:
+        """The one composition primitive must compose with itself.
+
+        It raised ``duplicate parameter name: 'step_amp_1'`` before — the
+        counter restarted at 1 on every call, so the outer signature
+        collided with the inner one.
+        """
+        import inspect
+
+        one = with_steps(linear, [2010.0])
+        two = with_steps(one, [2015.0, 2018.0])
+        assert list(inspect.signature(two).parameters)[1:] == [
+            "offset",
+            "rate",
+            "step_amp_1",
+            "step_amp_2",
+            "step_amp_3",
+        ]
+
+    def test_single_call_naming_is_unchanged(self) -> None:
+        """A base with no step params gives 1 + 0, i.e. byte-identical.
+
+        The 37 deployed records and the ``param_names`` cross-check in
+        ``detrend.trajectory_from_record`` depend on this exactly.
+        """
+        import inspect
+
+        one = with_steps(lineperiodic, [2010.0, 2015.0])
+        names = list(inspect.signature(one).parameters)[1:]
+        assert names[-2:] == ["step_amp_1", "step_amp_2"]
+
+    def test_a_nested_model_keeps_the_closed_form_path(self) -> None:
+        """Nesting must not silently drop to curve_fit."""
+        from gps_analysis.fitting import _resolve_linear_design
+
+        two = with_steps(with_steps(linear, [2010.0]), [2015.0, 2018.0])
+        assert _resolve_linear_design(two) is not None
+
+        t = np.arange(2005.0, 2025.0, 0.01)
+        y = (
+            3.0
+            + 2.0 * (t - 2010.0)
+            + 10.0 * (t >= 2010.0)
+            - 5.0 * (t >= 2015.0)
+            + 7.0 * (t >= 2018.0)
+        )
+        fit = fit_components(two, t, y)[0]
+        assert fit.params[1] == pytest.approx(2.0, abs=1e-9)
+        assert list(np.round(fit.params[2:], 9)) == [10.0, -5.0, 7.0]
+
+
+class TestDerivedDesignsReachVelocity:
+    def test_sliding_velocity_keeps_the_closed_form_path_on_a_stepped_model(
+        self,
+    ) -> None:
+        """`velocity` looked models up in the identity registry only.
+
+        A ``with_steps`` model carries its design on the attribute, so
+        `sliding_velocity` SILENTLY dropped to per-window ``curve_fit``
+        (same answer, ~10-100x slower, different covariance path, no
+        warning) and `estimate_velocity_mle` hard-raised "nonlinear".
+        Both now resolve through the attribute fallback.
+        """
+        from gps_analysis.velocity import sliding_velocity
+
+        t = np.arange(2010.0, 2016.0, 1.0 / 365.25)
+        y = 1.0 + 5.0 * (t - 2010.0) + 12.0 * (t >= 2013.0)
+        model = with_steps(linear, [2013.0])
+        result = sliding_velocity(
+            t, y, model=model, window_years=2.0, step_years=1.0, min_obs=100
+        )
+        rates = np.asarray(result.rates)
+        assert np.all(np.isfinite(rates[np.isfinite(rates)]))
+        assert np.nanmedian(rates) == pytest.approx(5.0, abs=0.2)

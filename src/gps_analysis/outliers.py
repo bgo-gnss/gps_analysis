@@ -133,6 +133,7 @@ __all__ = [
     "standardize_robust",
     "step_evidence",
     "whiten",
+    "clip_sigma",
 ]
 
 _DAYS_PER_YEAR = 365.25
@@ -489,6 +490,49 @@ def whiten(r: ArrayLike, sigma: ArrayLike | None) -> FloatArray:
     if not np.all(ss > 0.0):
         raise ValueError("sigma must be strictly positive (and finite)")
     return np.asarray(rr / ss, dtype=np.float64)
+
+
+def clip_sigma(sigma: ArrayLike | None, c: float) -> FloatArray | None:
+    """Cap formal uncertainties at ``c * median(sigma)`` (§3.4.3/§13).
+
+    Equation:
+        ``sigma'_i = min(sigma_i, c * med(sigma))``
+
+    Rationale (backlog finding 1, measured): the formal sigma inflates at
+    exactly the bad epochs, because the same daily estimation produces both
+    the blunder and its sigma.  ``r/sigma`` is therefore close to invariant
+    to how bad the solution was, and whitening SELF-PARDONS gross excursions
+    — RHOF 2023-02-28 Up carries an 83.0 mm residual at sigma = 13.2 mm
+    (4.1x median) and scores |z| = 3.33, not even a candidate.  Capping the
+    denominator keeps the seasonal quality RATIO that §3.1 wants while
+    removing the blunder-epoch self-pardon: the same epoch scores 8.82 at
+    c = 1.5.
+
+    Symbols -> args:
+        - ``sigma_i`` -> ``sigma``: formal 1-sigma uncertainties, or None
+        - ``c``       -> ``c``: cap in units of the median sigma; ``c <= 0``
+          disables the cap and returns ``sigma`` unchanged
+
+    Returns:
+        The capped array (a copy), or ``sigma`` itself when the cap is
+        disabled or ``sigma`` is None.  Non-finite and non-positive sigmas
+        are left alone — :func:`whiten` owns that contract.
+
+    Numerical notes:
+        The median is taken over FINITE POSITIVE sigmas only, so a series
+        carrying NaN/0 sentinels caps against the same reference the usable
+        epochs do.
+    """
+    if sigma is None or c <= 0.0:
+        return None if sigma is None else np.asarray(sigma, dtype=np.float64)
+    ss = np.asarray(sigma, dtype=np.float64)
+    usable = np.isfinite(ss) & (ss > 0.0)
+    if not usable.any():
+        return ss
+    cap = c * float(np.median(ss[usable]))
+    out = ss.copy()
+    out[usable] = np.minimum(out[usable], cap)
+    return out
 
 
 def standardize_robust(
@@ -948,6 +992,61 @@ def candidate_clusters(
     return clusters
 
 
+#: Minimum usable samples per flank for a determinate flank median (§3.4.2).
+FLANK_MIN_COUNT: int = 3
+
+
+def _flank_median_one_side(
+    t: FloatArray,
+    r: FloatArray,
+    in_window_usable: NDArray[np.bool_],
+    in_window_present: NDArray[np.bool_],
+    usable: NDArray[np.bool_],
+    edge: float,
+    *,
+    max_reach: float,
+) -> float:
+    """Median of one flank, with the §3.4.2a nearest-k gap fallback.
+
+    Three masks, because WHY a flank is thin decides what to do about it:
+    ``in_window_usable`` (fixed-W ∧ not excluded), ``in_window_present``
+    (fixed-W, exclusions ignored) and ``usable`` (every epoch on this
+    side of the cluster that is not excluded).
+
+    - **≥ FLANK_MIN_COUNT usable in-window samples** — plain in-window
+      median, byte-identical to the fixed-window behavior.  Widening
+      never perturbs an already-determinate flank.
+    - **Thin because the epochs are EXCLUDED** (present ≥ min, usable <
+      min) — stay NaN.  The neighborhood being wall-to-wall candidates
+      is the signature of a fast transient, precisely the §3.4 case that
+      must keep protecting; reaching past it would sample a different
+      part of the signal and manufacture a verdict.
+    - **Thin because the DATA IS ABSENT** (present < min) — the fixed
+      window measured elapsed time, not evidence.  Fall back to the
+      ``FLANK_MIN_COUNT`` usable samples nearest the cluster edge within
+      ``max_reach``.
+
+    Where there is genuinely no data at all (a cluster at the series
+    end) the fallback finds nothing and NaN is preserved — the correct
+    indeterminate answer rather than a manufactured one.
+    """
+    if int(np.count_nonzero(in_window_usable)) >= FLANK_MIN_COUNT:
+        return float(np.median(r[in_window_usable]))
+    if max_reach <= 0.0:
+        return float("nan")
+    if int(np.count_nonzero(in_window_present)) >= FLANK_MIN_COUNT:
+        return float("nan")  # excluded, not absent -- keep protecting
+
+    reach = usable & (np.abs(t - edge) <= max_reach)
+    idx = np.flatnonzero(reach)
+    if idx.size < FLANK_MIN_COUNT:
+        return float("nan")
+    # nearest k BY TIME, not by index: unequal spacing means the k
+    # index-adjacent epochs can straddle a far larger interval
+    nearest = idx[np.argsort(np.abs(t[idx] - edge), kind="stable")[:FLANK_MIN_COUNT]]
+    return float(np.median(r[nearest]))
+
+
 def _flank_medians(
     t: FloatArray,
     r: FloatArray,
@@ -956,6 +1055,7 @@ def _flank_medians(
     *,
     window: float,
     exclude: NDArray[np.bool_] | None,
+    max_reach: float = 0.0,
 ) -> tuple[float, float]:
     """Median residuals of the two flank windows of a cluster.
 
@@ -964,26 +1064,38 @@ def _flank_medians(
         ``r̄_post = med{ r_j : t_j ∈ (t_end, t_end + W] }``
 
     with ``exclude``-masked epochs dropped from both flanks. Either
-    median is NaN when its flank holds fewer than 3 usable samples.
-    Shared numerator machinery of :func:`step_evidence` (D) and the
-    elevated-background protection arm (§3.4.2 implementation note in
-    :func:`_protect_component`). Inputs are pre-validated by callers.
+    median is NaN when its flank holds fewer than
+    :data:`FLANK_MIN_COUNT` usable samples — unless ``max_reach`` > 0,
+    which enables the §3.4.2a nearest-k fallback for THIN flanks only
+    (see :func:`_flank_median_one_side`); ``max_reach=0`` is exactly the
+    original fixed-window behavior.  Shared numerator machinery of
+    :func:`step_evidence` (D) and the elevated-background protection arm
+    (§3.4.2 implementation note in :func:`_protect_component`). Inputs
+    are pre-validated by callers.
     """
-    pre = (t >= t[i_start] - window) & (t < t[i_start])
-    post = (t > t[i_end]) & (t <= t[i_end] + window)
+    before = t < t[i_start]
+    after = t > t[i_end]
+    # exclusions ignored: "is there DATA here at all", the discriminator
+    # between a data gap and a candidate-saturated transient neighborhood
+    pre_present = before & (t >= t[i_start] - window)
+    post_present = after & (t <= t[i_end] + window)
+    pre, post = pre_present, post_present
     if exclude is not None:
         ex = np.asarray(exclude, dtype=np.bool_)
         if ex.shape != t.shape:
             raise ValueError(
                 f"exclude shape {ex.shape} does not match t shape {t.shape}"
             )
-        pre &= ~ex
-        post &= ~ex
-    med_pre = (
-        float(np.median(r[pre])) if int(np.count_nonzero(pre)) >= 3 else float("nan")
+        before = before & ~ex
+        after = after & ~ex
+        pre = pre_present & ~ex
+        post = post_present & ~ex
+
+    med_pre = _flank_median_one_side(
+        t, r, pre, pre_present, before, float(t[i_start]), max_reach=max_reach
     )
-    med_post = (
-        float(np.median(r[post])) if int(np.count_nonzero(post)) >= 3 else float("nan")
+    med_post = _flank_median_one_side(
+        t, r, post, post_present, after, float(t[i_end]), max_reach=max_reach
     )
     return med_pre, med_post
 
@@ -997,6 +1109,7 @@ def step_evidence(
     window: float,
     scale: float,
     exclude: NDArray[np.bool_] | None = None,
+    max_reach: float = 0.0,
 ) -> float:
     """Compute the step-evidence statistic D of a candidate cluster.
 
@@ -1019,16 +1132,23 @@ def step_evidence(
         - ``exclude`` → ``exclude``: boolean mask of epochs to drop from
           both flank medians (normally the full candidate mask, so
           neighboring outliers cannot bias the flanks)
+        - ``R``       → ``max_reach``: nearest-k fallback reach [units of
+          t]; 0 (default) = fixed-window behavior only (§3.4.2a)
 
     Returns:
         D [dimensionless], float64. ``NaN`` when either flank holds
         fewer than 3 usable samples — the caller treats NaN as "cannot
         rule out a step" and protects (Gazeaux et al. 2013 motivates the
-        conservatism).
+        conservatism).  With ``max_reach`` > 0 a THIN flank first falls
+        back to the 3 usable samples nearest the cluster edge within
+        ``R``, so a flank straddling a data gap becomes determinate
+        instead of protecting by default; NaN then means genuinely
+        absent data (e.g. a cluster at the series end).
 
     Raises:
         ValueError: On invalid indices (``0 ≤ i_start ≤ i_end < N``),
-            shape mismatches, ``window ≤ 0`` or ``scale ≤ 0``.
+            shape mismatches, ``window ≤ 0``, ``scale ≤ 0`` or
+            ``max_reach < 0``.
 
     Reference:
         Gazeaux et al. 2013, JGR 118 (DOGEx — offsets are hard to
@@ -1051,8 +1171,10 @@ def step_evidence(
         raise ValueError(f"window must be > 0, got {window}")
     if scale <= 0.0:
         raise ValueError(f"scale must be > 0, got {scale}")
+    if max_reach < 0.0:
+        raise ValueError(f"max_reach must be >= 0, got {max_reach}")
     med_pre, med_post = _flank_medians(
-        tt, rr, i_start, i_end, window=window, exclude=exclude
+        tt, rr, i_start, i_end, window=window, exclude=exclude, max_reach=max_reach
     )
     if math.isnan(med_pre) or math.isnan(med_post):
         return float("nan")
@@ -1111,6 +1233,38 @@ class OutlierParams:
             differences [d] — across wider gaps an epoch has no usable
             neighbor and is never despiked
             (:func:`neighbor_differences`).
+        scale_floor_fraction: Hampel scale floor as a FRACTION of the
+            component's MEDIAN LOCAL scale — unit-free, so it needs no
+            per-station tuning, and it composes with ``scale_floor`` (the
+            effective floor is the larger).  Guards the MAD-implosion
+            degeneracy of Pearson et al. 2016 §3: when K+1 of a window's
+            2K+1 values coincide the local scale is exactly 0 and the
+            identifier flags the entire window.
+
+            The reference is the median LOCAL scale and not the global
+            one, which was measured to be wrong: against ŝ the smallest
+            legitimate local scale spans 0.0020-0.166 across the working
+            set, because at an unrest station ŝ is inflated by real
+            signal and quiet stretches look pathological.  A
+            global-referenced 0.05 suppressed 36 % of SENG's East epochs
+            whose windows hold entirely distinct values.  Against the
+            median local scale the same quantity spans 0.0298-0.229.
+
+            Default **0.02**, below every observed legitimate value, so it
+            forecloses the degeneracy and changes no current verdict.  It
+            is deliberately NOT a general quantized-data remedy — that
+            needs a value large enough to move real verdicts, which
+            belongs in a per-station override.
+        freeze_scale: Hold the robust scale fixed at its FIRST-sweep
+            estimate through the conservative iteration (default True).
+            Re-estimating it each sweep is the classic swamping feedback:
+            each sweep removes the tails, the trimmed scatter is tighter
+            than the true noise, the threshold shrinks, and the next sweep
+            flags epochs that were never anomalous.  The center still
+            tracks the improving fit — only the yardstick is held.  The
+            first-sweep estimate is already outlier-resistant (Huber fit +
+            MAD), so freezing costs nothing and removes the feedback.
+            False restores the pre-2026-08 behavior for attribution.
         scale_floor: Hampel scale floor s_floor [whitened-residual
             units] — guards the MAD-collapse degeneracy.
         min_outlier: Physical magnitude floor a_min [L], applied per
@@ -1122,9 +1276,72 @@ class OutlierParams:
         run_sign_fraction: Same-sign fraction q of the run rule.
         step_evidence_sigma: Step-evidence threshold k_step (§3.4.2).
         step_window_days: Step-evidence flank window W [d].
+        step_flank_max_reach_days: Nearest-k flank fallback reach R [d]
+            (§3.4.2a).  A fixed window W straddling a data gap holds < 3
+            usable samples and yields an INDETERMINATE D although good
+            samples sit just beyond the gap — the fixed window measures
+            elapsed time, not evidence.  When a flank is thin, the 3
+            usable samples nearest the cluster edge within R are used
+            instead; a flank that already has ≥ 3 in-window samples is
+            untouched, so this never perturbs a determinate statistic.
+            0 disables the fallback (pure fixed-window, the pre-2026-07
+            behavior).
+        step_magnitude_ratio: Magnitude-vs-step release ratio k_ratio
+            (§3.4.2b).  Releases ``PROTECT_STEP`` when the cluster's
+            amplitude about the local baseline exceeds ``k_ratio × D`` —
+            i.e. the excursion is far larger than the step invoked to
+            explain it (a 139 mm blunder on a 5 mm step scores ≈ 28; a
+            genuine step scores ≈ 0.5).  Applies only to the
+            DETERMINATE branch: with D indeterminate there is no step
+            magnitude to compare against, so this rule is silent there
+            and ``protect_on_indeterminate`` governs instead.  Default
+            **0.0 = disabled** — the rule can only ever loosen
+            detection, so it is opt-in until validated per network;
+            5.0 is the suggested starting value.
+        protect_on_indeterminate: Whether an INDETERMINATE step-evidence
+            statistic (``D`` NaN — a flank holding < 3 usable samples, so
+            "cannot rule out a step") protects the cluster (§3.4.2a).
+            Default **True**: the Gazeaux-motivated conservative
+            behavior, unchanged. Set False to make the step branch
+            respect ``step_evidence_sigma`` alone — without this switch
+            the NaN arm is unreachable by ANY threshold, so
+            ``step_evidence_sigma=1e6`` still protects and the knob
+            cannot express "stop protecting on step evidence". Turning
+            it off is also how a caller isolates the step rule when
+            testing the protection stages separately.
+        enable_global: Run the GLOBAL identifier S3 (|ẑ| > k_g).  Default
+            True.  Turning a stage off is a FIRST-CLASS operation (§14):
+            previously the only way was a sentinel threshold
+            (``global_n_sigma=1e9``), which does not express intent, cannot
+            be asserted on, and — for the protection stage — could not
+            express "off" at all (the §3.4.2a NaN arm).
+        enable_window: Run the WINDOWED Hampel identifier S4.  Default True.
+        enable_protection: Run the signal-protection stage S5 (floor / run /
+            step / operator windows).  Default True.  With it off, every
+            candidate becomes a flag — useful for attributing WHICH stage
+            found an epoch, never for production.
+        whiten_sigma_clip: Cap c on the whitening denominator, in units
+            of the median sigma (§13, :func:`clip_sigma`).  The formal
+            sigma inflates at exactly the bad epochs, so r/sigma
+            self-pardons gross excursions; capping it removes that
+            without discarding the seasonal quality ratio.  Default
+            **0.0 = off**, bit-identical to the pre-2026-07-28
+            behavior.  Measured on RHOF 2023-02-28 U (83.0 mm residual,
+            sigma 4.1x median): |z| 3.33 uncapped -> 8.82 at c=1.5 ->
+            6.74 at c=2.0 -> 4.53 at c=3.0, against k_g = 5.0.  Applies
+            to the IDENTIFIERS only; the robust fit keeps raw sigma.
         max_flag_fraction: Abort threshold f_max on the per-component
             **candidate** fraction (§3.5 — "> f_max of epochs *look
             like* outliers ⇒ unmodeled signal, do nothing, loudly").
+            The abort is PER COMPONENT (§3.5a): a pathological component
+            no longer zeroes its healthy siblings.
+        min_abort_candidates: Minimum ABSOLUTE candidate count before the
+            fraction rule may abort a component (§3.5a).  ``f_max`` alone
+            is quantized at small N — GFUM over a 90-day window aborts on
+            **4 candidates of 63** (6.3 % > 5 %), which is noise in the
+            counting rather than evidence of a wrong model.  Default
+            **0** reproduces the pre-2026-07-28 behavior bit-identically;
+            10 is the suggested production value.
         max_iterations: Sweep cap of the conservative iteration.
         loss: Robust-fit loss (``scipy.optimize.least_squares``);
             ``"huber"`` per §3.1.
@@ -1154,8 +1371,18 @@ class OutlierParams:
     run_sign_fraction: float = 0.8
     step_evidence_sigma: float = 3.0
     step_window_days: float = 10.0
+    step_flank_max_reach_days: float = 60.0
+    step_magnitude_ratio: float = 0.0
+    protect_on_indeterminate: bool = True
+    enable_global: bool = True
+    enable_window: bool = True
+    enable_protection: bool = True
+    whiten_sigma_clip: float = 0.0
     max_flag_fraction: float = 0.05
+    min_abort_candidates: int = 0
     max_iterations: int = 3
+    freeze_scale: bool = True
+    scale_floor_fraction: float = 0.02
     loss: str = "huber"
     f_scale: float = 1.0
     epoch_policy: str = "per_component"
@@ -1186,7 +1413,14 @@ class OutlierParams:
         for name in positive:
             if float(getattr(self, name)) <= 0.0:
                 raise ValueError(f"{name} must be > 0")
-        non_negative = ("scale_floor", "min_outlier", "max_run_days")
+        non_negative = (
+            "scale_floor",
+            "whiten_sigma_clip",
+            "min_outlier",
+            "max_run_days",
+            "step_flank_max_reach_days",
+            "step_magnitude_ratio",
+        )
         for name in non_negative:
             if float(getattr(self, name)) < 0.0:
                 raise ValueError(f"{name} must be >= 0")
@@ -1196,8 +1430,15 @@ class OutlierParams:
             raise ValueError("max_flag_fraction must be in (0, 1]")
         if self.window_min_count < 1:
             raise ValueError("window_min_count must be >= 1")
+        if self.min_abort_candidates < 0:
+            raise ValueError("min_abort_candidates must be >= 0")
         if self.max_iterations < 1:
             raise ValueError("max_iterations must be >= 1")
+        if not 0.0 <= self.scale_floor_fraction < 1.0:
+            raise ValueError(
+                f"scale_floor_fraction must be in [0, 1), got "
+                f"{self.scale_floor_fraction}"
+            )
         if self.window_order not in (0, 1, 2):
             raise ValueError(f"window_order must be 0, 1 or 2, got {self.window_order}")
         if self.window_order >= 1 and self.window_min_count < self.window_order + 2:
@@ -1284,11 +1525,25 @@ class OutlierDetection:
         n_despiked: Stage-0 gross-blunder count per component, shape
             (C,) int64 — all zeros unless ``params.despike`` is True.
         n_iterations: Detection sweeps actually performed.
-        converged: True when the flag mask reached a fixed point within
-            ``max_iterations`` (False on abort).
-        excess_flag_abort: True ⇒ the candidate fraction exceeded
-            ``max_flag_fraction`` and ``flags`` is all-False by rule
-            §3.5 — loud, diagnostics fully populated, never silent.
+        converged: True when every NON-ABORTED component reached a fixed
+            point within ``max_iterations``.  False when the sweep cap
+            was hit, or when every component aborted.  A partial abort
+            with the survivors converged reports True — the aborted
+            components are decided, not unfinished.
+        component_abort: Per-component abort mask, shape (C,) — True
+            where that component's candidate fraction exceeded
+            ``max_flag_fraction`` (subject to ``min_abort_candidates``)
+            and its ``flags`` row was therefore zeroed (§3.5a).  Always
+            present, shape (1,) for 1-D input.  An aborted component's
+            per-epoch diagnostics (``candidates``/``reasons``/
+            ``protected``/``z``) are those of the sweep in which IT
+            aborted, not of the last sweep the survivors ran — it is
+            decided and no longer re-evaluated.
+        excess_flag_abort: ``component_abort.any()`` — kept with its
+            original meaning so callers written against the whole-station
+            rule (notably ``detrend.estimate_detrend``) are unaffected.
+            Note the flags are now all-False only for the ABORTED
+            components; healthy siblings keep theirs.
         params: Echo of the thresholds used — provenance building block
             (MATH_STANDARDS §6).
     """
@@ -1308,6 +1563,11 @@ class OutlierDetection:
     converged: bool
     excess_flag_abort: bool
     params: OutlierParams
+    # Defaulted so any caller constructing this by hand (tests, stubs) keeps
+    # working; detect_outliers always passes it explicitly.
+    component_abort: NDArray[np.bool_] = dataclasses.field(
+        default_factory=lambda: np.zeros(0, dtype=np.bool_)
+    )
 
 
 def _resolve_floors(
@@ -1378,6 +1638,7 @@ def _component_candidates(
     inliers: NDArray[np.bool_],
     params: OutlierParams,
     half_window: float,
+    frozen: tuple[float, FloatArray] | None = None,
 ) -> tuple[
     FloatArray,
     FloatArray,
@@ -1420,7 +1681,10 @@ def _component_candidates(
         params.f_scale,
     )
     r = np.asarray(y_c - np.asarray(fit_model(tt, *p_hat), dtype=np.float64))
-    w = whiten(r, sigma_c)
+    # §13: cap sigma for the IDENTIFIER only. The robust fit above keeps the
+    # raw sigma, so §3.1's WLS weighting is untouched and backlog #6
+    # (f_scale not unit-agnostic on the sigma=None path) stays out of scope.
+    w = whiten(r, clip_sigma(sigma_c, params.whiten_sigma_clip))
     z, center, s_global = standardize_robust(w, scale=params.scale_estimator)
     n = int(tt.size)
     s_local = np.full(n, np.nan, dtype=np.float64)
@@ -1445,16 +1709,52 @@ def _component_candidates(
             order=params.window_order,
             robust_iterations=params.window_robust_iterations,
         )
+    if frozen is not None:
+        # Sweep >= 2: the SCALE is the one estimated on the first sweep. The
+        # center still tracks the improving fit -- only the yardstick is held.
+        s_global, s_local_frozen = frozen
+        s_local = s_local_frozen
     thin = np.isnan(s_local) | np.isnan(m)
     center_eff = np.where(thin, center, m)
     scale_eff = np.where(thin, s_global, s_local)
+    # MAD-implosion guard (Pearson et al. 2016 §3): if K+1 of a window's 2K+1
+    # values coincide the local scale is EXACTLY zero and the identifier flags
+    # the whole window. The absolute `scale_floor` guards it but defaults to 0,
+    # i.e. off.
+    #
+    # The reference is the MEDIAN LOCAL scale, deliberately NOT the global one.
+    # Measured: against s_global the smallest legitimate local scale ranges over
+    # 0.0020-0.166 across the working set -- an 80x spread -- because at an
+    # unrest station the global scale is inflated by real SIGNAL, so quiet
+    # stretches look pathologically small. A global-referenced floor of 0.05
+    # would have suppressed 36 % of SENG's East epochs whose windows are
+    # entirely distinct values (n=31, unique=31): not implosion at all. Against
+    # the median local scale the same quantity spans 0.0298-0.229, and the
+    # median is immune to that inflation.
+    #
+    # 0.02 sits below every observed legitimate value (min 0.0298, SENG E), so
+    # the guard forecloses collapse and changes no current verdict. It is NOT a
+    # general quantized-data remedy -- that needs a value large enough to move
+    # real verdicts, which belongs in a per-station override, not a default.
+    # The two floors compose; the effective one is whichever is larger.
+    finite_local = s_local[np.isfinite(s_local) & (s_local > 0.0)]
+    ref = float(np.median(finite_local)) if finite_local.size else float(s_global)
+    floor = max(params.scale_floor, float(params.scale_floor_fraction) * ref)
     local_mask = hampel_mask(
         w,
         center_eff,
         scale_eff,
         n_sigma=params.window_n_sigma,
-        scale_floor=params.scale_floor,
+        scale_floor=floor,
     )
+    # §14 stage gating. Zeroing the mask (rather than skipping the compute)
+    # keeps z / s_local populated, so a disabled stage stays DIAGNOSABLE —
+    # the point of isolation is attribution, and blanking the diagnostics
+    # would defeat it.
+    if not params.enable_global:
+        global_mask = np.zeros_like(global_mask)
+    if not params.enable_window:
+        local_mask = np.zeros_like(local_mask)
     candidates = global_mask | local_mask
     reasons[global_mask] |= np.uint8(REASON_GLOBAL)
     reasons[local_mask] |= np.uint8(REASON_LOCAL)
@@ -1529,7 +1829,13 @@ def _protect_component(
         background_rule = False
         if s_global > 0.0:
             med_pre, med_post = _flank_medians(
-                tt, w, i_start, i_end, window=step_window, exclude=flank_exclude
+                tt,
+                w,
+                i_start,
+                i_end,
+                window=step_window,
+                exclude=flank_exclude,
+                max_reach=params.step_flank_max_reach_days / _DAYS_PER_YEAR,
             )
             if math.isnan(med_pre) or math.isnan(med_post):
                 d = float("nan")
@@ -1541,7 +1847,36 @@ def _protect_component(
                 background_rule = background > params.step_evidence_sigma
         else:
             d = float("nan")
-        step_rule = math.isnan(d) or d > params.step_evidence_sigma
+        # §3.4.2a: the indeterminate (NaN) arm is a SEPARATE policy from the
+        # threshold, not a special case of it.  Folding them together
+        # ("isnan(d) or d > k") made the NaN arm unreachable by any k, so
+        # step_evidence_sigma=1e6 still protected -- a knob that cannot be
+        # turned off.  Default True keeps the conservative behavior.
+        if math.isnan(d):
+            step_rule = params.protect_on_indeterminate
+        else:
+            step_rule = d > params.step_evidence_sigma
+        # §3.4.2b magnitude-vs-step release (BGÓ): step evidence answers "did
+        # the level shift?" but never "by how much, RELATIVE to the excursion
+        # that raised the question".  A 139 mm blunder sitting on a real 5 mm
+        # step yields D > k_step and is protected by a step it dwarfs.  When
+        # the cluster's own amplitude about the local baseline exceeds
+        # k_ratio x the step it measured, the step cannot explain it and the
+        # protection is released.  A genuine step scores ~0.5 (the members sit
+        # AT the offset, so the excursion about the mid-level is half of it),
+        # far below any sane k_ratio -- this rule can only ever release, never
+        # protect, so it cannot mask signal that the other rules would keep.
+        if (
+            step_rule
+            and params.step_magnitude_ratio > 0.0
+            and not math.isnan(d)
+            and d > 0.0
+            and s_global > 0.0
+        ):
+            baseline = 0.5 * (med_pre + med_post)
+            amplitude = float(np.max(np.abs(w[members] - baseline))) / s_global
+            if amplitude > params.step_magnitude_ratio * d:
+                step_rule = False
         # A multi-day same-sign run is protected as possible unmodeled signal
         # UNLESS the step-evidence conclusively marks it a blunder cluster: it
         # returns to baseline (D small AND determinate) and both flanks sit at
@@ -1752,15 +2087,26 @@ def detect_outliers(
     scale_local = np.full((n_components, n), np.nan, dtype=np.float64)
     events: list[SuspectedEvent] = []
     converged = False
-    aborted = False
+    # §3.5a: the abort is per COMPONENT. The evidence is per component (SAUD's
+    # candidate fractions are [0.100, 0.009, 0.006] — only north is
+    # pathological), and zeroing east and up because north has an unmodeled
+    # signal problem discards perfectly good cleaning. Once a component
+    # aborts it is DECIDED: it is skipped on later sweeps and keeps its
+    # zeroed flags, while healthy siblings continue to their own fixed point.
+    component_abort = np.zeros(n_components, dtype=np.bool_)
     n_iterations = 0
+    # First-sweep robust scale per component, reused by every later sweep when
+    # `freeze_scale` is on (see OutlierParams.freeze_scale for why).
+    frozen_scale: list[tuple[float, FloatArray] | None] = [None] * n_components
 
     for _sweep in range(detection_params.max_iterations):
         n_iterations += 1
         events = []
-        aborted = False
-        new_flags = np.zeros_like(flags)
+        # aborted components keep their (zeroed) row rather than being rebuilt
+        new_flags = flags.copy()
         for c in range(n_components):
+            if component_abort[c]:
+                continue
             r, w, z_c, s_g, s_loc, cand_c, reasons_c = _component_candidates(
                 fit_model,
                 tt,
@@ -1770,7 +2116,10 @@ def detect_outliers(
                 ~(flags[c] | gross[c] | in_protect),
                 detection_params,
                 half_window,
+                frozen_scale[c],
             )
+            if detection_params.freeze_scale and frozen_scale[c] is None:
+                frozen_scale[c] = (float(s_g), np.array(s_loc, copy=True))
             # Gross (Stage-0) epochs are decided BEFORE the identifiers:
             # remove them from the identifier candidate set used for
             # protection and the abort fraction (they are not "epochs that
@@ -1780,21 +2129,29 @@ def detect_outliers(
             reasons_c = np.where(gross[c], np.uint8(REASON_GROSS), reasons_c).astype(
                 np.uint8
             )
-            prot_c, events_c = _protect_component(
-                tt,
-                r,
-                w,
-                cand_c,
-                s_g,
-                float(floors[c]),
-                protect_windows,
-                detection_params,
-                max_gap,
-                max_run,
-                step_window,
-                c,
-                despiked=gross[c],
-            )
+            # §14: with S5 off every candidate becomes a flag. An
+            # attribution tool ("which stage found this epoch?"), never a
+            # production setting -- protection is what stops real signal
+            # being masked.
+            if not detection_params.enable_protection:
+                prot_c = np.zeros(cand_c.shape, dtype=np.uint8)
+                events_c: list[SuspectedEvent] = []
+            else:
+                prot_c, events_c = _protect_component(
+                    tt,
+                    r,
+                    w,
+                    cand_c,
+                    s_g,
+                    float(floors[c]),
+                    protect_windows,
+                    detection_params,
+                    max_gap,
+                    max_run,
+                    step_window,
+                    c,
+                    despiked=gross[c],
+                )
             # Returned candidate mask INCLUDES gross so the documented §8.4
             # invariants hold with despike on: flags ⊆ candidates and
             # reasons == 0 exactly off candidates. Gross epochs carry
@@ -1818,12 +2175,25 @@ def detect_outliers(
             # (§3.5).
             abort_candidates = cand_c & ~in_protect
             n_abort = float(np.count_nonzero(abort_candidates))
-            if n_abort / n > detection_params.max_flag_fraction:
-                aborted = True
+            # §3.5a: the fraction rule is quantized at small N (GFUM/90 d
+            # aborts on 4 candidates of 63 = 6.3 %), so an absolute floor
+            # gates it. Default 0 leaves the rule exactly as it was.
+            if (
+                n_abort / n > detection_params.max_flag_fraction
+                and n_abort >= detection_params.min_abort_candidates
+            ):
+                component_abort[c] = True
+                new_flags[c] = False  # zero THIS component only
         if detection_params.epoch_policy == "union":
-            union = np.any(new_flags, axis=0)
-            new_flags = np.repeat(union[np.newaxis, :], n_components, axis=0)
-        if aborted:
+            # Union over the SURVIVORS only: an aborted component's all-False
+            # row carries no information, and folding it in would let one
+            # pathological component suppress nothing while a healthy one
+            # promotes across it — reintroducing the blast radius §3.5a removes.
+            live = ~component_abort
+            if live.any():
+                union = np.any(new_flags[live], axis=0)
+                new_flags[live] = union
+        if component_abort.all():
             flags = np.zeros_like(flags)
             converged = False
             break
@@ -1867,8 +2237,9 @@ def detect_outliers(
             n_despiked=n_despiked,
             n_iterations=n_iterations,
             converged=converged,
-            excess_flag_abort=aborted,
+            excess_flag_abort=bool(component_abort.any()),
             params=detection_params,
+            component_abort=component_abort,
         )
     return OutlierDetection(
         flags=flags,
@@ -1884,6 +2255,7 @@ def detect_outliers(
         n_despiked=n_despiked,
         n_iterations=n_iterations,
         converged=converged,
-        excess_flag_abort=aborted,
+        excess_flag_abort=bool(component_abort.any()),
         params=detection_params,
+        component_abort=component_abort,
     )

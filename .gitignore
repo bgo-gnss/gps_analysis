@@ -20,3 +20,10 @@ graphify-out/
 reference/gbis4ts/*.pdf
 reference/gbis4ts/**/*.rtf
 reference/gbis4ts/**/*.html
+
+# Cited papers: fetched on demand, never committed (same policy as above —
+# and most publisher PDFs may not be redistributed even when readable here).
+# Re-fetch any of them in one command:
+#   python3 ~/.claude/skills/search-scholar/scripts/paper-get.py <doi> --out reference/papers
+# See reference/papers/README.md for the citation-bearing list.
+reference/papers/*.pdf

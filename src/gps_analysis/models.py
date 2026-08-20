@@ -265,8 +265,51 @@ def exp_linear(
         Model positions x(t) [L], float64, same shape as ``t``.
 
     Reference:
-        Bevis & Brown 2014, J. Geodesy 88, eq. (6)–(7) (exponential
-        transient term of the extended trajectory model). Legacy sources:
+        **Elementary, and deliberately not attributed to any process.**
+        This is the general solution of a first-order linear ODE whose
+        equilibrium drifts linearly. Substituting ``u(t) = x(t) − (x₀ + v·t)``
+        for the departure from the linear asymptote,
+
+            ``du/dt = −k·u``   ⟹   ``u(t) = A·e^(−k·t)``
+
+        so ``x(t) = x₀ + v·t + A·e^(−k·t)`` and, equivalently,
+
+            ``dx/dt = v − k·(x − x₀ − v·t)``.
+
+        The derivation is given in full here rather than cited because it is
+        two lines of textbook ODE theory, and because naming a source would
+        misrepresent where the form comes from.
+
+        ⚠ **The form carries NO information about the mechanism.** Relaxation
+        toward a linearly-moving equilibrium is one of the most common
+        behaviours in nature: Newton's law of cooling, an RC circuit charging
+        under a ramp input, decay with constant resupply, compartmental and
+        biological kinetics, and any number of unrelated geophysical systems
+        all produce this identical curve. A good fit therefore says only that
+        *something* relaxes at rate ``k`` toward a trend ``v`` — it does not
+        identify what, and nothing about the underlying process may be
+        inferred from it without independent knowledge of that system.
+
+        Instances of use — **examples, never the derivation, and never
+        evidence about mechanism**: Reverso et al. 2014, JGR Solid Earth 119,
+        4666–4683, doi:10.1002/2013JB010569, eq. (20), fit posteruptive GNSS
+        displacement at Grímsvötn with ``Φ·(1 − e^(−t/τ)) + U̇_∞·t + C``
+        (this function under ``x₀ = C + Φ``, ``v = U̇_∞``, ``A = −Φ``,
+        ``k = 1/τ`` — the mapping is why A < 0 approaching the asymptote from
+        below), measuring ``τ = 0.33 ± 0.08`` and ``0.13 ± 0.04 yr``. Their
+        own §5 makes the same point from the other side: a hydraulically-fed
+        reservoir and one in a viscous shell fit equally well (Dzurisin et
+        al. 2009), as does thermo-poro-elastic injection (Fournier & Chardot
+        2012). The same shape appears at Axial Seamount (Nooner & Chadwick
+        2009), Westdahl and Okmok (Lu et al. 2003, 2010).
+
+        NOT Bevis & Brown 2014 — this docstring cited that paper's
+        "eq. (6)–(7)" until 2026-08-02, which is wrong twice over: those are
+        its sub-model decomposition and polynomial trend, and it contains no
+        exponential transient at all (only the logarithmic ``A·log(1+Δt/T)``,
+        its eq. 9). See ``reference/papers/README.md``.
+
+        Legacy sources:
         ``svartsengi_model.fitting.expf_long`` ≡
         ``exp_linear(t, p0, 0, p1, p2)`` (steady-state magma-inflow
         equilibration, Svartsengi half-life ≈ 90–120 d ⇒ k ≈ 2–3 yr⁻¹)
@@ -309,8 +352,14 @@ def exp_linear_rate(
         Instantaneous rate dx/dt [L/yr], float64, same shape as ``t``.
 
     Reference:
-        Analytic derivative of :func:`exp_linear` (Bevis & Brown 2014,
-        eq. 6). Legacy sources: ``svartsengi_model.fitting.dexpf`` ≡
+        Analytic derivative of :func:`exp_linear` — see that function's
+        Reference block for what the form does and does not imply.
+        NOT Bevis & Brown 2014 eq. 6: this docstring carried that
+        citation until 2026-08-09, inherited from the parent's
+        since-corrected one, and it is wrong for the same reason — that
+        paper's eq. 6 is a sub-model decomposition, and it contains no
+        exponential transient at all. Legacy sources:
+        ``svartsengi_model.fitting.dexpf`` ≡
         ``exp_linear_rate(t, 0, p1, p2)``; ``dexpf_short`` ≡
         ``exp_linear_rate(t, 0, p0, 1/p1)``.
 
