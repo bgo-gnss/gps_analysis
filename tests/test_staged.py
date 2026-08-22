@@ -28,10 +28,20 @@ from gps_analysis.staged import (
     HeldExplicit,
     HeldFromStage,
     Stage,
+    StagedEstimate,
     compose_held,
     estimate_staged,
     fit_held_partition,
+    group_parameter_mask,
 )
+
+
+def _groups(est: StagedEstimate) -> dict[str, dict[str, object]]:
+    """The fragment's ``groups`` block, type-narrowed for the assertions."""
+    groups = est.to_record_fragment()["groups"]
+    assert isinstance(groups, dict)
+    return groups
+
 
 TRUTH = np.array([3.0, 12.5, 2.0, 1.5, 0.4, -0.3])
 """offset, rate, cos_annual, sin_annual, cos_semiannual, sin_semiannual."""
@@ -548,12 +558,112 @@ class TestEstimateStaged:
             ],
         )
         frag = est.to_record_fragment()
-        assert set(frag) == {"stage_plan", "stages"}
+        assert set(frag) == {"groups", "stage_plan", "stages"}
         assert frag["stage_plan"][1]["held"] == {"periodic": "stage:clean"}
         assert frag["stages"][1]["held_covariance"] == "propagated"
         import json
 
         assert json.loads(json.dumps(frag)) == frag, "must be JSON-round-trippable"
+
+    def test_groups_block_names_the_estimating_stage_not_the_holder(self) -> None:
+        """`long` re-holds the periodic, but `clean` MADE it — provenance
+        must say self@clean with clean's domain, or the block would send an
+        operator auditing a seasonal to the wrong window."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage("clean", ("secular", "periodic"), segments=[(None, 2005.6)]),
+                Stage("long", ("secular",), held={"periodic": HeldFromStage("clean")}),
+            ],
+        )
+        groups = _groups(est)
+        assert set(groups) == {"secular", "periodic"}
+        assert groups["secular"] == {
+            "indices": [0, 1],
+            "stage": "long",
+            "segments": None,  # inherited the caller's (whole-series) domain
+            "provenance": "self",
+        }
+        assert groups["periodic"] == {
+            "indices": [2, 3, 4, 5],
+            "stage": "clean",
+            "segments": [[None, 2005.6]],
+            "provenance": "self",
+        }
+
+    def test_groups_indices_agree_with_group_parameter_mask(self) -> None:
+        """The block must be a projection of the ONE staged classifier —
+        an independent per-name list here is how a second vocabulary
+        (select_terms' step-folding) would sneak back in."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[Stage("all", ("secular", "periodic"))],
+        )
+        groups = _groups(est)
+        for name, entry in groups.items():
+            expected = np.flatnonzero(group_parameter_mask("lineperiodic", name))
+            assert entry["indices"] == [int(j) for j in expected]
+
+    def test_groups_block_carries_a_borrow_source_verbatim(self) -> None:
+        """A held-explicit group was never estimated on this station: its
+        provenance is the source string (geo_dataread spells it
+        ``donor:STA@fitted_at``) and its segments are None — the estimation
+        domain is the DONOR's and lives in the donor's record."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage(
+                    "fit",
+                    ("secular",),
+                    held={
+                        "periodic": HeldExplicit(
+                            TRUTH[PERIODIC], source="donor:OLAC@2026-07-01"
+                        )
+                    },
+                )
+            ],
+        )
+        groups = _groups(est)
+        assert groups["periodic"] == {
+            "indices": [2, 3, 4, 5],
+            "stage": "fit",
+            "segments": None,
+            "provenance": "donor:OLAC@2026-07-01",
+        }
+        assert groups["secular"]["provenance"] == "self"
+
+    def test_groups_block_covers_step_amplitudes(self) -> None:
+        """Steps are their own group here (the staged vocabulary), and their
+        appended-at-the-end indices are exactly why `indices` is explicit."""
+        from gps_analysis import with_steps
+        from gps_analysis.models import lineperiodic
+
+        rng = np.random.default_rng(3)
+        t = 2001.6 + np.arange(3000) / 365.25
+        model = with_steps(lineperiodic, [2005.0])
+        y = _design(t) @ TRUTH + 4.0 * (t >= 2005.0) + rng.normal(0.0, 1.0, t.size)
+        est = estimate_staged(
+            model,
+            t,
+            y,
+            plan=[Stage("all", ("secular", "periodic", "step"))],
+        )
+        groups = _groups(est)
+        assert groups["step"] == {
+            "indices": [6],
+            "stage": "all",
+            "segments": None,
+            "provenance": "self",
+        }
 
     @pytest.mark.parametrize(
         "plan, match",

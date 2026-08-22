@@ -401,9 +401,33 @@ class StagedEstimate:
         precedent: ``trajectory_from_record`` reads only
         version/model/step_epochs/param_names/components, and
         ``TrajectoryParams.from_record`` ignores unknown keys, so a staged
-        record and a single-fit one coexist in one document.
+        record and a single-fit one coexist in one document.  ``groups`` does
+        not bump the version for the same reason ``terms`` DID: a reader that
+        ignores ``terms`` mis-evaluates the trajectory (the spec is required
+        to rebuild the model), while a reader that ignores ``groups`` loses
+        only provenance — every number it evaluates is unchanged.
+
+        ``groups`` is per-term-group provenance — for each group the model
+        carries: which parameters are its (explicit ``indices`` into
+        ``param_names``), which stage's fit owns the composed value, on what
+        domain, and whether the value is this station's own (``"self"``) or a
+        held-explicit source (a borrow's ``HeldExplicit.source``, e.g.
+        ``donor:VMEY@<fitted_at>``).  An UNSTAGED record gets no ``groups``
+        key at all: for a single fit the answer ("everything self, on the
+        record's own domain") is fully derivable from keys the record already
+        has, and writing it down again would be a second copy that can drift
+        — absence already means "legacy single-window" for ``segments``, and
+        it means "single-stage, all self" here.
         """
         return {
+            # Explicit indices rather than a start/stop range, for two
+            # reasons: a range is exactly the shape the `segments` comment in
+            # detrend.py warns about (a 2-list a reader could index
+            # positionally as a window), and contiguity per group is an
+            # accident of today's term ordering (with_steps APPENDS step
+            # amplitudes after transient ones, already breaking GROUP_ORDER
+            # ordering) — indices stay correct whatever the order becomes.
+            "groups": self._groups_block(),
             "stage_plan": [
                 {
                     "name": s.name,
@@ -430,6 +454,76 @@ class StagedEstimate:
                 for r in self.stages
             ],
         }
+
+    def _groups_block(self) -> dict[str, dict[str, object]]:
+        """Per-group provenance of the composed parameter set.
+
+        Membership comes from :func:`_staged_group_of` over ``param_names``
+        — the SAME classifier :func:`group_parameter_mask` wraps — rather
+        than from ``group_parameter_mask(self.model, ...)``, because
+        ``self.model`` is a registry code only for registry models; a
+        composed transient model carries a name like
+        ``"polynomial+seasonal+log_transient"`` that no resolver accepts.
+        Classifying the names we already hold keeps the one-definition rule
+        without re-resolving anything.
+        """
+        members: dict[str, list[int]] = {}
+        for j, name in enumerate(self.param_names):
+            members.setdefault(_staged_group_of(name), []).append(j)
+        out: dict[str, dict[str, object]] = {}
+        for group in GROUP_ORDER:
+            if group not in members:
+                continue
+            stage, provenance, segments = self._group_origin(group)
+            out[group] = {
+                "indices": members[group],
+                "stage": stage,
+                # The estimating stage's domain; None means the record's own
+                # fit domain (its `segments`/`window` keys) — either because
+                # the stage inherited it, or because the value was never
+                # estimated on THIS station at all (a held-explicit borrow,
+                # whose domain lives in the donor's record). `provenance`
+                # disambiguates the two.
+                "segments": (
+                    None if segments is None else [[a, b] for a, b in segments]
+                ),
+                "provenance": provenance,
+            }
+        return out
+
+    def _group_origin(
+        self, group: str
+    ) -> tuple[str, str, Sequence[tuple[float | None, float | None]] | None]:
+        """``(stage, provenance, segments)`` of a group's composed value.
+
+        Mirrors the composition rule of :func:`estimate_staged` (a group
+        held in the FINAL stage is owned by that hold; otherwise the last
+        stage that freed it owns it), then walks ``stage:`` pointers to
+        where the value was actually MADE — so provenance says ``"self"``
+        with the estimating stage, not the stage that merely re-held it.
+        """
+        by_name = {s.name: s for s in self.plan}
+        stage = self.plan[-1]
+        if group not in stage.held:
+            for st in reversed(self.plan):
+                if group in st.free:
+                    return st.name, "self", st.segments
+            raise ValueError(
+                f"group {group!r} is never freed and not held in the final "
+                f"stage; estimate_staged would have refused this plan"
+            )
+        while True:
+            src = stage.held.get(group)
+            if src is None:
+                # A stage: chain that dead-ends in a stage which neither
+                # freed nor held the group: estimate_staged composed a zero
+                # there. Name the stage rather than claim "self".
+                return stage.name, f"stage:{stage.name}", None
+            if isinstance(src, HeldExplicit):
+                return stage.name, src.source, None
+            stage = by_name[src.stage]
+            if group in stage.free:
+                return stage.name, "self", stage.segments
 
 
 def _held_provenance(held: Held) -> str:
