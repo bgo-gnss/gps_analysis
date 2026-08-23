@@ -47,6 +47,7 @@ R2/R6).
 
 import dataclasses
 from collections.abc import Mapping, Sequence
+from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -65,6 +66,7 @@ __all__ = [
     "estimate_staged",
     "fit_held_partition",
     "group_parameter_mask",
+    "record_group_mask",
 ]
 
 
@@ -635,6 +637,70 @@ def group_parameter_mask(model: str | ModelFunc, group: str) -> NDArray[np.bool_
     model_func, _ = _resolve_model(model)
     names = _param_names(model_func)
     return np.array([_staged_group_of(n) == group for n in names], dtype=np.bool_)
+
+
+def record_group_mask(
+    record: Mapping[str, Any], group: str | Sequence[str]
+) -> NDArray[np.bool_]:
+    """Which of a stored RECORD's parameters belong to the named term groups.
+
+    :func:`group_parameter_mask` answers this for a *model*, whose parameter
+    vector is the unaugmented one.  A stored record's is longer:
+    ``StationEstimate.to_record`` APPENDS one ``step_amp_k`` per declared
+    step to the model's ``param_names``, so a station with a declared step
+    stores 7 parameters against ``lineperiodic``'s 6.
+
+    Callers that compared the two widths directly therefore REFUSED every
+    record carrying a step — which took out borrowing ``secular`` or
+    ``periodic`` from any station in ``steps.csv`` (SELF, HOFN), and with it
+    the whole "hold this station's own saved background and estimate only the
+    events" workflow.  Measured 2026-08-23.
+
+    Classification still comes from ``param_names``, never from a local list;
+    the appended tail is the one thing decided by construction, because no
+    classifier ever sees it.
+
+    Args:
+        record: A stored detrend record (needs ``param_names``, or ``model``
+            plus a component to infer the width from).
+        group: One term-group name, or several.
+
+    Returns:
+        Boolean mask aligned with the record's per-component parameter vector.
+
+    Raises:
+        ValueError: On an unknown group name.
+    """
+    wanted = {group} if isinstance(group, str) else set(group)
+    unknown = wanted - set(GROUP_ORDER)
+    if unknown:
+        raise ValueError(
+            f"unknown term group(s) {sorted(unknown)}; known: {list(GROUP_ORDER)}"
+        )
+    names = list(record.get("param_names") or ())
+    if names:
+        return np.array([_staged_group_of(n) in wanted for n in names], dtype=np.bool_)
+
+    # No param_names (a hand-written or very old record): fall back to the
+    # model's own vector and pad the step tail from the component width.
+    model = record.get("model")
+    if not isinstance(model, str):
+        raise ValueError("record has neither param_names nor a model code")
+    base = np.zeros(0, dtype=np.bool_)
+    for name in wanted:
+        one = group_parameter_mask(model, name)
+        base = one if base.size == 0 else (base | one)
+    components = record.get("components") or ()
+    width = base.size
+    if components:
+        first = components[0]
+        if isinstance(first, Mapping):
+            width = len(first.get("params") or ())
+    mask = np.zeros(max(width, base.size), dtype=np.bool_)
+    mask[: base.size] = base
+    if "step" in wanted:
+        mask[base.size :] = True
+    return mask
 
 
 def estimate_staged(

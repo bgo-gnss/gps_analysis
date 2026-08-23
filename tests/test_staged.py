@@ -95,9 +95,9 @@ class TestHeldFixedPoint:
             held_values=p_joint,  # full-length; only the held entries are read
             absolute_sigma=True,
         )
-        assert np.allclose(p_staged[SECULAR], p_joint[SECULAR], rtol=1e-6, atol=0.0), (
-            f"free params moved: {p_staged[SECULAR] - p_joint[SECULAR]}"
-        )
+        assert np.allclose(
+            p_staged[SECULAR], p_joint[SECULAR], rtol=1e-6, atol=0.0
+        ), f"free params moved: {p_staged[SECULAR] - p_joint[SECULAR]}"
 
     def test_the_held_values_pass_through_untouched(self) -> None:
         _t, a, y, sigma = _series()
@@ -165,9 +165,9 @@ class TestPropagatedCovariance:
         c_exact = (lin * sigma**2) @ lin.T
 
         got = cov[np.ix_(SECULAR, SECULAR)]
-        assert np.allclose(got, c_exact, rtol=1e-9, atol=0.0), (
-            f"max rel err {np.max(np.abs(got - c_exact)) / np.max(np.abs(c_exact)):.2e}"
-        )
+        assert np.allclose(
+            got, c_exact, rtol=1e-9, atol=0.0
+        ), f"max rel err {np.max(np.abs(got - c_exact)) / np.max(np.abs(c_exact)):.2e}"
 
     def test_the_conditional_form_always_understates(self) -> None:
         """``K C_v Kᵀ ⪰ 0``, so omitting it can only be optimistic."""
@@ -499,9 +499,9 @@ class TestEstimateStaged:
             names=["north", "east", "up"],
         )
         assert [s.name for s in est.stages] == ["clean", "long"]
-        assert est.stages[0].n_epochs < est.stages[1].n_epochs, (
-            "the clean window must be a strict subset of the long span"
-        )
+        assert (
+            est.stages[0].n_epochs < est.stages[1].n_epochs
+        ), "the clean window must be a strict subset of the long span"
         # the rate comes from the LAST stage that freed it; the seasonal from
         # the only stage that freed it
         assert est.fits[0].params[1] == pytest.approx(TRUTH[1], abs=0.1)
@@ -1044,3 +1044,73 @@ class TestGroupClassifiersCoverTheWholeTermAlgebra:
 
         with pytest.raises(ValueError, match="cannot classify"):
             _staged_group_of("tidal_k1")
+
+
+class TestRecordGroupMask:
+    """A stored record's parameter vector is LONGER than its model's.
+
+    ``to_record`` appends one ``step_amp_k`` per declared step, so a station
+    in ``steps.csv`` stores 7 parameters against ``lineperiodic``'s 6. Code
+    that compared the two widths refused every such record — which took out
+    borrowing ``secular``/``periodic`` from SELF or HOFN, and with it the
+    whole "hold this station's own saved background and estimate only the
+    events" workflow.
+    """
+
+    RECORD = {
+        "model": "lineperiodic",
+        "param_names": [
+            "offset",
+            "rate",
+            "cos_annual",
+            "sin_annual",
+            "cos_semiannual",
+            "sin_semiannual",
+            "step_amp_1",
+        ],
+        "components": [{"params": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]}],
+    }
+
+    def test_it_spans_the_stored_vector_not_the_model(self) -> None:
+        from gps_analysis.staged import group_parameter_mask, record_group_mask
+
+        assert group_parameter_mask("lineperiodic", "secular").size == 6
+        assert record_group_mask(self.RECORD, "secular").size == 7
+
+    def test_the_appended_tail_is_step(self) -> None:
+        from gps_analysis.staged import record_group_mask
+
+        names = self.RECORD["param_names"]
+        mask = record_group_mask(self.RECORD, "step")
+        assert [n for n, m in zip(names, mask, strict=True) if m] == ["step_amp_1"]
+
+    def test_secular_does_not_swallow_the_step(self) -> None:
+        """The staged vocabulary keeps them apart; the apply-time one does not."""
+        from gps_analysis.staged import record_group_mask
+
+        names = self.RECORD["param_names"]
+        mask = record_group_mask(self.RECORD, "secular")
+        assert [n for n, m in zip(names, mask, strict=True) if m] == ["offset", "rate"]
+
+    def test_several_groups_at_once(self) -> None:
+        from gps_analysis.staged import record_group_mask
+
+        mask = record_group_mask(self.RECORD, ["secular", "periodic"])
+        assert mask.sum() == 6 and not mask[-1]
+
+    def test_a_record_without_param_names_falls_back_to_the_model(self) -> None:
+        from gps_analysis.staged import record_group_mask
+
+        legacy = {k: v for k, v in self.RECORD.items() if k != "param_names"}
+        mask = record_group_mask(legacy, "secular")
+        assert mask.size == 7
+        assert list(mask[:2]) == [True, True]
+        assert not mask[-1], "the step tail is not secular"
+
+    def test_an_unknown_group_is_refused(self) -> None:
+        import pytest
+
+        from gps_analysis.staged import record_group_mask
+
+        with pytest.raises(ValueError, match="unknown term group"):
+            record_group_mask(self.RECORD, "gravitational_wave")
