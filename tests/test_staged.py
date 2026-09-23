@@ -97,9 +97,9 @@ class TestHeldFixedPoint:
             held_values=p_joint,  # full-length; only the held entries are read
             absolute_sigma=True,
         )
-        assert np.allclose(
-            p_staged[SECULAR], p_joint[SECULAR], rtol=1e-6, atol=0.0
-        ), f"free params moved: {p_staged[SECULAR] - p_joint[SECULAR]}"
+        assert np.allclose(p_staged[SECULAR], p_joint[SECULAR], rtol=1e-6, atol=0.0), (
+            f"free params moved: {p_staged[SECULAR] - p_joint[SECULAR]}"
+        )
 
     def test_the_held_values_pass_through_untouched(self) -> None:
         _t, a, y, sigma = _series()
@@ -167,9 +167,9 @@ class TestPropagatedCovariance:
         c_exact = (lin * sigma**2) @ lin.T
 
         got = cov[np.ix_(SECULAR, SECULAR)]
-        assert np.allclose(
-            got, c_exact, rtol=1e-9, atol=0.0
-        ), f"max rel err {np.max(np.abs(got - c_exact)) / np.max(np.abs(c_exact)):.2e}"
+        assert np.allclose(got, c_exact, rtol=1e-9, atol=0.0), (
+            f"max rel err {np.max(np.abs(got - c_exact)) / np.max(np.abs(c_exact)):.2e}"
+        )
 
     def test_the_conditional_form_always_understates(self) -> None:
         """``K C_v Kᵀ ⪰ 0``, so omitting it can only be optimistic."""
@@ -501,9 +501,9 @@ class TestEstimateStaged:
             names=["north", "east", "up"],
         )
         assert [s.name for s in est.stages] == ["clean", "long"]
-        assert (
-            est.stages[0].n_epochs < est.stages[1].n_epochs
-        ), "the clean window must be a strict subset of the long span"
+        assert est.stages[0].n_epochs < est.stages[1].n_epochs, (
+            "the clean window must be a strict subset of the long span"
+        )
         # the rate comes from the LAST stage that freed it; the seasonal from
         # the only stage that freed it
         assert est.fits[0].params[1] == pytest.approx(TRUTH[1], abs=0.1)
@@ -1132,9 +1132,15 @@ class TestApplyOnlyStage:
     """
 
     def _held(self) -> dict[str, HeldExplicit]:
+        # TRUTH generated `y`, so this secular IS at this station's datum --
+        # which is what local_datum asserts. The donor-datum != recipient-datum
+        # case, which this fixture cannot see by construction, is
+        # TestHeldDatumGuard below.
         return {
             "secular": HeldExplicit(
-                values=TRUTH[SECULAR], source="store:SENG@t0 anchored [2021.0,2021.5]"
+                values=TRUTH[SECULAR],
+                source="store:SENG@t0 anchored [2021.0,2021.5]",
+                local_datum=True,
             ),
             "periodic": HeldExplicit(values=TRUTH[PERIODIC], source="store:SENG@t0"),
         }
@@ -1180,7 +1186,10 @@ class TestApplyOnlyStage:
         c_sec = np.diag([0.04, 0.0001])
         held = self._held()
         held["secular"] = HeldExplicit(
-            values=TRUTH[SECULAR], source="store:SENG@t0", covariance=c_sec
+            values=TRUTH[SECULAR],
+            source="store:SENG@t0",
+            covariance=c_sec,
+            local_datum=True,
         )
         est = estimate_staged(
             "lineperiodic",
@@ -1432,9 +1441,9 @@ class TestHeldFromStageMustNameAnEstimator:
         res = estimate_staged("lineperiodic", t, y, plan=plan)
         assert res.stages[-1].held_covariance == "propagated"
         i_cos = res.param_names.index("cos_annual")
-        assert (
-            abs(res.fits[0].params[i_cos] - 3.0) < 1e-6
-        ), "the relayed cosine is a real estimate, not a composed zero"
+        assert abs(res.fits[0].params[i_cos] - 3.0) < 1e-6, (
+            "the relayed cosine is a real estimate, not a composed zero"
+        )
 
 
 class TestEvaluateGroupValuesCoversCurvature:
@@ -1471,3 +1480,109 @@ class TestEvaluateGroupValuesCoversCurvature:
         reverse = evaluate_group_values(["poly_3", "curvature"], [4.0, 3.0], t)
         assert np.allclose(forward, reverse)
         assert np.allclose(forward, 3.0 * t**2 + 4.0 * t**3)
+
+
+class TestHeldDatumGuard:
+    """A held intercept must be THIS station's (REVIEW_2026-09-13 finding #1).
+
+    Recipient 30 mm from the donor: a donor secular held verbatim put the
+    whole 30 mm into whatever was free — the residual level on an apply-only
+    stage, a true 5.0 mm step estimated as 35.0 mm on a free=("step",) one.
+    The leaf now refuses an unmarked datum-carrying hold; a hold re-anchored
+    with ``weighted_datum`` and marked ``local_datum=True`` recovers 5 mm.
+    """
+
+    SHIFT = 30.0
+    STEP_EPOCH = 2005.0
+    STEP = 5.0
+
+    def _recipient(self):
+        from gps_analysis import with_steps
+        from gps_analysis.models import lineperiodic
+
+        rng = np.random.default_rng(21)
+        t = 2001.6 + np.arange(3000) / 365.25
+        y = (
+            _design(t) @ TRUTH
+            + self.SHIFT
+            + self.STEP * (t >= self.STEP_EPOCH)
+            + rng.normal(0.0, 1.0, t.size)
+        )
+        return with_steps(lineperiodic, [self.STEP_EPOCH]), t, y
+
+    def _plan(self, secular: HeldExplicit) -> list[Stage]:
+        return [
+            Stage(
+                "steps",
+                ("step",),
+                held={
+                    "secular": secular,
+                    "periodic": HeldExplicit(TRUTH[PERIODIC], "donor:SENG"),
+                },
+            )
+        ]
+
+    def test_unmarked_donor_secular_is_refused_on_a_fitting_stage(self) -> None:
+        model, t, y = self._recipient()
+        donor = HeldExplicit(TRUTH[SECULAR], "donor:SENG")
+        with pytest.raises(ValueError, match="local_datum=True"):
+            estimate_staged(model, t, y, plan=self._plan(donor))
+
+    def test_unmarked_donor_secular_is_refused_on_an_apply_only_stage(self) -> None:
+        t, _a, y, sigma = _series()
+        plan = [
+            Stage(
+                "apply",
+                (),
+                held={
+                    "secular": HeldExplicit(TRUTH[SECULAR], "donor:SENG"),
+                    "periodic": HeldExplicit(TRUTH[PERIODIC], "donor:SENG"),
+                },
+            )
+        ]
+        with pytest.raises(ValueError, match="including its datum"):
+            estimate_staged("lineperiodic", t, y, sigma, plan=plan)
+
+    def test_a_periodic_only_borrow_needs_no_marker(self) -> None:
+        """No datum in the group, nothing to leak — the legacy OLAC manoeuvre."""
+        t, _a, y, sigma = _series()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y,
+            sigma,
+            plan=[
+                Stage(
+                    "fit",
+                    ("secular",),
+                    held={"periodic": HeldExplicit(TRUTH[PERIODIC], "donor:OLAC")},
+                )
+            ],
+        )
+        assert est.fits[0].params[1] == pytest.approx(TRUTH[1], abs=0.05)
+
+    def test_marking_alone_does_not_hide_the_leak(self) -> None:
+        """local_datum is an assertion, not a fix: marked but NOT anchored, the
+        30 mm still lands in the step. This is why the marker is the caller's
+        promise and the anchoring its job."""
+        model, t, y = self._recipient()
+        donor = HeldExplicit(TRUTH[SECULAR], "donor:SENG", local_datum=True)
+        est = estimate_staged(model, t, y, plan=self._plan(donor))
+        assert est.fits[0].params[-1] == pytest.approx(self.STEP + self.SHIFT, abs=0.2)
+
+    def test_reanchored_donor_secular_recovers_the_true_step(self) -> None:
+        from gps_analysis import evaluate_group_values, weighted_datum
+
+        model, t, y = self._recipient()
+        pre = t < self.STEP_EPOCH  # anchor where the step is not yet in play
+        g = evaluate_group_values(
+            ["rate", "cos_annual", "sin_annual", "cos_semiannual", "sin_semiannual"],
+            TRUTH[1:],
+            t[pre],
+        )
+        anchored = TRUTH[SECULAR].copy()
+        anchored[0] = weighted_datum(y[pre], g)
+        assert anchored[0] == pytest.approx(TRUTH[0] + self.SHIFT, abs=0.2)
+        donor = HeldExplicit(anchored, "donor:SENG anchored", local_datum=True)
+        est = estimate_staged(model, t, y, plan=self._plan(donor))
+        assert est.fits[0].params[-1] == pytest.approx(self.STEP, abs=0.2)

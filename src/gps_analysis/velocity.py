@@ -624,8 +624,7 @@ class VelocityEstimateMIDAS(VelocityEstimate):
         frac = np.asarray(self.fraction_removed, dtype=np.float64)
         if len(self.n_used) != n_components:
             raise ValueError(
-                f"got {len(self.n_used)} n_used entries for "
-                f"{n_components} components"
+                f"got {len(self.n_used)} n_used entries for {n_components} components"
             )
         if scale.shape != (n_components,):
             raise ValueError(

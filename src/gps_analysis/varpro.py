@@ -579,7 +579,7 @@ def _eval_design(
     a = np.asarray(design(theta), dtype=np.float64)
     if a.ndim != 2 or a.shape[0] != n_obs:
         raise ValueError(
-            f"design(theta={theta!r}) must return shape ({n_obs}, P), " f"got {a.shape}"
+            f"design(theta={theta!r}) must return shape ({n_obs}, P), got {a.shape}"
         )
     if n_params is not None and a.shape[1] != n_params:
         raise ValueError(
