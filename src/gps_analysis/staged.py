@@ -64,6 +64,7 @@ __all__ = [
     "StagedEstimate",
     "compose_held",
     "estimate_staged",
+    "evaluate_group_values",
     "fit_held_partition",
     "group_parameter_mask",
     "record_group_mask",
@@ -113,7 +114,14 @@ class Stage:
 
     Attributes:
         name: Stage label, referenced by :class:`HeldFromStage`.
-        free: Term-group names estimated in this stage.
+        free: Term-group names estimated in this stage.  MAY be empty for
+            an apply-only stage that holds everything — the fully-borrowed
+            station of design §2.6, where every term group comes from a
+            donor and nothing is estimable locally.  Such a stage must hold
+            at least one group; :func:`estimate_staged` takes an apply path
+            for it (no fit, no invented covariance) rather than routing it
+            through :func:`fit_held_partition`, which correctly refuses an
+            all-held mask.
         held: Group name → where its value comes from.  Holds are
             TERM-GRANULAR by contract, never per-parameter within a term —
             see :func:`fit_held_partition`.
@@ -126,6 +134,121 @@ class Stage:
     free: tuple[str, ...]
     held: Mapping[str, Held] = dataclasses.field(default_factory=dict)
     segments: Sequence[tuple[float | None, float | None]] | None = None
+
+
+def evaluate_group_values(
+    names: Sequence[str],
+    values: ArrayLike,
+    t: ArrayLike,
+) -> FloatArray:
+    """Evaluate named secular/periodic coefficients as a model value g(t).
+
+    Equation:
+        ``g(tᵢ) = Σ_j v_j·φ_j(tᵢ)`` — the partial trajectory carried by the
+        named coefficients alone, where each basis function φ_j is denoted by
+        the parameter NAME: ``offset``/``rate``/``curvature``/``poly_m`` are
+        the absolute-t monomials ``t⁰, t¹, t², tᵐ`` of :class:`terms.Polynomial`,
+        and ``cos_annual``/``sin_annual``/``cos_semiannual``/``sin_semiannual``/
+        ``cos_harmonicH``/``sin_harmonicH`` are the absolute-``yearf``
+        trigonometric columns ``cos(2πh·t), sin(2πh·t)`` of
+        :class:`terms.Seasonal`.
+
+    Symbols → args:
+        - ``φ_j`` → ``names``: parameter names, each denoting one basis
+          function (dimensionless labels)
+        - ``v_j`` → ``values``: the coefficients, one per name [model units,
+          typically mm and mm/yr on fractional-year epochs]
+        - ``tᵢ`` → ``t``: evaluation epochs, absolute fractional years [yr]
+
+    Returns:
+        ``g(t)``, shape ``(N,)``, float64 [same units as the amplitudes].
+
+    Raises:
+        ValueError: on a length mismatch, or a name outside the secular and
+            periodic groups.  Step and transient amplitudes are refused on
+            purpose: their basis functions need per-station metadata (a step
+            epoch, a transient τ) that a bare parameter name does not carry,
+            so evaluating them "by name" would have to guess it.
+
+    Reference:
+        Bevis & Brown 2014, J. Geodesy 88 — the polynomial and seasonal
+        blocks of the trajectory model (their eqs. 3 and the ``n_F = 2``
+        seasonal series).
+
+    Numerical notes:
+        The columns come from the SAME :class:`terms.Polynomial` /
+        :class:`terms.Seasonal` classes that generate every fitted design,
+        indexed by name — never a locally restated ``t**m`` or phase
+        convention, so the borrow path (which uses this to evaluate a
+        donor's background on a borrower's epochs — ``geo_dataread``'s
+        re-anchoring) cannot drift from what the estimator fitted.  Any
+        SUBSET of a group's names is valid input: dropping ``offset``
+        evaluates the donor's s(t) without its datum, which is exactly the
+        re-anchoring use.  Trig columns are bounded; the monomials are the
+        raw absolute-t columns and share the conditioning caveat of
+        ``fitting._fit_linear_design`` — harmless here because nothing is
+        inverted, it is a pure weighted sum.
+    """
+    from .terms import Polynomial, Seasonal
+
+    vv = np.asarray(values, dtype=np.float64).ravel()
+    if vv.size != len(names):
+        raise ValueError(
+            f"evaluate_group_values: {len(names)} names but {vv.size} values"
+        )
+    tt = np.asarray(t, dtype=np.float64)
+
+    # Widest term that covers every requested name, so the name -> column
+    # mapping is read off the term's OWN `names` tuple rather than restated.
+    #
+    # Degree 2 is the widest NAMED tier -- ("offset", "rate", "curvature") --
+    # and every higher monomial is `poly_<m>`, parsed below. So this probe is
+    # complete and, unlike the `max(max_degree, 1)` it replaces, INDEPENDENT
+    # OF NAME ORDER: that probe only ever held ("offset", "rate"), so
+    # `curvature` fell through to the "unrecognised" raise unless a `poly_m`
+    # name happened to be seen FIRST and lifted max_degree to >= 2. A degree-2
+    # donor yields exactly ("offset", "rate", "curvature") through
+    # geo_dataread's `_entry_group_names`, so the borrow re-anchoring this
+    # function exists to serve raised on its most ordinary input.
+    secular_named = Polynomial(degree=2).names
+    max_degree = 0
+    max_harmonic = 0
+    for name in names:
+        group = _staged_group_of(name)
+        if group == "secular":
+            if name in secular_named:
+                max_degree = max(max_degree, secular_named.index(name))
+            elif name.startswith("poly_"):
+                max_degree = max(max_degree, int(name.removeprefix("poly_")))
+            else:  # pragma: no cover - _staged_group_of is the classifier
+                raise ValueError(f"unrecognised secular parameter {name!r}")
+        elif group == "periodic":
+            tag = name.split("_", 1)[1]
+            harmonic = {"annual": 1, "semiannual": 2}.get(tag)
+            if harmonic is None:
+                harmonic = int(tag.removeprefix("harmonic"))
+            max_harmonic = max(max_harmonic, harmonic)
+        else:
+            raise ValueError(
+                f"evaluate_group_values cannot evaluate {name!r}: group "
+                f"{group!r} needs per-station metadata (step epoch, "
+                f"transient tau) a parameter name does not carry"
+            )
+
+    columns: dict[str, FloatArray] = {}
+    if max_degree or any(_staged_group_of(n) == "secular" for n in names):
+        poly = Polynomial(degree=max_degree)
+        cols = poly.columns(tt)
+        columns.update({n: cols[:, j] for j, n in enumerate(poly.names)})
+    if max_harmonic:
+        seasonal = Seasonal(n_harmonics=max_harmonic)
+        cols = seasonal.columns(tt)
+        columns.update({n: cols[:, j] for j, n in enumerate(seasonal.names)})
+
+    out = np.zeros(tt.shape, dtype=np.float64)
+    for name, value in zip(names, vv, strict=True):
+        out += value * columns[name]
+    return out
 
 
 def fit_held_partition(
@@ -360,9 +483,14 @@ class StageResult:
         n_epochs: Epochs inside this stage's domain.
         params: Per component, the stage's own full-length solution.
         covariance: Per component, its (P, P) covariance — propagated when
-            the held values carried one, conditional otherwise.
-        held_covariance: ``"propagated"`` or ``"conditional"``, so a reader
-            of a stored record can tell which was reported.
+            the held values carried one, conditional otherwise.  For an
+            apply-only stage: zeros outside any supplied ``C_v`` block,
+            because no fit ran and no conditional block exists to report.
+        held_covariance: ``"propagated"``, ``"conditional"`` or
+            ``"applied"``, so a reader of a stored record can tell which
+            was reported.  ``"applied"`` is the apply-only marker: NOTHING
+            was estimated in this stage — the parameter vector is exactly
+            the composed held values.
     """
 
     name: str
@@ -652,7 +780,7 @@ def record_group_mask(
 
     Callers that compared the two widths directly therefore REFUSED every
     record carrying a step — which took out borrowing ``secular`` or
-    ``periodic`` from any station in ``steps.csv`` (SELF, HOFN), and with it
+    ``periodic`` from any station in ``steps.yaml`` (SELF, HOFN), and with it
     the whole "hold this station's own saved background and estimate only the
     events" workflow.  Measured 2026-08-23.
 
@@ -669,16 +797,73 @@ def record_group_mask(
         Boolean mask aligned with the record's per-component parameter vector.
 
     Raises:
-        ValueError: On an unknown group name.
+        ValueError: On an unknown group name, an unsupported
+            ``record_version``, or ``param_names`` that disagree with the
+            declared model's own positional names.
+
+    Numerical notes:
+        ``record_version`` is enforced here for the same reason
+        :func:`detrend.trajectory_from_record` enforces it: this is the OTHER
+        record reader, and it is the one the borrow path actually calls
+        (``geo_dataread`` reaches a donor through
+        :func:`record_group_mask` -> ``donor_group_values``; it has no
+        ``trajectory_from_record`` call site at all).  Without the check the
+        version claim was decorative on that path -- a ``record_version`` 0
+        record whose ``param_names`` had been permuted to
+        ``["rate", "offset", ...]`` returned a happy ``[T, T, F, ...]`` mask,
+        and the positional ``params[mask]`` that follows then borrowed
+        ``(12.5, 3.0)`` as ``(offset, rate)``.  The same record raises in
+        ``trajectory_from_record``.  Two readers, one record format, one
+        enforcement.
     """
+    from .detrend import SUPPORTED_RECORD_VERSIONS, _param_names, _resolve_model
+
     wanted = {group} if isinstance(group, str) else set(group)
     unknown = wanted - set(GROUP_ORDER)
     if unknown:
         raise ValueError(
             f"unknown term group(s) {sorted(unknown)}; known: {list(GROUP_ORDER)}"
         )
+    # Enforced WHEN PRESENT. `trajectory_from_record` additionally refuses a
+    # record with no version at all; this reader cannot yet, because it also
+    # serves the documented hand-written/pre-`param_names` records (see the
+    # fallback below) and 19 such fixtures live in geo_dataread. So the gap
+    # that remains is a record carrying NO `record_version` key -- malformed
+    # in production, where `to_record` always writes one. Closing it is a
+    # cross-package fixture change, deliberately not made here.
+    if "record_version" in record:
+        version = record.get("record_version")
+        if version not in SUPPORTED_RECORD_VERSIONS:
+            raise ValueError(
+                f"unknown record_version {version!r}; this reader supports "
+                f"{sorted(SUPPORTED_RECORD_VERSIONS)}"
+            )
     names = list(record.get("param_names") or ())
     if names:
+        # `param_names` drives the classification, so it must agree with the
+        # model it claims to describe -- otherwise the mask is right about the
+        # NAMES and wrong about the SLOTS the caller indexes with it. Only the
+        # unaugmented head is checked: `to_record` appends one `step_amp_k`
+        # per declared step, and that tail is decided by construction (see
+        # above). A v2 record's `model` is a "+"-joined term-kind string
+        # rather than a registry code, so it is left to the terms reader.
+        model_code = record.get("model")
+        if record.get("terms") is None and isinstance(model_code, str):
+            model_func, _ = _resolve_model(model_code)
+            expected = tuple(_param_names(model_func))
+            head = tuple(names[: len(expected)])
+            # Only when the record is at least as wide as its model. A SHORTER
+            # `param_names` is a different malformation -- a record carrying
+            # only `["step_amp_1"]` against lineperiodic has no background at
+            # all -- and its callers diagnose that far better than a generic
+            # mismatch would ("no background to save"). This check is about
+            # PERMUTED or renamed slots, which needs a full head to compare.
+            if len(names) >= len(expected) and head != expected:
+                raise ValueError(
+                    f"record param_names {head} disagree with model "
+                    f"{model_code!r} whose parameters are {expected}; the mask "
+                    f"would be indexed positionally against the wrong slots"
+                )
         return np.array([_staged_group_of(n) in wanted for n in names], dtype=np.bool_)
 
     # No param_names (a hand-written or very old record): fall back to the
@@ -727,6 +912,21 @@ def estimate_staged(
     would leave an unowned coefficient, so the plan is rejected up front
     rather than silently emitting a zero.
 
+    **Apply-only stages.**  A stage that frees NOTHING and holds at least one
+    group takes an apply path: its parameter vector is exactly the composed
+    held values, no fit is attempted, and no covariance is invented — the
+    stage's covariance is all-zero outside any supplied ``C_v`` block, which
+    is precisely how :func:`fit_held_partition` already reports held blocks
+    (``C_v`` where given, zeros when the values are treated as exactly
+    known), so a reader of the composed matrix needs no second convention.
+    The stage is flagged ``held_covariance="applied"`` so a stored record
+    says unmistakably that nothing was estimated on this station.  This is
+    the fully-borrowed station of design §2.6 (ELDC holding both secular and
+    periodic from a donor): before this path existed the case was
+    unrepresentable, because :func:`fit_held_partition` — correctly, it is a
+    fitting primitive — refuses an all-held mask.  The apply path goes
+    AROUND that refusal, never through it.
+
     Symbols → args:
         - ``f`` → ``model``: registry code or a registered callable
         - ``tᵢ`` → ``t``: epochs, fractional years [yr]
@@ -751,9 +951,10 @@ def estimate_staged(
         A :class:`StagedEstimate`.
 
     Raises:
-        ValueError: For an empty plan, a duplicate stage name, a reference
-            to a stage that has not run yet, a term owned by no stage, or a
-            stage whose domain holds no epochs.
+        ValueError: For an empty plan, a duplicate stage name, a stage that
+            neither frees nor holds any group, a reference to a stage that
+            has not run yet, a term owned by no stage, or a stage whose
+            domain holds no epochs.
 
     Reference:
         The manoeuvre is the operator recipe of
@@ -780,6 +981,11 @@ def estimate_staged(
         if stage.name in seen:
             raise ValueError(f"duplicate stage name {stage.name!r}")
         seen.add(stage.name)
+        if not stage.free and not stage.held:
+            raise ValueError(
+                f"stage {stage.name!r} frees nothing and holds nothing; a "
+                f"stage either estimates term groups or applies held ones"
+            )
 
     model_func, model_name = _resolve_model(model)
     design_spec = _resolve_linear_design(model_func)
@@ -819,6 +1025,38 @@ def estimate_staged(
             f"stage, so the composed record would carry them as zero"
         )
 
+    # A HeldFromStage can only relay what its source actually ESTIMATED. A
+    # stage's parameter vector is zero outside what that stage freed or held,
+    # so holding a group from a stage that did neither relays a ZERO -- and
+    # because the source's covariance BLOCK for it is likewise zero rather
+    # than None, `all(b is not None for ...)` passes and the composed record
+    # labels that zero `held_covariance="propagated"`: an invented value,
+    # documented as sourced. The docstring above has always promised such a
+    # plan is "rejected up front rather than silently emitting a zero"; the
+    # ownership check could not see it, because it counts a group as owned as
+    # soon as ANY stage frees it, without asking whether the stage being
+    # borrowed FROM is that stage.
+    estimated_by: dict[str, set[str]] = {
+        stage.name: {*stage.free, *stage.held} for stage in plan
+    }
+    ran: set[str] = set()
+    for stage in plan:
+        for g, src in stage.held.items():
+            if not isinstance(src, HeldFromStage):
+                continue
+            if src.stage not in ran:
+                raise ValueError(
+                    f"stage {stage.name!r} holds {g!r} from {src.stage!r}, "
+                    f"which has not run"
+                )
+            if g not in estimated_by[src.stage]:
+                raise ValueError(
+                    f"stage {stage.name!r} holds {g!r} from stage "
+                    f"{src.stage!r}, which neither frees nor holds {g!r}; its "
+                    f"value there is a composed zero, not an estimate"
+                )
+        ran.add(stage.name)
+
     composed = [np.zeros(n_params, dtype=np.float64) for _ in range(n_components)]
     composed_cov = [
         np.zeros((n_params, n_params), dtype=np.float64) for _ in range(n_components)
@@ -846,6 +1084,24 @@ def estimate_staged(
         free_mask = np.zeros(n_params, dtype=np.bool_)
         for g in stage.free:
             free_mask |= masks[g]
+        # A freed group the model has no term for contributes no columns.
+        # `group_parameter_mask` documents an all-False mask as something "the
+        # caller should treat as an error", and until the apply-only path
+        # existed it effectively was one: the stage fell through to
+        # `fit_held_partition`, which refused an all-held mask. Now an empty
+        # `free_mask` selects APPLY instead, so a plan asking to FIT a
+        # transient on a model that has none returned a record saying nothing
+        # was estimated -- indistinguishable from a deliberate fully-borrowed
+        # station. Checked per group, not just on the union, so a partly
+        # resolvable `free=("secular", "transient")` cannot quietly fit half
+        # of what was asked.
+        absent = [g for g in stage.free if not masks[g].any()]
+        if absent:
+            raise ValueError(
+                f"stage {stage.name!r} frees {absent}, which model "
+                f"{model_name!r} has no term for; nothing would be estimated "
+                f"for {'them' if len(absent) > 1 else 'it'}"
+            )
         if (free_mask & held_mask).any():
             overlap = [
                 n for n, k in zip(param_names, free_mask & held_mask, strict=True) if k
@@ -890,7 +1146,26 @@ def estimate_staged(
                     held_cov_block[np.ix_(pos, pos)] = blk
                 kind = "propagated"
 
-            if held_mask.any():
+            if not free_mask.any():
+                # APPLY, don't fit (the all-held case): the stage's parameter
+                # vector IS the composed held values, and detecting it BEFORE
+                # fit_held_partition is deliberate — that primitive refuses an
+                # all-held mask, and the refusal is correct for a fitting
+                # primitive. No fit ran, so no covariance is invented: zeros
+                # outside any supplied C_v block, matching how
+                # fit_held_partition already reports held blocks. Blocks are
+                # relayed PER GROUP (unlike the fit path's all-or-nothing
+                # held_cov_block, whose propagation math needs the whole held
+                # covariance): nothing is propagated here, so a group that
+                # carried its C_v keeps it even beside one that did not.
+                p = values.copy()
+                cov = np.zeros((n_params, n_params), dtype=np.float64)
+                for gm, blk in blocks:
+                    if blk is not None:
+                        gi = np.flatnonzero(gm)
+                        cov[np.ix_(gi, gi)] = blk
+                kind = "applied"
+            elif held_mask.any():
                 p, cov = fit_held_partition(
                     full_design[mask],
                     yy[c][mask],

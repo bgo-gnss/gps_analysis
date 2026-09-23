@@ -104,6 +104,7 @@ from .models import FloatArray, TrajectoryParams
 from .outliers import OutlierDetection, OutlierParams, detect_outliers
 
 __all__ = [
+    "DETREND_METHOD_BORROWED",
     "DETREND_METHOD_PLAIN",
     "DETREND_METHOD_ROBUST",
     "RECORD_VERSION",
@@ -150,6 +151,22 @@ step-augmented fit — the outlier stage ran and defined the inlier set."""
 DETREND_METHOD_PLAIN = "plain_wls"
 """``detrend_method`` provenance tag (design §0.2): plain WLS on all
 windowed epochs (legacy semantics) — outlier stage off or aborted."""
+
+DETREND_METHOD_BORROWED = "borrowed"
+"""``detrend_method`` provenance tag: NOTHING was estimated on this station.
+
+Every stage was apply-only, so the parameters are a donor's throughout (bar
+the locally anchored datum — see
+:func:`geo_dataread.stage_plan.resolve_stage_plan`).  The other two tags both
+assert a fit happened here and differ only in which inlier set defined it;
+stamping either on a fully-borrowed record would claim a fit that never ran,
+on the one field a reader consults to find out.  The companion ``borrowed``
+block names the donor; this is the tag that stops the record from *looking*
+self-estimated.
+
+Not a member of ``gps_api``'s ``DETREND_ESTIMATION_METHODS``: that is the
+closed vocabulary of estimation methods an operator may REQUEST in config,
+and "borrowed" is an outcome, never a request."""
 
 _MODEL_NAMES: dict[str, ModelFunc] = {
     "linear": models.linear,
@@ -704,7 +721,7 @@ def estimate_detrend(
           open bounds use the data span — per §0.7 the window should be
           as long as the step-free/pre-unrest history allows
         - ``t_k`` → ``step_epochs``: known step epochs [yr] (caller's
-          per-station table — TOS equipment changes, ``steps.csv``
+          per-station table — TOS equipment changes, ``steps.yaml``
           coseismic offsets; the leaf never reads config); only epochs
           strictly inside the window augment the model — earlier steps
           are absorbed by the intercept, later ones cannot be estimated
