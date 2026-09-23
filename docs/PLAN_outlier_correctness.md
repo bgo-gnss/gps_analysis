@@ -191,9 +191,9 @@ python geo_dataread/tests/characterize_fleet_outliers.py --stations GFUM --windo
 #   expect still aborts (default 0 preserves baseline)
 
 # visibility
-plot-gps-timeseries SAUD --ref plate --view cleaned --special full --save png --name saud_abort
-plot-gps-timeseries SAUD --ref plate --view cleaned --special full --hide-outliers --save png --name saud_abort_hidden
-#   North axis badged in both; East/Up carry grey overlays in the first
+plot-gps-timeseries SAUD --ref plate --view cleaned --special full --save png --name saud_abort_hidden
+plot-gps-timeseries SAUD --ref plate --view cleaned --special full --show-outliers --save png --name saud_abort_shown
+#   North axis badged in both; East/Up carry grey overlays only with --show-outliers
 ```
 
 Plus all four suites, and a `gps_plot` test asserting the badge artist exists

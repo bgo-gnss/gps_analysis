@@ -538,7 +538,7 @@ def heaviside_steps(
         - ``t``   → ``t``: epochs, fractional years (``yearf``) [yr]
         - ``t_k`` → ``epochs``: known step epochs, shape (K,) [yr] —
           fixed data, e.g. equipment changes from TOS or coseismic
-          offsets from the deployed ``steps.csv`` (caller's business)
+          offsets from the deployed ``steps.yaml`` (caller's business)
         - ``a_k`` → ``amplitudes``: step amplitudes, shape (K,) [L]
 
     Args:

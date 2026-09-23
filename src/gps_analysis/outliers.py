@@ -1454,7 +1454,7 @@ class OutlierParams:
 class SuspectedEvent:
     """A protected candidate cluster — suspected real signal, not noise.
 
-    Operator-facing hint for the ``steps.csv`` review flow and the
+    Operator-facing hint for the ``steps.yaml`` review flow and the
     GBIS4TS break-detection lane (§3.4/§9-Q5): sustained one-sided runs
     and persisting offsets survive detection *and* are surfaced here —
     never silently.
@@ -1521,7 +1521,7 @@ class OutlierDetection:
             ``step_epochs`` input order [L]; ``None`` without steps.
         suspected_events: Protected clusters of the final sweep
             (:class:`SuspectedEvent`) — feed the operator review /
-            ``steps.csv`` lane; the leaf only surfaces them.
+            ``steps.yaml`` lane; the leaf only surfaces them.
         n_despiked: Stage-0 gross-blunder count per component, shape
             (C,) int64 — all zeros unless ``params.despike`` is True.
         n_iterations: Detection sweeps actually performed.

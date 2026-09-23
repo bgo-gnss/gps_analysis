@@ -52,6 +52,7 @@ from gps_analysis.deformation import (
     volume_from_pressure,
 )
 from gps_analysis.detrend import (
+    DETREND_METHOD_BORROWED,
     DETREND_METHOD_PLAIN,
     DETREND_METHOD_ROBUST,
     DetrendEstimate,
@@ -138,6 +139,7 @@ from gps_analysis.staged import (
     StageResult,
     compose_held,
     estimate_staged,
+    evaluate_group_values,
     fit_held_partition,
 )
 from gps_analysis.terms import (
@@ -242,6 +244,7 @@ __all__ = [
     "step_evidence",
     "detect_outliers",
     # detrend (stored-parameter detrending: estimate once, apply anywhere)
+    "DETREND_METHOD_BORROWED",
     "DETREND_METHOD_PLAIN",
     "DETREND_METHOD_ROBUST",
     "DetrendEstimate",
@@ -258,6 +261,7 @@ __all__ = [
     "StagedEstimate",
     "compose_held",
     "estimate_staged",
+    "evaluate_group_values",
     "fit_held_partition",
     "slice_window",
     "slice_windows",

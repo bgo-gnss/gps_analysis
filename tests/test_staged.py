@@ -20,6 +20,8 @@ decades above the observed 1.2e-8 so it pins the identity without pinning
 BLAS. Covariance identities hold to 1e-9 relative.
 """
 
+from typing import Any
+
 import numpy as np
 import pytest
 
@@ -28,10 +30,20 @@ from gps_analysis.staged import (
     HeldExplicit,
     HeldFromStage,
     Stage,
+    StagedEstimate,
     compose_held,
     estimate_staged,
     fit_held_partition,
+    group_parameter_mask,
 )
+
+
+def _groups(est: StagedEstimate) -> dict[str, dict[str, object]]:
+    """The fragment's ``groups`` block, type-narrowed for the assertions."""
+    groups = est.to_record_fragment()["groups"]
+    assert isinstance(groups, dict)
+    return groups
+
 
 TRUTH = np.array([3.0, 12.5, 2.0, 1.5, 0.4, -0.3])
 """offset, rate, cos_annual, sin_annual, cos_semiannual, sin_semiannual."""
@@ -85,9 +97,9 @@ class TestHeldFixedPoint:
             held_values=p_joint,  # full-length; only the held entries are read
             absolute_sigma=True,
         )
-        assert np.allclose(p_staged[SECULAR], p_joint[SECULAR], rtol=1e-6, atol=0.0), (
-            f"free params moved: {p_staged[SECULAR] - p_joint[SECULAR]}"
-        )
+        assert np.allclose(
+            p_staged[SECULAR], p_joint[SECULAR], rtol=1e-6, atol=0.0
+        ), f"free params moved: {p_staged[SECULAR] - p_joint[SECULAR]}"
 
     def test_the_held_values_pass_through_untouched(self) -> None:
         _t, a, y, sigma = _series()
@@ -155,9 +167,9 @@ class TestPropagatedCovariance:
         c_exact = (lin * sigma**2) @ lin.T
 
         got = cov[np.ix_(SECULAR, SECULAR)]
-        assert np.allclose(got, c_exact, rtol=1e-9, atol=0.0), (
-            f"max rel err {np.max(np.abs(got - c_exact)) / np.max(np.abs(c_exact)):.2e}"
-        )
+        assert np.allclose(
+            got, c_exact, rtol=1e-9, atol=0.0
+        ), f"max rel err {np.max(np.abs(got - c_exact)) / np.max(np.abs(c_exact)):.2e}"
 
     def test_the_conditional_form_always_understates(self) -> None:
         """``K C_v Kᵀ ⪰ 0``, so omitting it can only be optimistic."""
@@ -489,9 +501,9 @@ class TestEstimateStaged:
             names=["north", "east", "up"],
         )
         assert [s.name for s in est.stages] == ["clean", "long"]
-        assert est.stages[0].n_epochs < est.stages[1].n_epochs, (
-            "the clean window must be a strict subset of the long span"
-        )
+        assert (
+            est.stages[0].n_epochs < est.stages[1].n_epochs
+        ), "the clean window must be a strict subset of the long span"
         # the rate comes from the LAST stage that freed it; the seasonal from
         # the only stage that freed it
         assert est.fits[0].params[1] == pytest.approx(TRUTH[1], abs=0.1)
@@ -548,12 +560,112 @@ class TestEstimateStaged:
             ],
         )
         frag = est.to_record_fragment()
-        assert set(frag) == {"stage_plan", "stages"}
+        assert set(frag) == {"groups", "stage_plan", "stages"}
         assert frag["stage_plan"][1]["held"] == {"periodic": "stage:clean"}
         assert frag["stages"][1]["held_covariance"] == "propagated"
         import json
 
         assert json.loads(json.dumps(frag)) == frag, "must be JSON-round-trippable"
+
+    def test_groups_block_names_the_estimating_stage_not_the_holder(self) -> None:
+        """`long` re-holds the periodic, but `clean` MADE it — provenance
+        must say self@clean with clean's domain, or the block would send an
+        operator auditing a seasonal to the wrong window."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage("clean", ("secular", "periodic"), segments=[(None, 2005.6)]),
+                Stage("long", ("secular",), held={"periodic": HeldFromStage("clean")}),
+            ],
+        )
+        groups = _groups(est)
+        assert set(groups) == {"secular", "periodic"}
+        assert groups["secular"] == {
+            "indices": [0, 1],
+            "stage": "long",
+            "segments": None,  # inherited the caller's (whole-series) domain
+            "provenance": "self",
+        }
+        assert groups["periodic"] == {
+            "indices": [2, 3, 4, 5],
+            "stage": "clean",
+            "segments": [[None, 2005.6]],
+            "provenance": "self",
+        }
+
+    def test_groups_indices_agree_with_group_parameter_mask(self) -> None:
+        """The block must be a projection of the ONE staged classifier —
+        an independent per-name list here is how a second vocabulary
+        (select_terms' step-folding) would sneak back in."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[Stage("all", ("secular", "periodic"))],
+        )
+        groups = _groups(est)
+        for name, entry in groups.items():
+            expected = np.flatnonzero(group_parameter_mask("lineperiodic", name))
+            assert entry["indices"] == [int(j) for j in expected]
+
+    def test_groups_block_carries_a_borrow_source_verbatim(self) -> None:
+        """A held-explicit group was never estimated on this station: its
+        provenance is the source string (geo_dataread spells it
+        ``donor:STA@fitted_at``) and its segments are None — the estimation
+        domain is the DONOR's and lives in the donor's record."""
+        t, y = self._series3()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y[0],
+            plan=[
+                Stage(
+                    "fit",
+                    ("secular",),
+                    held={
+                        "periodic": HeldExplicit(
+                            TRUTH[PERIODIC], source="donor:OLAC@2026-07-01"
+                        )
+                    },
+                )
+            ],
+        )
+        groups = _groups(est)
+        assert groups["periodic"] == {
+            "indices": [2, 3, 4, 5],
+            "stage": "fit",
+            "segments": None,
+            "provenance": "donor:OLAC@2026-07-01",
+        }
+        assert groups["secular"]["provenance"] == "self"
+
+    def test_groups_block_covers_step_amplitudes(self) -> None:
+        """Steps are their own group here (the staged vocabulary), and their
+        appended-at-the-end indices are exactly why `indices` is explicit."""
+        from gps_analysis import with_steps
+        from gps_analysis.models import lineperiodic
+
+        rng = np.random.default_rng(3)
+        t = 2001.6 + np.arange(3000) / 365.25
+        model = with_steps(lineperiodic, [2005.0])
+        y = _design(t) @ TRUTH + 4.0 * (t >= 2005.0) + rng.normal(0.0, 1.0, t.size)
+        est = estimate_staged(
+            model,
+            t,
+            y,
+            plan=[Stage("all", ("secular", "periodic", "step"))],
+        )
+        groups = _groups(est)
+        assert groups["step"] == {
+            "indices": [6],
+            "stage": "all",
+            "segments": None,
+            "provenance": "self",
+        }
 
     @pytest.mark.parametrize(
         "plan, match",
@@ -934,3 +1046,428 @@ class TestGroupClassifiersCoverTheWholeTermAlgebra:
 
         with pytest.raises(ValueError, match="cannot classify"):
             _staged_group_of("tidal_k1")
+
+
+class TestRecordGroupMask:
+    """A stored record's parameter vector is LONGER than its model's.
+
+    ``to_record`` appends one ``step_amp_k`` per declared step, so a station
+    in ``steps.csv`` stores 7 parameters against ``lineperiodic``'s 6. Code
+    that compared the two widths refused every such record — which took out
+    borrowing ``secular``/``periodic`` from SELF or HOFN, and with it the
+    whole "hold this station's own saved background and estimate only the
+    events" workflow.
+    """
+
+    RECORD = {
+        "record_version": 1,
+        "model": "lineperiodic",
+        "param_names": [
+            "offset",
+            "rate",
+            "cos_annual",
+            "sin_annual",
+            "cos_semiannual",
+            "sin_semiannual",
+            "step_amp_1",
+        ],
+        "components": [{"params": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]}],
+    }
+
+    def test_it_spans_the_stored_vector_not_the_model(self) -> None:
+        from gps_analysis.staged import group_parameter_mask, record_group_mask
+
+        assert group_parameter_mask("lineperiodic", "secular").size == 6
+        assert record_group_mask(self.RECORD, "secular").size == 7
+
+    def test_the_appended_tail_is_step(self) -> None:
+        from gps_analysis.staged import record_group_mask
+
+        names = self.RECORD["param_names"]
+        mask = record_group_mask(self.RECORD, "step")
+        assert [n for n, m in zip(names, mask, strict=True) if m] == ["step_amp_1"]
+
+    def test_secular_does_not_swallow_the_step(self) -> None:
+        """The staged vocabulary keeps them apart; the apply-time one does not."""
+        from gps_analysis.staged import record_group_mask
+
+        names = self.RECORD["param_names"]
+        mask = record_group_mask(self.RECORD, "secular")
+        assert [n for n, m in zip(names, mask, strict=True) if m] == ["offset", "rate"]
+
+    def test_several_groups_at_once(self) -> None:
+        from gps_analysis.staged import record_group_mask
+
+        mask = record_group_mask(self.RECORD, ["secular", "periodic"])
+        assert mask.sum() == 6 and not mask[-1]
+
+    def test_a_record_without_param_names_falls_back_to_the_model(self) -> None:
+        from gps_analysis.staged import record_group_mask
+
+        legacy = {k: v for k, v in self.RECORD.items() if k != "param_names"}
+        mask = record_group_mask(legacy, "secular")
+        assert mask.size == 7
+        assert list(mask[:2]) == [True, True]
+        assert not mask[-1], "the step tail is not secular"
+
+    def test_an_unknown_group_is_refused(self) -> None:
+        import pytest
+
+        from gps_analysis.staged import record_group_mask
+
+        with pytest.raises(ValueError, match="unknown term group"):
+            record_group_mask(self.RECORD, "gravitational_wave")
+
+
+class TestApplyOnlyStage:
+    """The all-held case: apply, don't fit (design §2.6, the fully-borrowed
+    station).
+
+    ``fit_held_partition`` refuses an all-held mask and must KEEP doing so —
+    it is a fitting primitive, and "fit nothing" is not a fit. The apply path
+    in ``estimate_staged`` goes around it: the stage's parameter vector is
+    exactly the composed held values, no covariance is invented, and the
+    stage is flagged ``held_covariance="applied"`` so a stored record says
+    unmistakably that nothing was estimated.
+    """
+
+    def _held(self) -> dict[str, HeldExplicit]:
+        return {
+            "secular": HeldExplicit(
+                values=TRUTH[SECULAR], source="store:SENG@t0 anchored [2021.0,2021.5]"
+            ),
+            "periodic": HeldExplicit(values=TRUTH[PERIODIC], source="store:SENG@t0"),
+        }
+
+    def test_all_held_stage_applies_without_fitting(self) -> None:
+        t, _a, y, sigma = _series()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y,
+            sigma,
+            plan=[Stage(name="apply", free=(), held=self._held())],
+        )
+        np.testing.assert_array_equal(est.fits[0].params, TRUTH)
+        # No fit ran, so no covariance exists to report: all-zero, matching
+        # fit_held_partition's held-block convention (zeros when the held
+        # values are treated as exactly known).
+        np.testing.assert_array_equal(est.fits[0].covariance, 0.0)
+        assert est.stages[0].held_covariance == "applied"
+
+    def test_record_fragment_is_self_describing(self) -> None:
+        t, _a, y, sigma = _series()
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y,
+            sigma,
+            plan=[Stage(name="apply", free=(), held=self._held())],
+        )
+        frag = est.to_record_fragment()
+        stages = frag["stages"]
+        assert isinstance(stages, list)
+        assert stages[0]["free"] == []
+        assert stages[0]["held_covariance"] == "applied"
+        groups = _groups(est)
+        assert groups["secular"]["provenance"] == (
+            "store:SENG@t0 anchored [2021.0,2021.5]"
+        )
+        assert groups["periodic"]["provenance"] == "store:SENG@t0"
+
+    def test_supplied_held_covariance_is_relayed_not_invented(self) -> None:
+        t, _a, y, sigma = _series()
+        c_sec = np.diag([0.04, 0.0001])
+        held = self._held()
+        held["secular"] = HeldExplicit(
+            values=TRUTH[SECULAR], source="store:SENG@t0", covariance=c_sec
+        )
+        est = estimate_staged(
+            "lineperiodic",
+            t,
+            y,
+            sigma,
+            plan=[Stage(name="apply", free=(), held=held)],
+        )
+        cov = np.asarray(est.fits[0].covariance)
+        np.testing.assert_array_equal(cov[np.ix_([0, 1], [0, 1])], c_sec)
+        # everything the caller did NOT supply stays zero
+        cov[np.ix_([0, 1], [0, 1])] = 0.0
+        np.testing.assert_array_equal(cov, 0.0)
+
+    def test_fit_held_partition_still_refuses_all_held(self) -> None:
+        """The primitive's refusal is correct and must survive the new path."""
+        t, _a, y, sigma = _series()
+        with pytest.raises(ValueError, match="holds every column"):
+            fit_held_partition(
+                _design(t),
+                y,
+                sigma,
+                held_mask=np.ones(6, dtype=bool),
+                held_values=TRUTH,
+            )
+
+    def test_stage_with_nothing_to_do_is_refused(self) -> None:
+        t, _a, y, sigma = _series()
+        with pytest.raises(ValueError, match="frees nothing and holds nothing"):
+            estimate_staged(
+                "lineperiodic",
+                t,
+                y,
+                sigma,
+                plan=[Stage(name="void", free=(), held={})],
+            )
+
+
+class TestEvaluateGroupValues:
+    """The name-driven basis evaluator the re-anchoring borrow path uses.
+
+    The columns must come from the SAME Term classes that generate every
+    fitted design, so the checks compare against the production design
+    directly rather than against locally restated formulas.
+    """
+
+    def test_matches_the_lineperiodic_design(self) -> None:
+        from gps_analysis.staged import evaluate_group_values
+
+        t, _a, _y, _s = _series(n=200)
+        names = [
+            "offset",
+            "rate",
+            "cos_annual",
+            "sin_annual",
+            "cos_semiannual",
+            "sin_semiannual",
+        ]
+        np.testing.assert_allclose(
+            evaluate_group_values(names, TRUTH, t), _design(t) @ TRUTH, rtol=1e-12
+        )
+
+    def test_subset_supports_the_datum_free_evaluation(self) -> None:
+        # Dropping `offset` is exactly the re-anchoring use: the donor's
+        # s(t) without its datum.
+        from gps_analysis.staged import evaluate_group_values
+
+        t, _a, _y, _s = _series(n=50)
+        got = evaluate_group_values(["rate"], [TRUTH[1]], t)
+        np.testing.assert_allclose(got, TRUTH[1] * t, rtol=1e-12)
+
+    def test_step_and_transient_names_are_refused(self) -> None:
+        from gps_analysis.staged import evaluate_group_values
+
+        with pytest.raises(ValueError, match="metadata"):
+            evaluate_group_values(["step_amp_1"], [1.0], np.array([2021.0]))
+        with pytest.raises(ValueError, match="metadata"):
+            evaluate_group_values(["log_amp_1"], [1.0], np.array([2021.0]))
+
+    def test_length_mismatch_is_refused(self) -> None:
+        from gps_analysis.staged import evaluate_group_values
+
+        with pytest.raises(ValueError, match="names but"):
+            evaluate_group_values(["offset"], [1.0, 2.0], np.array([2021.0]))
+
+
+class TestRecordGroupMaskEnforcesTheRecordContract:
+    """The borrow path's record reader enforces what its sibling enforces.
+
+    ``trajectory_from_record`` has always checked ``record_version`` and the
+    ``terms``/version pairing. ``record_group_mask`` did not — and it is the
+    reader the cross-station borrow actually goes through (``geo_dataread``
+    reaches a donor via ``record_group_mask`` -> ``donor_group_values`` and
+    has no ``trajectory_from_record`` call site at all). So the version claim
+    was decorative on precisely the path where a wrong slot becomes a wrong
+    number in a stored record.
+    """
+
+    GOOD: dict[str, Any] = {
+        "record_version": 1,
+        "model": "lineperiodic",
+        "param_names": [
+            "offset",
+            "rate",
+            "cos_annual",
+            "sin_annual",
+            "cos_semiannual",
+            "sin_semiannual",
+        ],
+        "components": [{"params": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]}],
+    }
+
+    def test_a_v0_record_is_refused(self) -> None:
+        import pytest
+
+        from gps_analysis.staged import record_group_mask
+
+        stale = {**self.GOOD, "record_version": 0}
+        with pytest.raises(ValueError, match="unknown record_version"):
+            record_group_mask(stale, "secular")
+
+    def test_a_record_without_a_version_is_still_tolerated(self) -> None:
+        """The remaining gap, pinned so it is a decision and not a drift.
+
+        ``trajectory_from_record`` refuses a version-less record outright.
+        This reader cannot yet: it also serves the documented hand-written /
+        pre-``param_names`` records, and geo_dataread has 19 such fixtures.
+        Production records always carry a version (``to_record`` writes one),
+        so this tolerance is for hand-written input only. Tighten to match
+        the sibling reader once those fixtures are updated.
+        """
+        from gps_analysis.staged import record_group_mask
+
+        anonymous = {k: v for k, v in self.GOOD.items() if k != "record_version"}
+        mask = record_group_mask(anonymous, "secular")
+        assert list(mask) == [True, True, False, False, False, False]
+
+    def test_permuted_param_names_are_refused(self) -> None:
+        """The exact leak: a happy mask indexed positionally into wrong slots.
+
+        With ``["rate", "offset", ...]`` the mask is right about the NAMES —
+        both are secular — so it comes back ``[True, True, ...]`` and the
+        caller's ``params[mask]`` borrows ``(2.0, 1.0)`` as ``(offset, rate)``.
+        """
+        import pytest
+
+        from gps_analysis.staged import record_group_mask
+
+        permuted = {
+            **self.GOOD,
+            "param_names": ["rate", "offset", *self.GOOD["param_names"][2:]],
+        }
+        with pytest.raises(ValueError, match="disagree with model"):
+            record_group_mask(permuted, "secular")
+
+    def test_the_step_tail_is_still_allowed_past_the_head_check(self) -> None:
+        """Only the unaugmented head is checked; the appended tail is fine."""
+        from gps_analysis.staged import record_group_mask
+
+        stepped = {
+            **self.GOOD,
+            "param_names": [*self.GOOD["param_names"], "step_amp_1"],
+            "components": [{"params": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]}],
+        }
+        mask = record_group_mask(stepped, "step")
+        assert list(mask) == [False] * 6 + [True]
+
+
+class TestFreeingAnAbsentGroupIsRefused:
+    """Asking to FIT a term the model does not have is an error, not an apply.
+
+    Before the apply-only path existed this was caught by accident:
+    ``fit_held_partition`` refuses an all-held mask. Once an empty
+    ``free_mask`` started selecting the apply path, the same plan produced a
+    record saying nothing was estimated — indistinguishable from a deliberate
+    fully-borrowed station.
+    """
+
+    def test_freeing_a_transient_on_lineperiodic_raises(self) -> None:
+        import pytest
+
+        from gps_analysis.staged import HeldExplicit, Stage, estimate_staged
+
+        t = np.linspace(2020.0, 2023.0, 200)
+        y = 1.0 + 2.0 * (t - 2020.0)
+        plan = [
+            Stage(
+                "fit",
+                ("transient",),
+                held={
+                    "secular": HeldExplicit(np.array([1.0, 2.0]), "donor:X"),
+                    "periodic": HeldExplicit(np.zeros(4), "donor:X"),
+                },
+            )
+        ]
+        with pytest.raises(ValueError, match="has no term for"):
+            estimate_staged("lineperiodic", t, y, plan=plan)
+
+    def test_a_partly_resolvable_free_still_raises(self) -> None:
+        """`free=("secular", "transient")` must not quietly fit just secular."""
+        import pytest
+
+        from gps_analysis.staged import HeldExplicit, Stage, estimate_staged
+
+        t = np.linspace(2020.0, 2023.0, 200)
+        y = 1.0 + 2.0 * (t - 2020.0)
+        plan = [
+            Stage(
+                "fit",
+                ("secular", "transient"),
+                held={"periodic": HeldExplicit(np.zeros(4), "donor:X")},
+            )
+        ]
+        with pytest.raises(ValueError, match="has no term for"):
+            estimate_staged("lineperiodic", t, y, plan=plan)
+
+
+class TestHeldFromStageMustNameAnEstimator:
+    """A stage can only relay what its source actually estimated.
+
+    A stage's vector is zero outside what it freed or held, and its
+    covariance block for such a group is zero rather than ``None`` — so the
+    composed record labelled an invented zero ``held_covariance="propagated"``.
+    """
+
+    def test_holding_a_group_the_source_never_touched_raises(self) -> None:
+        import pytest
+
+        from gps_analysis.staged import HeldFromStage, Stage, estimate_staged
+
+        t = np.linspace(2020.0, 2023.0, 400)
+        y = 1.0 + 2.0 * (t - 2020.0) + 3.0 * np.cos(2 * np.pi * t)
+        plan = [
+            Stage("A", ("secular",), held={}),
+            Stage("B", ("secular",), held={"periodic": HeldFromStage("A")}),
+        ]
+        with pytest.raises(ValueError, match="neither frees nor holds"):
+            estimate_staged("lineperiodic", t, y, plan=plan)
+
+    def test_relaying_a_group_the_source_did_estimate_is_fine(self) -> None:
+        from gps_analysis.staged import HeldFromStage, Stage, estimate_staged
+
+        t = np.linspace(2020.0, 2023.0, 400)
+        y = 1.0 + 2.0 * (t - 2020.0) + 3.0 * np.cos(2 * np.pi * t)
+        plan = [
+            Stage("A", ("secular", "periodic")),
+            Stage("B", ("secular",), held={"periodic": HeldFromStage("A")}),
+        ]
+        res = estimate_staged("lineperiodic", t, y, plan=plan)
+        assert res.stages[-1].held_covariance == "propagated"
+        i_cos = res.param_names.index("cos_annual")
+        assert (
+            abs(res.fits[0].params[i_cos] - 3.0) < 1e-6
+        ), "the relayed cosine is a real estimate, not a composed zero"
+
+
+class TestEvaluateGroupValuesCoversCurvature:
+    """`curvature` is an ordinary secular name, in any position.
+
+    The probe used to be `Polynomial(degree=max(max_degree, 1))`, whose names
+    are only ("offset", "rate") — so `curvature` hit the "unrecognised" raise
+    unless a `poly_m` name happened to be seen FIRST. A degree-2 donor yields
+    exactly ("offset", "rate", "curvature") through geo_dataread's
+    `_entry_group_names`, so the borrow re-anchoring this function exists to
+    serve raised on its most ordinary input.
+    """
+
+    def test_curvature_alone(self) -> None:
+        from gps_analysis.staged import evaluate_group_values
+
+        t = np.array([2020.0, 2021.0])
+        out = evaluate_group_values(["curvature"], [2.0], t)
+        assert np.allclose(out, 2.0 * t**2)
+
+    def test_curvature_in_natural_order(self) -> None:
+        from gps_analysis.staged import evaluate_group_values
+
+        t = np.array([2020.0, 2021.0, 2022.5])
+        names = ["offset", "rate", "curvature"]
+        out = evaluate_group_values(names, [1.0, 2.0, 3.0], t)
+        assert np.allclose(out, 1.0 + 2.0 * t + 3.0 * t**2)
+
+    def test_order_does_not_change_the_result(self) -> None:
+        from gps_analysis.staged import evaluate_group_values
+
+        t = np.array([2020.0, 2021.5])
+        forward = evaluate_group_values(["curvature", "poly_3"], [3.0, 4.0], t)
+        reverse = evaluate_group_values(["poly_3", "curvature"], [4.0, 3.0], t)
+        assert np.allclose(forward, reverse)
+        assert np.allclose(forward, 3.0 * t**2 + 4.0 * t**3)
