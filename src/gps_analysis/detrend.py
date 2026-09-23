@@ -104,6 +104,7 @@ from .models import FloatArray, TrajectoryParams
 from .outliers import OutlierDetection, OutlierParams, detect_outliers
 
 __all__ = [
+    "DATUM_PARAM_NAMES",
     "DETREND_METHOD_BORROWED",
     "DETREND_METHOD_PLAIN",
     "DETREND_METHOD_ROBUST",
@@ -113,9 +114,21 @@ __all__ = [
     "apply_detrend",
     "estimate_detrend",
     "evaluate_record",
+    "reanchor_record",
     "select_terms",
     "trajectory_from_record",
+    "weighted_datum",
 ]
+
+DATUM_PARAM_NAMES: frozenset[str] = frozenset({"offset", "poly_0"})
+"""Parameter names that carry a background's DATUM (its level at t = 0).
+
+``offset`` is the intercept at t = 0 in ABSOLUTE fractional years
+(t ≈ 2×10³), so its value is wildly station-specific: it is the one
+coefficient of a secular background that never transfers between
+stations. ``poly_0`` is the same column under the explicit-polynomial
+spelling. Every borrow path finds the datum by one of these NAMES,
+never by position."""
 
 RECORD_VERSION = 1
 """Version this writer EMITS for the leaf's station-record shape.
@@ -1233,6 +1246,199 @@ def evaluate_record(
     return np.stack(
         [np.asarray(model_func(tt, *fit.params), dtype=np.float64) for fit in fits]
     )
+
+
+def weighted_datum(
+    y: ArrayLike,
+    model: ArrayLike,
+    sigma: ArrayLike | None = None,
+) -> float:
+    """Locally re-anchored datum p̂₀ of a borrowed background.
+
+    Equation:
+        ``p̂₀ = Σᵢ wᵢ·(yᵢ − gᵢ) / Σᵢ wᵢ``,  ``wᵢ = 1/σᵢ²``
+
+    — the weighted mean of the borrower's residual against the datum-free
+    borrowed model: the WLS solution of the one-column constant design
+    ``y − g = p₀·1 + ε``, same ``1/σ²`` convention as
+    :func:`gps_analysis.fitting._wls_solve`.
+
+    Symbols → args:
+        - ``yᵢ`` → ``y``: the borrower's observations, one component, (N,) [mm]
+        - ``gᵢ`` → ``model``: the borrowed model at the same epochs WITHOUT
+          its datum term, (N,) [mm]
+        - ``σᵢ`` → ``sigma``: the borrower's 1-σ uncertainties, (N,) [mm];
+          None ⇒ unit weights (plain mean)
+
+    Returns:
+        p̂₀ [mm] — the borrower-local level of the borrowed background.
+
+    Reference:
+        Weighted mean as the Gauss–Markov estimator of a constant: Aitken
+        1936, Proc. R. Soc. Edinb. 55 (the P = 1 case of the WLS solve).
+
+    Numerical notes:
+        Closed form, nothing inverted. Requires at least one epoch — the
+        caller selects the window and refuses an empty one with a message
+        naming the station.
+    """
+    resid = np.asarray(y, dtype=np.float64) - np.asarray(model, dtype=np.float64)
+    if sigma is None:
+        return float(np.mean(resid))
+    w = 1.0 / np.square(np.asarray(sigma, dtype=np.float64))
+    return float(np.sum(w * resid) / np.sum(w))
+
+
+def reanchor_record(
+    record: Mapping[str, Any],
+    t: ArrayLike,
+    y: ArrayLike,
+    sigma: ArrayLike | None = None,
+    *,
+    window: tuple[float, float] | None = None,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Re-express a DONOR's stored record at a BORROWER's datum.
+
+    A stored record applies to another station's epochs only for its
+    station-independent coefficients. Two parts of it are the donor's own
+    and must not transfer:
+
+    - the **datum** (:data:`DATUM_PARAM_NAMES`) — the intercept at t = 0,
+      which pins the borrower to the donor's level (measured: SENG holding
+      SKSH's background is off by (−2.9, −30.1, +41.5) mm N/E/U);
+    - the **step terms** — Heaviside jumps at the DONOR's equipment/event
+      epochs, which would subtract the donor's steps from the borrower.
+
+    So the steps are dropped (``step_epochs = []``, their amplitudes and
+    covariance rows removed), and per component the datum is replaced by
+    :func:`weighted_datum` of the borrower's own residual against the
+    datum-free, step-free donor model over ``window``. Rate, curvature and
+    every seasonal/transient coefficient stay the donor's verbatim.
+
+    Equation (per component c, epochs i in the window with finite y, σ):
+        ``p̂₀_c = Σᵢ wᵢ·(y_ci − f(tᵢ; p̂_c ∖ p₀)) / Σᵢ wᵢ``
+
+    Symbols → args:
+        - ``p̂_c`` → ``record``: the donor's station record
+          (:meth:`DetrendEstimate.to_record` shape, WITH ``param_names``)
+        - ``tᵢ`` → ``t``: the borrower's epochs, (N,) [fractional yr]
+        - ``y_ci`` → ``y``: the borrower's observations, (C, N) [mm], rows in
+          the record's component order
+        - ``σ_ci`` → ``sigma``: (C, N) [mm] or None ⇒ unit weights
+        - window → ``window``: ``(start, end)`` [fractional yr]; None ⇒ the
+          full span of ``t``
+
+    Returns:
+        ``(record, anchor)`` — a NEW record (the input is not mutated) and the
+        anchor provenance ``{"window": [a, b], "n_epochs": [..per comp..],
+        "datum": [..per comp..], "dropped_step_epochs": [...]}`` for the
+        caller to store beside ``borrowed``. The datum's covariance row and
+        column are replaced: zero cross terms, variance ``1/Σw`` (or the
+        variance of the mean with unit weights) — the uncertainty of THIS
+        anchor, not the donor's intercept.
+
+    Raises:
+        ValueError: on a record without ``param_names`` (a legacy record's
+            datum cannot be located by name), a model with no datum
+            parameter, a component-count mismatch, a degenerate window, or a
+            window selecting no finite epoch of some component — never a
+            silent fallback to the donor's level.
+
+    Reference:
+        ``docs/REVIEW_2026-09-13_package.md`` finding #1; geo_dataread's
+        ``resolve_stage_plan`` re-anchoring (same estimator).
+    """
+    model_func, fits = trajectory_from_record(record)  # validates the record
+    del model_func
+    names = record.get("param_names")
+    if names is None:
+        raise ValueError(
+            "reanchor_record: record has no param_names, so its datum cannot "
+            "be located by name; re-estimate the donor (records now store "
+            "param_names)"
+        )
+    names = [str(n) for n in names]
+    datum_idx = [j for j, n in enumerate(names) if n in DATUM_PARAM_NAMES]
+    if len(datum_idx) != 1:
+        raise ValueError(
+            f"reanchor_record: expected exactly one datum parameter "
+            f"{sorted(DATUM_PARAM_NAMES)} in {names}, found {len(datum_idx)}"
+        )
+    j0 = datum_idx[0]
+    step_epochs = [float(v) for v in record.get("step_epochs", [])]
+    keep = len(names) - len(step_epochs)
+    if any(n.startswith(_STEP_AMP_PREFIX) for n in names[:keep]):
+        raise ValueError(  # pragma: no cover - trajectory_from_record checks
+            f"reanchor_record: step amplitudes out of place in {names}"
+        )
+
+    tt = np.atleast_1d(np.asarray(t, dtype=np.float64))
+    yy = np.atleast_2d(np.asarray(y, dtype=np.float64))
+    ss = None if sigma is None else np.atleast_2d(np.asarray(sigma, dtype=np.float64))
+    if yy.shape != (len(fits), tt.size) or (ss is not None and ss.shape != yy.shape):
+        raise ValueError(
+            f"reanchor_record: y{yy.shape}"
+            + ("" if ss is None else f"/sigma{ss.shape}")
+            + f" does not match ({len(fits)} components, {tt.size} epochs)"
+        )
+    lo, hi = window if window is not None else (float(tt.min()), float(tt.max()))
+    lo, hi = float(lo), float(hi)
+    if not (np.isfinite(lo) and np.isfinite(hi)) or hi < lo:
+        raise ValueError(
+            f"reanchor_record: anchor window [{lo!r},{hi!r}] is degenerate"
+        )
+    in_window = (tt >= lo) & (tt <= hi)
+
+    new_record: dict[str, Any] = dict(record)
+    new_record["param_names"] = names[:keep]
+    new_record["step_epochs"] = []
+    stripped: list[TrajectoryParams] = []
+    for fit in fits:
+        params = np.array(fit.params[:keep], dtype=np.float64)
+        params[j0] = 0.0
+        cov = np.array(fit.covariance[:keep, :keep], dtype=np.float64)
+        stripped.append(TrajectoryParams(params, cov, fit.component))
+    new_record["components"] = [fit.to_record() for fit in stripped]
+    datum_free = evaluate_record(new_record, tt)
+
+    datums: list[float] = []
+    counts: list[int] = []
+    components: list[dict[str, Any]] = []
+    for c, fit in enumerate(stripped):
+        sel = in_window & np.isfinite(yy[c])
+        if ss is not None:
+            sel &= np.isfinite(ss[c]) & (ss[c] > 0)
+        n = int(np.count_nonzero(sel))
+        if n == 0:
+            raise ValueError(
+                f"reanchor_record: anchor window [{lo!r},{hi!r}] selects no "
+                f"finite epoch of component {fit.component or c!r}; the "
+                f"borrowed datum cannot be anchored"
+            )
+        sig = None if ss is None else ss[c][sel]
+        p0 = weighted_datum(yy[c][sel], datum_free[c][sel], sig)
+        if sig is not None:
+            var0 = 1.0 / float(np.sum(1.0 / np.square(sig)))
+        else:
+            resid = yy[c][sel] - datum_free[c][sel] - p0
+            var0 = float(np.var(resid, ddof=1)) / n if n > 1 else float("inf")
+        params = fit.params.copy()
+        params[j0] = p0
+        cov = fit.covariance.copy()
+        cov[j0, :] = 0.0
+        cov[:, j0] = 0.0
+        cov[j0, j0] = var0
+        components.append(TrajectoryParams(params, cov, fit.component).to_record())
+        datums.append(p0)
+        counts.append(n)
+    new_record["components"] = components
+    anchor = {
+        "window": [lo, hi],
+        "n_epochs": counts,
+        "datum": datums,
+        "dropped_step_epochs": step_epochs,
+    }
+    return new_record, anchor
 
 
 def apply_detrend(

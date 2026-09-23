@@ -98,11 +98,22 @@ class HeldExplicit:
             propagates into the free parameters (see
             :func:`fit_held_partition`); when None the held values are
             treated as exactly known and the result is conditional on them.
+        local_datum: True when a DATUM parameter among ``values``
+            (:data:`gps_analysis.detrend.DATUM_PARAM_NAMES` — the intercept
+            at t = 0) is THIS station's level: its own stored background,
+            or a donor's re-anchored on this station's data
+            (:func:`gps_analysis.detrend.weighted_datum`).  Fail-closed:
+            the default False makes :func:`estimate_staged` refuse to hold
+            a datum-carrying group, because a donor's intercept lands in
+            whatever is free — measured, a true 5.0 mm step estimated as
+            35.0 mm under a 30 mm datum difference.  Irrelevant for groups
+            without a datum (periodic).
     """
 
     values: FloatArray
     source: str
     covariance: FloatArray | None = None
+    local_datum: bool = False
 
 
 Held = HeldFromStage | HeldExplicit
@@ -1002,7 +1013,7 @@ def estimate_staged(
 
     full_design = design_spec.build(tt)
     n_params = full_design.shape[1]
-    from .detrend import _param_names
+    from .detrend import DATUM_PARAM_NAMES, _param_names
 
     param_names = tuple(_param_names(model_func))
 
@@ -1107,6 +1118,30 @@ def estimate_staged(
                 n for n, k in zip(param_names, free_mask & held_mask, strict=True) if k
             ]
             raise ValueError(f"stage {stage.name!r} both frees and holds {overlap}")
+        # A held intercept must be THIS station's level. A donor's `offset` is
+        # its own datum (t = 0 in absolute years, so tens of mm to km apart
+        # between stations); held verbatim it lands in whatever is free -- the
+        # whole residual level on an apply-only stage, a step amplitude on a
+        # free=("step",) one. Fail-closed: the caller asserts local_datum
+        # after anchoring (or for its own stored values); nothing is guessed.
+        for g, src in stage.held.items():
+            if not isinstance(src, HeldExplicit) or src.local_datum:
+                continue
+            datum = [
+                n
+                for n, m in zip(param_names, masks[g], strict=True)
+                if m and n in DATUM_PARAM_NAMES
+            ]
+            if datum:
+                raise ValueError(
+                    f"stage {stage.name!r} holds {g!r} from {src.source!r}, "
+                    f"including its datum {datum}, without local_datum=True. "
+                    f"Another station's intercept is ITS level, not this "
+                    f"one's; re-anchor it on this station's data "
+                    f"(gps_analysis.weighted_datum / reanchor_record) and "
+                    f"mark the hold local_datum=True, or hold only groups "
+                    f"without a datum."
+                )
 
         stage_params: list[FloatArray] = []
         stage_cov: list[FloatArray] = []

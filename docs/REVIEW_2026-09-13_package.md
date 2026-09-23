@@ -7,7 +7,15 @@ Read-only review; ~42 findings, almost all reproduced with numbers rather than a
 
 > **Status 2026-09-13:** the four branch blockers (§P2) are **implemented** —
 > `staged.py` +295, `tests/test_staged.py` +357, 11 new tests of which 9 fail against the
-> pre-fix source. `gps_analysis` 715 pass, `geo_dataread` 439, `gps_api` 144. Not committed.
+> pre-fix source. `gps_analysis` 715 pass, `geo_dataread` 439, `gps_api` 144. Committed
+> 2026-09-23 (`809dd25`).
+>
+> **Status 2026-09-23:** finding **#1 (datum leak) fixed** on both routes — gps_api
+> `_borrowed_record` now calls the new leaf `reanchor_record` (datum re-anchored on the
+> borrower's own series, donor steps dropped), and `estimate_staged` refuses a
+> datum-carrying `HeldExplicit` unless `local_datum=True` (fail-closed). Tests assert
+> `mean(y − model) ≈ 0` on a recipient 30 mm from the donor and a true 5 mm step recovered
+> as 5 mm. No deployed record was affected (72 records, none borrowed; `use_sta: {}`).
 > Everything else here is outstanding.
 
 ---

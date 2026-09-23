@@ -40,6 +40,7 @@ from gps_analysis.detrend import (
     apply_detrend,
     estimate_detrend,
     evaluate_record,
+    reanchor_record,
     select_terms,
     trajectory_from_record,
 )
@@ -914,3 +915,121 @@ def test_segmented_record_is_additive_and_legacy_records_still_apply():
     assert trajectory_from_record(legacy) is not None
     full = evaluate_record(record, t)
     assert np.allclose(evaluate_record(legacy, t), full, rtol=0, atol=0)
+
+
+# ---------------------------------------------------------------------------
+# reanchor_record: a donor's record re-expressed at a borrower's datum
+# (docs/REVIEW_2026-09-13_package.md finding #1)
+# ---------------------------------------------------------------------------
+
+DATUM_SHIFT = np.array([30.0, -41.0, 17.0])
+"""Borrower level minus donor level, per component [mm] — the leak's size."""
+
+DONOR_STEP = 2017.5
+DONOR_STEP_AMP = np.array([8.0, -6.0, 12.0])
+
+
+def _donor_and_borrower() -> tuple[dict, FloatArr, FloatArr, FloatArr]:
+    """A donor record (with a step) and a borrower series.
+
+    The borrower shares the donor's rate and seasonal, sits DATUM_SHIFT away
+    from it, and has NO step at the donor's step epoch. So the correct
+    borrowed model reproduces the borrower exactly up to noise, and any
+    leaked donor datum or donor step shows up as a residual mean.
+    """
+    t, y, sigma = _white_series(6 * 365, seed=11)
+    y_donor = y + DONOR_STEP_AMP[:, None] * (t >= DONOR_STEP)
+    est = estimate_detrend(
+        lineperiodic, t, y_donor, sigma, step_epochs=[DONOR_STEP], detect=False
+    )
+    record = est.to_record(fitted_at="2026-09-23T00:00:00Z")
+    rng = np.random.default_rng(12)
+    y_b = _truth(t) + DATUM_SHIFT[:, None] + rng.normal(0.0, WN, size=(3, t.size))
+    return record, t, y_b, sigma
+
+
+class TestReanchorRecord:
+    def test_verbatim_donor_record_leaks_datum_and_step(self) -> None:
+        """The bug being fixed, measured: a verbatim copy is off by the shift."""
+        record, t, y_b, _ = _donor_and_borrower()
+        resid = y_b - evaluate_record(record, t)
+        before = t < DONOR_STEP
+        after = ~before
+        np.testing.assert_allclose(resid[:, before].mean(axis=1), DATUM_SHIFT, atol=0.5)
+        np.testing.assert_allclose(
+            resid[:, after].mean(axis=1), DATUM_SHIFT - DONOR_STEP_AMP, atol=0.5
+        )
+
+    def test_reanchored_record_fits_the_borrower(self) -> None:
+        """mean(y_b − model) ≈ 0 on the BORROWER's data, before and after the
+        donor's step epoch — neither the donor's level nor its step survive."""
+        record, t, y_b, sigma = _donor_and_borrower()
+        new, anchor = reanchor_record(record, t, y_b, sigma)
+        resid = y_b - evaluate_record(new, t)
+        for part in (t < DONOR_STEP, t >= DONOR_STEP):
+            np.testing.assert_allclose(resid[:, part].mean(axis=1), 0.0, atol=0.3)
+        assert new["step_epochs"] == []
+        assert "step_amp_1" not in new["param_names"]
+        assert anchor["dropped_step_epochs"] == [DONOR_STEP]
+        assert anchor["n_epochs"] == [t.size] * 3
+        np.testing.assert_allclose(
+            anchor["datum"], [c["params"][0] for c in new["components"]]
+        )
+
+    def test_rate_and_seasonal_stay_the_donors(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        new, _ = reanchor_record(record, t, y_b, sigma)
+        for old_c, new_c in zip(record["components"], new["components"], strict=True):
+            assert new_c["params"][1:] == old_c["params"][1:6]
+
+    def test_input_record_is_not_mutated(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        frozen = json.dumps(record, sort_keys=True)
+        reanchor_record(record, t, y_b, sigma)
+        assert json.dumps(record, sort_keys=True) == frozen
+
+    def test_record_round_trips_through_the_reader(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        new, _ = reanchor_record(record, t, y_b, sigma)
+        trajectory_from_record(json.loads(json.dumps(new)))
+
+    def test_datum_variance_is_this_anchor_not_the_donor_intercept(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        new, _ = reanchor_record(record, t, y_b, sigma)
+        _, fits = trajectory_from_record(new)
+        cov = fits[0].covariance
+        assert cov[0, 0] == pytest.approx(WN**2 / t.size)
+        assert np.all(cov[0, 1:] == 0.0) and np.all(cov[1:, 0] == 0.0)
+
+    def test_window_restricts_the_anchor(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        y_b = y_b.copy()
+        y_b[:, t > 2018.0] += 100.0  # deformation after the anchor window
+        new, anchor = reanchor_record(record, t, y_b, sigma, window=(2015.0, 2018.0))
+        resid = y_b - evaluate_record(new, t)
+        np.testing.assert_allclose(resid[:, t <= 2018.0].mean(axis=1), 0.0, atol=0.3)
+        assert anchor["window"] == [2015.0, 2018.0]
+
+    def test_nan_epochs_are_ignored(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        y_b = y_b.copy()
+        y_b[1, ::3] = np.nan
+        new, anchor = reanchor_record(record, t, y_b, sigma)
+        assert np.isfinite(anchor["datum"]).all()
+        assert anchor["n_epochs"][1] < anchor["n_epochs"][0]
+
+    def test_empty_window_refuses(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        with pytest.raises(ValueError, match="selects no finite epoch"):
+            reanchor_record(record, t, y_b, sigma, window=(1990.0, 1991.0))
+
+    def test_record_without_param_names_refuses(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        legacy = {k: v for k, v in record.items() if k != "param_names"}
+        with pytest.raises(ValueError, match="no param_names"):
+            reanchor_record(legacy, t, y_b, sigma)
+
+    def test_shape_mismatch_refuses(self) -> None:
+        record, t, y_b, sigma = _donor_and_borrower()
+        with pytest.raises(ValueError, match="does not match"):
+            reanchor_record(record, t, y_b[:2], sigma[:2])

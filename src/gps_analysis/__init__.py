@@ -52,6 +52,7 @@ from gps_analysis.deformation import (
     volume_from_pressure,
 )
 from gps_analysis.detrend import (
+    DATUM_PARAM_NAMES,
     DETREND_METHOD_BORROWED,
     DETREND_METHOD_PLAIN,
     DETREND_METHOD_ROBUST,
@@ -59,8 +60,10 @@ from gps_analysis.detrend import (
     apply_detrend,
     estimate_detrend,
     evaluate_record,
+    reanchor_record,
     select_terms,
     trajectory_from_record,
+    weighted_datum,
 )
 from gps_analysis.fitting import (
     ModelFunc,
@@ -253,6 +256,9 @@ __all__ = [
     "trajectory_from_record",
     "evaluate_record",
     "apply_detrend",
+    "DATUM_PARAM_NAMES",
+    "reanchor_record",
+    "weighted_datum",
     # baseline
     "HeldExplicit",
     "HeldFromStage",
