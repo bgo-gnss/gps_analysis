@@ -660,6 +660,17 @@ application primitive. (`"secular"` keeps the offset with the rate so the
 line-only view matches the legacy `detrend_line` behavior of subtracting
 `p[0:2]`.)
 
+**Two vocabularies (2026-10-14).** Since step augmentation, `select_terms`'
+`"secular"` holds the step amplitudes too, so "remove rate + seasonals but keep
+the step offsets visible" was not expressible and gps_plot added the steps back
+by hand. `apply_detrend` / `evaluate_record` now also take `groups=`: the
+staged grammar's group names (`terms.GROUP_ORDER`: `secular` = the polynomial
+alone, `periodic`, `step`, `transient`), classified per record by
+`staged.record_group_mask` and applied by `select_record_groups` with the same
+coefficient + covariance zeroing. `terms=` is unchanged; giving both raises.
+Checked on every deployed record (3 documents × 7 term combinations): the
+`groups=` path equals `terms=` + step add-back to 3e-14 mm.
+
 ### 5.4 Caller responsibilities (who does what)
 
 | Concern                                                                                                        | Owner                                                                                                         |
