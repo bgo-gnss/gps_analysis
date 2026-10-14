@@ -387,6 +387,53 @@ def test_select_terms_steps_stay_with_secular() -> None:
         assert abs(per[c, 1] - per[c, 0]) < 0.5
 
 
+def _stepped_record(
+    step_epoch: float = 2016.5,
+) -> tuple[dict, NDArray[np.float64], NDArray[np.float64]]:
+    n = 1096
+    rng = np.random.default_rng(22)
+    t = _daily_t(n)
+    y = _truth(t) + rng.normal(0.0, WN, size=(3, n))
+    y += heaviside_steps(t, [step_epoch], [25.0])[np.newaxis, :]
+    sigma = np.full((3, n), WN)
+    est = estimate_detrend(
+        lineperiodic, t, y, sigma, step_epochs=[step_epoch], detect=False
+    )
+    return est.to_record(), t, y
+
+
+def test_record_groups_split_steps_from_the_polynomial() -> None:
+    """groups=("secular","periodic") removes rate + seasonals, keeps the steps.
+
+    That is select_terms' ("secular","periodic") with the step amplitudes
+    added back — what gps_plot's --ref detrend used to do by hand.
+    """
+    record, t, y = _stepped_record()
+    amps = np.array([c["params"][6] for c in record["components"]])
+    jumps = (t >= record["step_epochs"][0]).astype(np.float64)
+
+    kept = apply_detrend(record, t, y, groups=("secular", "periodic"))
+    by_hand = apply_detrend(record, t, y, terms=("secular", "periodic"))
+    by_hand = by_hand + amps[:, np.newaxis] * jumps[np.newaxis, :]
+    np.testing.assert_allclose(kept, by_hand, rtol=0, atol=1e-9)
+
+    every = evaluate_record(record, t, groups=("secular", "periodic", "step"))
+    np.testing.assert_allclose(every, evaluate_record(record, t), rtol=0, atol=1e-9)
+
+    steps = evaluate_record(record, t, groups="step")
+    np.testing.assert_allclose(
+        steps, amps[:, np.newaxis] * jumps[np.newaxis, :], rtol=0, atol=1e-12
+    )
+
+
+def test_record_groups_errors() -> None:
+    record, t, y = _stepped_record()
+    with pytest.raises(ValueError, match="not both"):
+        apply_detrend(record, t, y, terms="periodic", groups="secular")
+    with pytest.raises(ValueError, match="unknown term group"):
+        evaluate_record(record, t, groups="linear")
+
+
 # ---------------------------------------------------------- serialization
 
 
