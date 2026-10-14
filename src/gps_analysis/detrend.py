@@ -657,7 +657,13 @@ def select_terms(
     fit_list = [fits] if isinstance(fits, TrajectoryParams) else list(fits)
     if "all" in wanted:
         return fit_list
-    keep = _term_keep_mask(model, terms)
+    return _keep_params(fit_list, _term_keep_mask(model, terms))
+
+
+def _keep_params(
+    fit_list: Sequence[TrajectoryParams], keep: NDArray[np.bool_]
+) -> list[TrajectoryParams]:
+    """Zero the parameters (and covariance rows/columns) outside ``keep``."""
     out: list[TrajectoryParams] = []
     for fit in fit_list:
         if fit.params.size != keep.size:
@@ -675,6 +681,31 @@ def select_terms(
             )
         )
     return out
+
+
+def select_record_groups(
+    record: Mapping[str, Any],
+    fits: Sequence[TrajectoryParams],
+    groups: str | Sequence[str],
+) -> list[TrajectoryParams]:
+    """Keep only the named term groups of a stored record's fits.
+
+    The groups are the staged grammar's (:data:`terms.GROUP_ORDER`):
+    ``"secular"`` = the polynomial (offset, rate, curvature …) WITHOUT the
+    step amplitudes, ``"periodic"``, ``"step"``, ``"transient"`` —
+    classified by :func:`gps_analysis.staged.record_group_mask`, so a
+    record's appended ``step_amp_k`` tail is handled. Unlike
+    :func:`select_terms`, whose ``"secular"`` includes the steps, this
+    can express "rate + seasonals, steps kept": ``("secular", "periodic")``.
+    Same zeroing as :func:`select_terms` (exact, covariance masked too).
+
+    Raises:
+        ValueError: On an unknown group, or a record whose parameter count
+            disagrees with its fits.
+    """
+    from .staged import record_group_mask
+
+    return _keep_params(list(fits), record_group_mask(record, groups))
 
 
 def estimate_detrend(
@@ -1202,7 +1233,11 @@ def trajectory_from_record(
 
 
 def evaluate_record(
-    record: Mapping[str, Any], t: ArrayLike, *, terms: str = "all"
+    record: Mapping[str, Any],
+    t: ArrayLike,
+    *,
+    terms: str = "all",
+    groups: str | Sequence[str] | None = None,
 ) -> FloatArray:
     """Evaluate a stored trajectory record at arbitrary epochs.
 
@@ -1222,7 +1257,9 @@ def evaluate_record(
           (:meth:`DetrendEstimate.to_record` shape)
         - ``t`` → ``t``: evaluation epochs, fractional years [yr]
         - selection → ``terms``: ``"all"`` | ``"secular"`` |
-          ``"periodic"`` (:func:`select_terms`)
+          ``"periodic"`` (:func:`select_terms`), or ``groups``: staged
+          group names (:func:`select_record_groups`; ``"secular"`` there
+          excludes the steps). Give one, not both.
 
     Returns:
         Model values, shape (C, N), float64 [L] — component rows in
@@ -1239,9 +1276,7 @@ def evaluate_record(
         Pure evaluation — no state, no window: new epochs are simply
         new arguments.
     """
-    model_func, fits = trajectory_from_record(record)
-    if terms != "all":
-        fits = select_terms(model_func, fits, terms)
+    model_func, fits = _selected_fits(record, terms, groups)
     tt = np.atleast_1d(np.asarray(t, dtype=np.float64))
     return np.stack(
         [np.asarray(model_func(tt, *fit.params), dtype=np.float64) for fit in fits]
@@ -1448,6 +1483,7 @@ def apply_detrend(
     *,
     terms: str = "all",
     frame: str | None = None,
+    groups: str | Sequence[str] | None = None,
 ) -> FloatArray:
     """Subtract a stored trajectory record from observations (pure view).
 
@@ -1471,7 +1507,9 @@ def apply_detrend(
         - selection → ``terms``: ``"all"`` | ``"secular"`` |
           ``"periodic"`` — partial detrend views from the SAME stored
           parameters (the legacy ``detrend_line``/``detrend_periodic``
-          switches, design §4.2)
+          switches, design §4.2); or ``groups``, staged group names
+          (:func:`select_record_groups`: ``("secular", "periodic")`` removes
+          rate + seasonals and keeps the steps). Give one, not both.
         - frame guard → ``frame``: the series' frame tag; when both it
           and the record's ``frame`` are non-None they must match —
           applying parameters across frames is an error to refuse, not
@@ -1503,7 +1541,21 @@ def apply_detrend(
                 f"frame mismatch: record frame {record_frame!r} != series "
                 f"frame {frame!r} - refusing to apply (design §2.5)"
             )
+    model_func, fits = _selected_fits(record, terms, groups)
+    return remove_trend(model_func, t, y, fits)
+
+
+def _selected_fits(
+    record: Mapping[str, Any],
+    terms: str,
+    groups: str | Sequence[str] | None,
+) -> tuple[ModelFunc, list[TrajectoryParams]]:
+    """(model, fits) of a record, reduced by ``terms`` or ``groups``."""
     model_func, fits = trajectory_from_record(record)
+    if groups is not None:
+        if terms != "all":
+            raise ValueError("give terms or groups, not both")
+        return model_func, select_record_groups(record, fits, groups)
     if terms != "all":
         fits = select_terms(model_func, fits, terms)
-    return remove_trend(model_func, t, y, fits)
+    return model_func, fits
