@@ -68,6 +68,10 @@ SHORT_SNR_PAIR = 10.0
 #: (correlated noise); Svartsengi 2023-11-12 + 14/30 d windows (the decay
 #: after the dike) reach 30-310. A flag, not a refusal.
 NONLINEAR_F = 50.0
+#: ... and only up to this window length [days]: the threshold is
+#: calibrated to 61 d; longer quiet windows (91 d p99 80) would be flagged
+#: for their correlated noise and leftover seasonal
+NONLINEAR_MAX_DAYS = 61
 #: a window is about this fraction full of epochs at most for daily data
 _DAYS_PER_YEAR = 365.25
 

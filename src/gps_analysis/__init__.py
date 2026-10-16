@@ -137,6 +137,7 @@ from gps_analysis.preprocess import (
 )
 from gps_analysis.rate_quality import (
     NONLINEAR_F,
+    NONLINEAR_MAX_DAYS,
     SHORT_SNR,
     SHORT_SNR_PAIR,
     LineFit,
@@ -311,6 +312,7 @@ __all__ = [
     "largest_gap",
     "rate_scale_at",
     "NONLINEAR_F",
+    "NONLINEAR_MAX_DAYS",
     "SHORT_SNR",
     "SHORT_SNR_PAIR",
     "LineFit",
