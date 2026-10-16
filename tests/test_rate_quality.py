@@ -63,9 +63,12 @@ def test_bad_arguments_raise() -> None:
 
 
 def test_window_gates_name_each_reason() -> None:
-    t = np.linspace(2020.0, 2020.05, 10)
+    t = np.linspace(2020.0, 2020.05, 4)
     reasons = window_gates(t, (2020.0, 2020.5), step_epochs=[2020.2, 2021.0])
-    assert reasons == ("n_obs=10<20", "cover=0.10<0.8", "step_in_window@2020.2000")
+    assert reasons == ("n_obs=4<5", "cover=0.10<0.8", "step_in_window@2020.2000")
+    # a week of daily epochs passes: the inter-episode windows of an unrest
+    week = 2020.0 + np.arange(8) / 365.25
+    assert window_gates(week, (2020.0, 2020.0 + 7 / 365.25)) == ()
     full = np.linspace(2020.0, 2020.5, 100)
     assert window_gates(full, (2020.0, 2020.5)) == ()
     # a step on the window edge is not inside it
@@ -77,3 +80,18 @@ def test_window_gates_name_each_reason() -> None:
 def test_largest_gap() -> None:
     assert largest_gap([2020.0, 2020.1, 2020.6, np.nan]) == pytest.approx(0.5)
     assert largest_gap([2020.0]) == 0.0
+
+
+def test_rate_scale_at_interpolates_in_log_t_and_holds_the_ends() -> None:
+    from gps_analysis import rate_scale_at
+
+    years = [0.1, 1.0]
+    k = [[2.0, 4.0], [4.0, np.nan]]
+    np.testing.assert_allclose(rate_scale_at(np.sqrt(0.1), years, k), [3.0, 4.0])
+    np.testing.assert_allclose(rate_scale_at(0.01, years, k), [2.0, 4.0])
+    np.testing.assert_allclose(rate_scale_at(10.0, years, k), [4.0, 4.0])
+    assert np.isnan(rate_scale_at(1.0, [1.0], [[np.nan]]))[0]
+    with pytest.raises(ValueError, match="window_years"):
+        rate_scale_at(0.0, years, k)
+    with pytest.raises(ValueError, match="table shapes"):
+        rate_scale_at(1.0, [1.0], k)

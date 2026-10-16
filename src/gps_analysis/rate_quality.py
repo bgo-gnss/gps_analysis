@@ -29,6 +29,7 @@ detrend window), and what to do with a refusal, are the caller's.
 from __future__ import annotations
 
 import dataclasses
+import math
 from collections.abc import Sequence
 
 import numpy as np
@@ -41,8 +42,10 @@ from .velocity import sliding_velocity
 MAD_TO_SIGMA = 1.4826
 #: fewest valid windows behind a k (fewer: NaN, the caller's fallback)
 MIN_WINDOWS = 8
-#: the default gates of a windowed rate
-MIN_OBS = 20
+#: the default gates of a windowed rate: a count floor small enough for
+#: the week-long inter-episode windows of an unrest (``min_cover`` is what
+#: keeps a sparse window out), and the share of the window spanned
+MIN_OBS = 5
 MIN_COVER = 0.8
 #: a window is about this fraction full of epochs at most for daily data
 _DAYS_PER_YEAR = 365.25
@@ -199,3 +202,40 @@ def window_gates(
         if start < epoch < end:
             reasons.append(f"step_in_window@{epoch:.4f}")
     return tuple(reasons)
+
+
+def rate_scale_at(
+    window_years: float, table_years: ArrayLike, table_k: ArrayLike
+) -> FloatArray:
+    """k at ``window_years`` from a table of k by window length.
+
+    Linear in log T between the table's lengths, held at the end values
+    outside them (k changes slowly with T; extrapolating a trend in it
+    would invent one). NaN entries of a component are skipped.
+
+    Args:
+        window_years: The window length T [yr], > 0.
+        table_years: Window lengths, shape (M,), increasing [yr].
+        table_k: k per length and component, shape (M, C).
+
+    Returns:
+        k, shape (C,); NaN for a component with no finite entry.
+
+    Raises:
+        ValueError: on a non-positive T, or mismatched table shapes.
+    """
+    if window_years <= 0:
+        raise ValueError(f"window_years must be > 0, got {window_years}")
+    ty = np.asarray(table_years, dtype=np.float64)
+    tk = np.asarray(table_k, dtype=np.float64)
+    if tk.ndim == 1:
+        tk = tk[:, None]
+    if tk.shape[0] != ty.size or ty.size == 0:
+        raise ValueError(f"table shapes differ: years {ty.shape}, k {tk.shape}")
+    out = np.full(tk.shape[1], np.nan)
+    x = math.log(window_years)
+    for c in range(tk.shape[1]):
+        ok = np.isfinite(tk[:, c]) & (ty > 0)
+        if ok.any():
+            out[c] = float(np.interp(x, np.log(ty[ok]), tk[ok, c]))
+    return out

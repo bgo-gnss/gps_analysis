@@ -139,6 +139,7 @@ from gps_analysis.rate_quality import (
     RateScale,
     empirical_rate_scale,
     largest_gap,
+    rate_scale_at,
     window_gates,
 )
 from gps_analysis.staged import (
@@ -302,6 +303,7 @@ __all__ = [
     "RateScale",
     "empirical_rate_scale",
     "largest_gap",
+    "rate_scale_at",
     "window_gates",
     "horizontal_magnitude",
     "horizontal_azimuth",
