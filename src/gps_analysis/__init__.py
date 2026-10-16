@@ -136,10 +136,16 @@ from gps_analysis.preprocess import (
     screen_uncertainty,
 )
 from gps_analysis.rate_quality import (
+    NONLINEAR_F,
+    SHORT_SNR,
+    SHORT_SNR_PAIR,
+    LineFit,
     RateScale,
     empirical_rate_scale,
     largest_gap,
+    line_fit,
     rate_scale_at,
+    signal_to_noise,
     window_gates,
 )
 from gps_analysis.staged import (
@@ -304,6 +310,12 @@ __all__ = [
     "empirical_rate_scale",
     "largest_gap",
     "rate_scale_at",
+    "NONLINEAR_F",
+    "SHORT_SNR",
+    "SHORT_SNR_PAIR",
+    "LineFit",
+    "line_fit",
+    "signal_to_noise",
     "window_gates",
     "horizontal_magnitude",
     "horizontal_azimuth",

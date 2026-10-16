@@ -21,6 +21,12 @@ not fit to give a rate at all:
 2. :func:`window_gates` — the reasons a window gives no rate: too few
    epochs, too little of the window covered, a declared step inside it.
 3. :func:`largest_gap` — the provenance of how gapped the window was.
+4. :func:`line_fit` — the window's line in closed form, with what the
+   gates of a short window need: the a-priori σ (no χ² scaling, which has
+   no meaning on 2–3 epochs), χ²/ν, and the F statistic of a quadratic
+   against the line (:data:`NONLINEAR_F`: a decaying pulse, not a rate).
+5. :func:`signal_to_noise` — |v|/σ of the horizontal pair and of up, the
+   key of the short tier (:data:`SHORT_SNR`, :data:`SHORT_SNR_PAIR`).
 
 The leaf stays pure: which series is "quiet" (a station's curated
 detrend window), and what to do with a refusal, are the caller's.
@@ -47,6 +53,21 @@ MIN_WINDOWS = 8
 #: keeps a sparse window out), and the share of the window spanned
 MIN_OBS = 5
 MIN_COVER = 0.8
+#: the short tier (fewer epochs or less cover than the standard gates): a
+#: part (horizontal pair, up) stands when |v|/σ reaches this. Measured
+#: 2026-10-16 on 3 yr quiet spans of 20 stations, raw series, background
+#: removed, every 1-8 day window (~20000 per n): false accepts per 10⁴ at
+#: |v_h|/σ_h ≥ 5 are 2 (n=3), 1.6 (n=4); at n=2, with no χ² to inflate σ on
+#: a blunder, 23 at 5 and 2 at 10, hence its own threshold. The fast
+#: motion passes: Svartsengi 2023-11-12 (post-dike) 9-15 from n=2-5; the
+#: dike itself ~200 at n=2; the slower 2024 inflation from ~10-14 days.
+SHORT_SNR = 5.0
+SHORT_SNR_PAIR = 10.0
+#: a window's line is flagged nonlinear when the quadratic's F against it
+#: reaches this, in a component. Quiet p99 is 23-42 at 7-61 d, 80 at 91 d
+#: (correlated noise); Svartsengi 2023-11-12 + 14/30 d windows (the decay
+#: after the dike) reach 30-310. A flag, not a refusal.
+NONLINEAR_F = 50.0
 #: a window is about this fraction full of epochs at most for daily data
 _DAYS_PER_YEAR = 365.25
 
@@ -165,6 +186,7 @@ def window_gates(
     step_epochs: Sequence[float] = (),
     min_obs: int = MIN_OBS,
     min_cover: float = MIN_COVER,
+    epoch_span: float = 0.0,
 ) -> tuple[str, ...]:
     """Why the epochs ``t`` inside ``window`` give no rate; empty when fit.
 
@@ -183,6 +205,9 @@ def window_gates(
         step_epochs: Declared step epochs of the station [yr].
         min_obs: Fewest epochs.
         min_cover: Least fraction of the window spanned by the epochs.
+        epoch_span: The time one epoch stands for [yr] (a daily solution:
+            its day, 1/365.25), added to the epochs' span: five daily
+            epochs cover a five-day window. 0: the bare span.
 
     Raises:
         ValueError: on an empty or reversed window.
@@ -195,13 +220,112 @@ def window_gates(
     reasons: list[str] = []
     if tt.size < min_obs:
         reasons.append(f"n_obs={tt.size}<{min_obs}")
-    cover = float(np.ptp(tt)) / (end - start) if tt.size > 1 else 0.0
+    cover = (
+        min(1.0, (float(np.ptp(tt)) + epoch_span) / (end - start)) if tt.size else 0.0
+    )
     if cover < min_cover - 1e-9:  # fractional-year rounding: 0.79999… is 0.8
         reasons.append(f"cover={cover:.2f}<{min_cover:g}")
     for epoch in sorted(float(e) for e in step_epochs):
         if start < epoch < end:
             reasons.append(f"step_in_window@{epoch:.4f}")
     return tuple(reasons)
+
+
+@dataclasses.dataclass(frozen=True)
+class LineFit:
+    """A weighted line through one component of a window.
+
+    Attributes:
+        rate: The slope [L/yr].
+        sigma_apriori: Its σ from the data σ alone [L/yr].
+        chi2nu: χ²/ν of the line (NaN for 2 epochs).
+        f_quadratic: F of a quadratic against the line (NaN below 4
+            epochs; :data:`NONLINEAR_F`).
+        n: Epochs used.
+    """
+
+    rate: float
+    sigma_apriori: float
+    chi2nu: float
+    f_quadratic: float
+    n: int
+
+    @property
+    def sigma_scaled(self) -> float:
+        """The WLS formal σ: a-priori × √(χ²/ν) (as
+        :func:`~gps_analysis.velocity.estimate_velocity`), the a-priori σ
+        for 2 epochs."""
+        if not math.isfinite(self.chi2nu):
+            return self.sigma_apriori
+        return self.sigma_apriori * math.sqrt(self.chi2nu)
+
+    @property
+    def sigma_short(self) -> float:
+        """The σ of the short tier: a-priori × √max(1, χ²/ν). On 2-4
+        epochs χ²/ν is too noisy to shrink σ by, but a blunder must
+        still inflate it."""
+        if not math.isfinite(self.chi2nu):
+            return self.sigma_apriori
+        return self.sigma_apriori * math.sqrt(max(1.0, self.chi2nu))
+
+
+def line_fit(t: ArrayLike, y: ArrayLike, sigma: ArrayLike) -> LineFit:
+    """The weighted least-squares line ``y = a + v·(t − t̄)``, closed form.
+
+    Equations (w = 1/σ², t̄ the weighted mean epoch):
+        ``v = Σw(t−t̄)y / Σw(t−t̄)²``, ``σ_v = 1/√Σw(t−t̄)²``,
+        ``χ²/ν = Σw r² / (n − 2)``;
+        ``F = (χ²_line − χ²_quad) / (χ²_quad / (n − 3))`` (one more
+        parameter; NaN below 4 epochs).
+
+    Args:
+        t: Epochs [yr], shape (N,), N ≥ 2, finite, not all equal.
+        y: Values [L], shape (N,), finite.
+        sigma: 1-σ [L], shape (N,), > 0.
+
+    Raises:
+        ValueError: fewer than 2 epochs, or all at one epoch.
+    """
+    tt = np.asarray(t, dtype=np.float64)
+    yy = np.asarray(y, dtype=np.float64)
+    w = 1.0 / np.asarray(sigma, dtype=np.float64) ** 2
+    n = tt.size
+    if n < 2:
+        raise ValueError(f"a line needs 2 epochs, got {n}")
+    tm = float(np.sum(w * tt) / np.sum(w))
+    dt = tt - tm
+    stt = float(np.sum(w * dt * dt))
+    if not stt > 0:
+        raise ValueError("all epochs at one time")
+    v = float(np.sum(w * dt * yy) / stt)
+    a = float(np.sum(w * yy) / np.sum(w))
+    chi_line = float(np.sum(w * (yy - a - v * dt) ** 2))
+    chi2nu = chi_line / (n - 2) if n > 2 else math.nan
+    f = math.nan
+    if n > 3:
+        sw = np.sqrt(w)
+        scale = float(np.max(np.abs(dt))) or 1.0
+        x = dt / scale
+        design = np.column_stack([np.ones(n), x, x * x]) * sw[:, None]
+        coef = np.linalg.lstsq(design, yy * sw, rcond=None)[0]
+        chi_quad = float(np.sum((yy * sw - design @ coef) ** 2))
+        f = (chi_line - chi_quad) / (chi_quad / (n - 3)) if chi_quad > 0 else math.inf
+    return LineFit(v, 1.0 / math.sqrt(stt), chi2nu, f, n)
+
+
+def signal_to_noise(rate: ArrayLike, sigma: ArrayLike) -> tuple[float, float]:
+    """(|v_h|/σ_h, |v_u|/σ_u) of an N/E/U rate.
+
+    σ_h is the σ of the horizontal speed,
+    ``√((v_n σ_n)² + (v_e σ_e)²) / |v_h|``; NaN where a rate or σ is.
+    """
+    v = np.asarray(rate, dtype=np.float64).reshape(3)
+    s = np.asarray(sigma, dtype=np.float64).reshape(3)
+    vh = math.hypot(v[0], v[1])
+    sh = math.hypot(v[0] * s[0], v[1] * s[1]) / vh if vh > 0 else math.nan
+    snr_h = vh / sh if sh > 0 else math.nan
+    snr_u = abs(v[2]) / s[2] if s[2] > 0 else math.nan
+    return float(snr_h), float(snr_u)
 
 
 def rate_scale_at(

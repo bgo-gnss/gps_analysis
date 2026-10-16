@@ -95,3 +95,56 @@ def test_rate_scale_at_interpolates_in_log_t_and_holds_the_ends() -> None:
         rate_scale_at(0.0, years, k)
     with pytest.raises(ValueError, match="table shapes"):
         rate_scale_at(1.0, [1.0], k)
+
+
+def test_line_fit_matches_the_wls_estimator_and_scales_sigma() -> None:
+    from gps_analysis import estimate_velocity, line_fit
+
+    rng = np.random.default_rng(4)
+    t = _daily(0.1)
+    s = np.full(t.size, 2.0)
+    y = 30.0 * (t - t[0]) + rng.normal(0.0, 3.0, t.size)
+    fit = line_fit(t, y, s)
+    est = estimate_velocity(t, y, s, model="linear")
+    assert fit.rate == pytest.approx(float(est.rates[0]), rel=1e-9)
+    assert fit.sigma_scaled == pytest.approx(float(est.sigmas[0]), rel=1e-6)
+    assert fit.chi2nu == pytest.approx(9.0 / 4.0, rel=0.4)
+    assert fit.sigma_short >= fit.sigma_apriori
+
+
+def test_line_fit_on_two_epochs_and_a_blunder() -> None:
+    from gps_analysis import line_fit
+
+    two = line_fit([2020.0, 2020.01], [0.0, 5.0], [2.0, 2.0])
+    assert two.rate == pytest.approx(500.0)
+    assert two.sigma_apriori == pytest.approx(np.sqrt(8.0) / 0.01)
+    assert np.isnan(two.chi2nu) and two.sigma_short == two.sigma_apriori
+    # a perfect line has χ² = 0: the short σ does not shrink below a priori
+    three = line_fit([2020.0, 2020.01, 2020.02], [0.0, 5.0, 10.0], [2.0] * 3)
+    assert three.sigma_scaled < 1e-6 and three.sigma_short == three.sigma_apriori
+    # a blunder at the end inflates the short σ
+    bad = line_fit([2020.0, 2020.01, 2020.02], [0.0, 0.0, 30.0], [2.0] * 3)
+    assert bad.sigma_short > 2 * bad.sigma_apriori
+    with pytest.raises(ValueError, match="2 epochs"):
+        line_fit([2020.0], [0.0], [1.0])
+
+
+def test_quadratic_f_flags_a_decaying_pulse_not_noise() -> None:
+    from gps_analysis import NONLINEAR_F, line_fit
+
+    rng = np.random.default_rng(5)
+    t = _daily(30 / 365.25)
+    s = np.full(t.size, 2.0)
+    quiet = line_fit(t, rng.normal(0.0, 2.0, t.size), s)
+    decay = 100.0 * (1 - np.exp(-(t - t[0]) * 365.25 / 5.0))
+    pulse = line_fit(t, decay + rng.normal(0.0, 2.0, t.size), s)
+    assert quiet.f_quadratic < NONLINEAR_F < pulse.f_quadratic
+
+
+def test_signal_to_noise_of_the_horizontal_pair_and_up() -> None:
+    from gps_analysis import signal_to_noise
+
+    h, u = signal_to_noise([3.0, 4.0, -10.0], [1.0, 1.0, 2.0])
+    assert h == pytest.approx(5.0) and u == pytest.approx(5.0)
+    h, u = signal_to_noise([0.0, 0.0, 1.0], [1.0, 1.0, np.nan])
+    assert np.isnan(h) and np.isnan(u)
