@@ -196,7 +196,7 @@ def window_gates(
     if tt.size < min_obs:
         reasons.append(f"n_obs={tt.size}<{min_obs}")
     cover = float(np.ptp(tt)) / (end - start) if tt.size > 1 else 0.0
-    if cover < min_cover:
+    if cover < min_cover - 1e-9:  # fractional-year rounding: 0.79999… is 0.8
         reasons.append(f"cover={cover:.2f}<{min_cover:g}")
     for epoch in sorted(float(e) for e in step_epochs):
         if start < epoch < end:
