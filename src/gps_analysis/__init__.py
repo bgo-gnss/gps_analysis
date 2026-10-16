@@ -135,6 +135,13 @@ from gps_analysis.preprocess import (
     prep_plot_series,
     screen_uncertainty,
 )
+from gps_analysis.rate_quality import (
+    RateScale,
+    empirical_rate_scale,
+    largest_gap,
+    rate_scale_at,
+    window_gates,
+)
 from gps_analysis.staged import (
     HeldExplicit,
     HeldFromStage,
@@ -293,6 +300,11 @@ __all__ = [
     "midas_trimmed_median",
     "midas_rate_uncertainty",
     "sliding_velocity",
+    "RateScale",
+    "empirical_rate_scale",
+    "largest_gap",
+    "rate_scale_at",
+    "window_gates",
     "horizontal_magnitude",
     "horizontal_azimuth",
     "horizontal_magnitude_sigma",
