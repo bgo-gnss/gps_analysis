@@ -74,6 +74,10 @@ NONLINEAR_F = 50.0
 #: calibrated to 61 d; longer quiet windows (91 d p99 80) would be flagged
 #: for their correlated noise and leftover seasonal
 NONLINEAR_MAX_DAYS = 61
+#: ... and from this many epochs in the component: F(1, n-3) is heavy
+#: tailed on few epochs (white noise P(F >= 50) 9 % at n=4, 2 % at 5,
+#: 0.6 % at 6, 0.2 % at 7)
+NONLINEAR_MIN_OBS = 7
 #: a window is about this fraction full of epochs at most for daily data
 _DAYS_PER_YEAR = 365.25
 
@@ -315,7 +319,10 @@ def line_fit(t: ArrayLike, y: ArrayLike, sigma: ArrayLike) -> LineFit:
         design = np.column_stack([np.ones(n), x, x * x]) * sw[:, None]
         coef = np.linalg.lstsq(design, yy * sw, rcond=None)[0]
         chi_quad = float(np.sum((yy * sw - design @ coef) ** 2))
-        f = (chi_line - chi_quad) / (chi_quad / (n - 3)) if chi_quad > 0 else math.inf
+        # an exact line (or quadratic): both χ² are round-off, F is noise
+        spread = float(np.sum(w * (yy - a) ** 2))
+        if chi_quad > 1e-12 * spread:
+            f = (chi_line - chi_quad) / (chi_quad / (n - 3))
     return LineFit(v, 1.0 / math.sqrt(stt), chi2nu, f, n)
 
 

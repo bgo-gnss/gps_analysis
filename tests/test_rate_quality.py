@@ -122,6 +122,9 @@ def test_line_fit_on_two_epochs_and_a_blunder() -> None:
     # a perfect line has χ² = 0: the short σ does not shrink below a priori
     three = line_fit([2020.0, 2020.01, 2020.02], [0.0, 5.0, 10.0], [2.0] * 3)
     assert three.sigma_scaled < 1e-6 and three.sigma_short == three.sigma_apriori
+    # an exact line on more epochs: the quadratic's F is round-off, not a flag
+    exact = line_fit(2020.0 + np.arange(6) / 365.25, 7.0 * np.arange(6), [2.0] * 6)
+    assert np.isnan(exact.f_quadratic)
     # a blunder at the end inflates the short σ
     bad = line_fit([2020.0, 2020.01, 2020.02], [0.0, 0.0, 30.0], [2.0] * 3)
     assert bad.sigma_short > 2 * bad.sigma_apriori
