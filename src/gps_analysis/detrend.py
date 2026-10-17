@@ -657,7 +657,25 @@ def select_terms(
     fit_list = [fits] if isinstance(fits, TrajectoryParams) else list(fits)
     if "all" in wanted:
         return fit_list
+    _require_groups(_param_names(model), wanted, getattr(model, "__name__", model))
     return _keep_params(fit_list, _term_keep_mask(model, terms))
+
+
+#: groups a selection must find at least one parameter of: asking for the
+#: background (or the seasonal) of a model that has none is an error, never
+#: an all-zero selection that silently removes nothing
+_REQUIRED_GROUPS = ("secular", "periodic")
+
+
+def _require_groups(names: Sequence[str], wanted: Any, what: object) -> None:
+    """Raise when a requested secular/periodic group has no parameter in
+    ``names`` (a seasonal-only record asked for its rate, say)."""
+    for group in _REQUIRED_GROUPS:
+        if group not in wanted:
+            continue
+        test = _is_periodic_param if group == "periodic" else _is_secular_param
+        if not any(test(n) for n in names):
+            raise ValueError(f"{what!r} has no {group} parameters to select")
 
 
 def _keep_params(
@@ -1550,7 +1568,25 @@ def _selected_fits(
     terms: str,
     groups: str | Sequence[str] | None,
 ) -> tuple[ModelFunc, list[TrajectoryParams]]:
-    """(model, fits) of a record, reduced by ``terms`` or ``groups``."""
+    """(model, fits) of a record, reduced by ``terms`` or ``groups``.
+
+    Raises:
+        ValueError: A seasonal-only record (``seasonal_only``: its seasonal
+            interpolated from other stations, no secular of its own) asked
+            for anything but ``"periodic"`` — ``"all"`` would otherwise
+            pass for the station's background.
+    """
+    if record.get("seasonal_only"):
+        asked = (
+            {terms}
+            if groups is None
+            else ({groups} if isinstance(groups, str) else set(groups))
+        )
+        if asked != {"periodic"}:
+            raise ValueError(
+                f"seasonal-only record ({record.get('detrend_method')}): only "
+                f"'periodic' can be removed, not {sorted(asked)}"
+            )
     model_func, fits = trajectory_from_record(record)
     if groups is not None:
         if terms != "all":
