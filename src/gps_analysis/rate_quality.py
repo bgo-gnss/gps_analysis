@@ -58,11 +58,13 @@ MIN_COVER = 0.8
 #: 2026-10-16 on 3 yr quiet spans of 20 stations, raw series, background
 #: removed, every 1-8 day window (~20000 per n): false accepts per 10⁴ at
 #: |v_h|/σ_h ≥ 5 are 2 (n=3), 1.6 (n=4); at n=2, with no χ² to inflate σ on
-#: a blunder, 23 at 5 and 2 at 10, hence its own threshold. The fast
-#: motion passes: Svartsengi 2023-11-12 (post-dike) 9-15 from n=2-5; the
-#: dike itself ~200 at n=2; the slower 2024 inflation from ~10-14 days.
+#: a blunder, 23 at 5, ~10 at 8 and 2 at 10, hence its own threshold: 8
+#: (BGÓ 2026-10-17), so the post-dike pairs pass (Svartsengi 2023-11-12..13
+#: SENG 9.1, SKSH 10.0, THOB 8.9). The fast motion passes: post-dike 9-15
+#: from n=2-5; the dike itself ~200 at n=2; the slower 2024 inflation from
+#: ~10-14 days.
 SHORT_SNR = 5.0
-SHORT_SNR_PAIR = 10.0
+SHORT_SNR_PAIR = 8.0
 #: a window's line is flagged nonlinear when the quadratic's F against it
 #: reaches this, in a component. Quiet p99 is 23-42 at 7-61 d, 80 at 91 d
 #: (correlated noise); Svartsengi 2023-11-12 + 14/30 d windows (the decay
