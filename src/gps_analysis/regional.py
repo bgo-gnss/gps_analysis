@@ -127,7 +127,7 @@ def interpolate_seasonal(
         return dataclasses.replace(empty, distances_km=dist, refused=reason)
     wn = w / w.sum()
     pred: FloatArray = np.tensordot(wn, coeffs, axes=1)
-    order = np.argsort(-wn)
+    order = np.argsort(-wn, kind="stable")
     weights = {codes[i]: round(float(wn[i]), 6) for i in order if wn[i] > 0}
     return RegionalSeasonal(pred, weights, dist, None, length_km, radius_km)
 

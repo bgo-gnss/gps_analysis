@@ -55,3 +55,15 @@ def test_bad_shapes_and_lengths_raise() -> None:
         interpolate_seasonal((0.0, 0.0), {}, length_km=0.0)
     with pytest.raises(ValueError, match=r"\(3, 4\)"):
         interpolate_seasonal((0.0, 0.0), {"A": (0.0, 0.0, np.zeros((3, 2)))})
+
+
+def test_too_little_donor_weight_refuses() -> None:
+    """Two donors within 2L but far out on the Gaussian: Σw < min_weight."""
+    from gps_analysis.regional import interpolate_seasonal
+
+    c = np.ones((3, 4))
+    # ~95 km away at lat 64: w = exp(-(95/50)^2) ≈ 0.027 each
+    donors = {"A": (-20.05, 64.0, c), "B": (-20.05, 64.01, c)}
+    got = interpolate_seasonal((-22.0, 64.0), donors)
+    assert got.refused is not None and "weight" in got.refused
+    assert np.all(np.isnan(got.coeffs)) and got.weights == {}
