@@ -1126,3 +1126,32 @@ def test_asking_a_model_for_a_group_it_lacks_raises() -> None:
             {**_seasonal_only_record(), "seasonal_only": False}, "secular"
         )
     assert record_group_mask(_seasonal_only_record(), "periodic").all()
+
+
+def test_a_periodic_record_without_the_flag_is_seasonal_only_by_structure() -> None:
+    """The fail-closed rule must not hinge on the ``seasonal_only`` flag: a
+    ``periodic`` record without it has no secular either (review 2026-10-18)."""
+    from gps_analysis.detrend import is_seasonal_only
+
+    rec = {**_seasonal_only_record(), "seasonal_only": False}
+    rec.pop("detrend_method")
+    t = np.linspace(2020.0, 2021.0, 10)
+    assert is_seasonal_only(rec)
+    for terms in ("all", "secular"):
+        with pytest.raises(ValueError, match="seasonal-only"):
+            evaluate_record(rec, t, terms=terms)
+    assert np.all(np.isfinite(evaluate_record(rec, t, terms="periodic")))
+
+
+def test_the_background_of_a_line_model_is_its_line() -> None:
+    """A model without periodic terms answers the background pair
+    ("secular", "periodic") with its line; only "periodic" alone raises."""
+    from gps_analysis.staged import record_group_mask
+
+    comp = {"params": [1.0, 2.0], "cov_upper": [0.0] * 3}
+    rec = {"record_version": RECORD_VERSION, "model": "linear",
+           "param_names": ["offset", "rate"], "step_epochs": [],
+           "components": [dict(comp) for _ in range(3)]}  # fmt: skip
+    assert record_group_mask(rec, ("secular", "periodic")).all()
+    with pytest.raises(ValueError, match="no periodic parameters"):
+        record_group_mask(rec, "periodic")
