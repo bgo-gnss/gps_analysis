@@ -875,6 +875,9 @@ def record_group_mask(
                     f"{model_code!r} whose parameters are {expected}; the mask "
                     f"would be indexed positionally against the wrong slots"
                 )
+        from .detrend import _require_groups
+
+        _require_groups(names, wanted, f"record {record.get('model')!r}")
         return np.array([_staged_group_of(n) in wanted for n in names], dtype=np.bool_)
 
     # No param_names (a hand-written or very old record): fall back to the

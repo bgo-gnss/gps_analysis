@@ -657,7 +657,41 @@ def select_terms(
     fit_list = [fits] if isinstance(fits, TrajectoryParams) else list(fits)
     if "all" in wanted:
         return fit_list
+    _require_groups(_param_names(model), wanted, getattr(model, "__name__", model))
     return _keep_params(fit_list, _term_keep_mask(model, terms))
+
+
+#: groups a selection must find at least one parameter of: asking for the
+#: background (or the seasonal) of a model that has none is an error, never
+#: an all-zero selection that silently removes nothing
+_REQUIRED_GROUPS = ("secular", "periodic")
+
+
+def _require_groups(names: Sequence[str], wanted: Any, what: object) -> None:
+    """Raise when a requested group has no parameter in ``names``.
+
+    ``secular`` is required whenever it is asked for: a background without
+    an offset/rate is no background (a seasonal-only record asked for its
+    rate). ``periodic`` only when it is asked for ALONE: the background pair
+    ``("secular", "periodic")`` of a ``linear`` model is its line.
+    """
+    wanted = {wanted} if isinstance(wanted, str) else set(wanted)
+    for group in _REQUIRED_GROUPS:
+        if group not in wanted or (group == "periodic" and wanted != {"periodic"}):
+            continue
+        test = _is_periodic_param if group == "periodic" else _is_secular_param
+        if not any(test(n) for n in names):
+            raise ValueError(f"{what!r} has no {group} parameters to select")
+
+
+def is_seasonal_only(record: Mapping[str, Any]) -> bool:
+    """A record with no secular term of its own: flagged ``seasonal_only``
+    (a regional seasonal) or, by structure, ``param_names`` without an
+    offset/rate. Only its ``periodic`` group may be removed."""
+    if record.get("seasonal_only"):
+        return True
+    names = record.get("param_names") or ()
+    return bool(names) and not any(_is_secular_param(str(n)) for n in names)
 
 
 def _keep_params(
@@ -1550,7 +1584,25 @@ def _selected_fits(
     terms: str,
     groups: str | Sequence[str] | None,
 ) -> tuple[ModelFunc, list[TrajectoryParams]]:
-    """(model, fits) of a record, reduced by ``terms`` or ``groups``."""
+    """(model, fits) of a record, reduced by ``terms`` or ``groups``.
+
+    Raises:
+        ValueError: A seasonal-only record (:func:`is_seasonal_only`: its
+            seasonal interpolated from other stations, or no secular term
+            at all) asked for anything but ``"periodic"`` — ``"all"`` would otherwise
+            pass for the station's background.
+    """
+    if is_seasonal_only(record):
+        asked = (
+            {terms}
+            if groups is None
+            else ({groups} if isinstance(groups, str) else set(groups))
+        )
+        if asked != {"periodic"}:
+            raise ValueError(
+                f"seasonal-only record ({record.get('detrend_method')}): only "
+                f"'periodic' can be removed, not {sorted(asked)}"
+            )
     model_func, fits = trajectory_from_record(record)
     if groups is not None:
         if terms != "all":
