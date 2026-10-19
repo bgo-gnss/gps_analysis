@@ -169,3 +169,28 @@ def test_flags_are_nested_in_the_tolerance() -> None:
         if prev is not None:
             assert not (prev & ~f).any(), k
         prev = f
+
+
+def test_a_side_reaches_past_missing_days() -> None:
+    """THOB 2026-09-19: three missing days left 7 of 8 epochs before a
+    46 mm blunder — a one-sided verdict, never flagged. A side now takes
+    the nearest running_min_count epochs within running_max_reach_days."""
+    t, y = _series()
+    keep = np.ones(t.size, dtype=bool)
+    keep[[192, 195, 198]] = False  # three missing days in the 10 before
+    t, y = t[keep], y[keep]
+    i = int(np.searchsorted(t, 2020.0 + 200 * DAY))
+    y[i] += 40.0
+    assert np.flatnonzero(detect_outliers_running(t, y).flags).tolist() == [i]
+    no_reach = OutlierParams(running_max_reach_days=10.0)
+    assert not detect_outliers_running(t, y, params=no_reach).flags[i]
+
+
+def test_reach_is_bounded() -> None:
+    """Beyond running_max_reach_days a side gives no verdict (a long gap)."""
+    t = np.r_[2020.0 + np.arange(40) * DAY, 2020.0 + (np.arange(40) + 80) * DAY]
+    x = np.zeros(t.size)
+    before, after = one_sided_line_predictions(
+        t, x, half_window=10 * DAY, min_count=8, max_reach=30 * DAY
+    )
+    assert np.isnan(before[40]) and np.isfinite(after[40])  # 41 d gap behind

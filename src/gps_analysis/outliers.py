@@ -1370,6 +1370,9 @@ class OutlierParams:
         running_min_count: Epochs a side needs for a verdict (§15).
         running_scale_days: Half-window of the noise level — the
             first-difference MAD [d] (§15).
+        running_max_reach_days: How far a side may reach for its
+            ``running_min_count`` epochs when days are missing [d] (§15;
+            ≥ the half-window).
     """
 
     scale_estimator: str = "mad"
@@ -1410,6 +1413,7 @@ class OutlierParams:
     running_n_sigma: float = 4.5
     running_min_count: int = 8
     running_scale_days: float = 60.0
+    running_max_reach_days: float = 30.0
 
     def __post_init__(self) -> None:
         if self.method not in ("model", "running"):
@@ -1440,6 +1444,7 @@ class OutlierParams:
             "running_half_window_days",
             "running_n_sigma",
             "running_scale_days",
+            "running_max_reach_days",
         )
         for name in positive:
             if float(getattr(self, name)) <= 0.0:
@@ -2351,6 +2356,7 @@ def one_sided_line_predictions(
     half_window: float,
     min_count: int,
     robust_iterations: int = 2,
+    max_reach: float | None = None,
 ) -> tuple[FloatArray, FloatArray]:
     """Predict each epoch from a robust local line on each side of it.
 
@@ -2367,11 +2373,17 @@ def one_sided_line_predictions(
         - ``h``   → ``half_window``: one side's length [units of t]
         - ``min_count``: epochs a side needs for a prediction (≥ 3)
         - ``robust_iterations``: bisquare re-weightings (Cleveland 1979)
+        - ``max_reach``: when a side holds fewer than ``min_count`` epochs
+          within h (missing days), it takes the nearest ``min_count``
+          epochs instead, provided they lie within ``max_reach`` [units of
+          t] of t_i; None = h (no reaching). THOB 2026-09-19: three missing
+          days left 7 of 8 epochs before a 46 mm blunder, which then had a
+          one-sided verdict only and was never flagged.
 
     Returns:
         ``(m⁻, m⁺)`` — each shape (N,) float64 [units of x]; NaN where the
-        side holds fewer than ``min_count`` epochs or its design is
-        rank-deficient (no verdict from that side).
+        side holds fewer than ``min_count`` epochs within reach or its
+        design is rank-deficient (no verdict from that side).
 
     Raises:
         ValueError: If ``t`` is unsorted/non-finite, ``x`` non-finite,
@@ -2394,6 +2406,7 @@ def one_sided_line_predictions(
         raise ValueError(f"half_window must be > 0, got {half_window}")
     if min_count < 3:
         raise ValueError(f"min_count must be >= 3, got {min_count}")
+    reach = half_window if max_reach is None else max(float(max_reach), half_window)
     n = int(tt.size)
     before = np.full(n, np.nan, dtype=np.float64)
     after = np.full(n, np.nan, dtype=np.float64)
@@ -2405,13 +2418,15 @@ def one_sided_line_predictions(
             lo += 1
         while hi < n and tt[hi] <= t_i + half_window:
             hi += 1
-        if i - lo >= min_count:
+        start = lo if i - lo >= min_count else i - min_count
+        if start >= 0 and (start == lo or t_i - tt[start] <= reach):
             before[i] = _robust_line_at_zero(
-                tt[lo:i] - t_i, xx[lo:i], robust_iterations
+                tt[start:i] - t_i, xx[start:i], robust_iterations
             )
-        if hi - (i + 1) >= min_count:
+        stop = hi if hi - (i + 1) >= min_count else i + 1 + min_count
+        if stop <= n and (stop == hi or tt[stop - 1] - t_i <= reach):
             after[i] = _robust_line_at_zero(
-                tt[i + 1 : hi] - t_i, xx[i + 1 : hi], robust_iterations
+                tt[i + 1 : stop] - t_i, xx[i + 1 : stop], robust_iterations
             )
     return before, after
 
@@ -2567,6 +2582,7 @@ def detect_outliers_running(
             half_window=half,
             min_count=p.running_min_count,
             robust_iterations=p.window_robust_iterations,
+            max_reach=p.running_max_reach_days / _DAYS_PER_YEAR,
         )
         s = rolling_difference_scale(
             tt, x, half_window=p.running_scale_days / _DAYS_PER_YEAR, max_gap=gap
