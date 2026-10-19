@@ -91,6 +91,7 @@ documented default — the caller (gps_api precompute) owns config.
 import dataclasses
 import math
 from collections.abc import Sequence
+from typing import Any
 
 import numpy as np
 from numpy.typing import ArrayLike, NDArray
@@ -122,11 +123,14 @@ __all__ = [
     "SuspectedEvent",
     "candidate_clusters",
     "detect_outliers",
+    "detect_outliers_running",
     "hampel_mask",
     "mad_scale",
     "neighbor_differences",
+    "one_sided_line_predictions",
     "qn_scale",
     "rolling_median",
+    "rolling_difference_scale",
     "rolling_mad",
     "rolling_polyfit",
     "spike_mask",
@@ -1351,6 +1355,21 @@ class OutlierParams:
             | ``"union"`` (an epoch flagged in any component is flagged
             in all; overrides per-component protection of the other
             components by construction).
+        method: Detector of a CALLER that dispatches (geo_dataread's
+            cleaned view) — ``"running"`` (default since 2026-10-19, BGÓ;
+            §15, prior-free: two one-sided local lines per epoch,
+            :func:`detect_outliers_running`) | ``"model"`` (§3, against one
+            robust trajectory fit). :func:`detect_outliers` itself is always
+            the model method and ignores this field (gps_api and the detrend
+            estimator need its ``fits``).
+        running_half_window_days: Half-window h of each one-sided local
+            line [d] (§15; ±10 d — short enough that the signal stays a
+            line, long enough for a verdict).
+        running_n_sigma: Threshold k of the running method, in units of
+            the local noise level (§15; BGÓ: 4–5 σ).
+        running_min_count: Epochs a side needs for a verdict (§15).
+        running_scale_days: Half-window of the noise level — the
+            first-difference MAD [d] (§15).
     """
 
     scale_estimator: str = "mad"
@@ -1386,8 +1405,17 @@ class OutlierParams:
     loss: str = "huber"
     f_scale: float = 1.0
     epoch_policy: str = "per_component"
+    method: str = "running"
+    running_half_window_days: float = 10.0
+    running_n_sigma: float = 4.5
+    running_min_count: int = 8
+    running_scale_days: float = 60.0
 
     def __post_init__(self) -> None:
+        if self.method not in ("model", "running"):
+            raise ValueError(
+                f"method must be 'model' or 'running', got {self.method!r}"
+            )
         if self.scale_estimator not in ("mad", "qn"):
             raise ValueError(
                 f"scale_estimator must be 'mad' or 'qn', got {self.scale_estimator!r}"
@@ -1409,6 +1437,9 @@ class OutlierParams:
             "despike_n_sigma",
             "despike_return_sigma",
             "despike_gap_days",
+            "running_half_window_days",
+            "running_n_sigma",
+            "running_scale_days",
         )
         for name in positive:
             if float(getattr(self, name)) <= 0.0:
@@ -1430,6 +1461,8 @@ class OutlierParams:
             raise ValueError("max_flag_fraction must be in (0, 1]")
         if self.window_min_count < 1:
             raise ValueError("window_min_count must be >= 1")
+        if self.running_min_count < 3:
+            raise ValueError("running_min_count must be >= 3 (a line and a residual)")
         if self.min_abort_candidates < 0:
             raise ValueError("min_abort_candidates must be >= 0")
         if self.max_iterations < 1:
@@ -2257,5 +2290,398 @@ def detect_outliers(
         converged=converged,
         excess_flag_abort=bool(component_abort.any()),
         params=detection_params,
+        component_abort=component_abort,
+    )
+
+
+# ---------------------------------------------------------------------------
+# §15 — prior-free running-window detection (method="running")
+# ---------------------------------------------------------------------------
+
+
+RUNNING_EXCURSION_SIGMA = 2.25
+"""Excursion level of the §15 run rule [noise units]: an epoch off either
+one-sided line by more than this (on one sign) belongs to an excursion, and a
+candidate inside an excursion longer than ``max_run_days`` is signal. Fixed —
+independent of ``running_n_sigma`` — so the flags are nested in k."""
+
+
+def _robust_line_at_zero(
+    dt: FloatArray, xw: FloatArray, robust_iterations: int
+) -> float:
+    """Robust straight line through one side's epochs, evaluated at dt = 0.
+
+    Start: Siegel's repeated median (50 % breakdown) —
+    ``β̂_1 = med_i med_{j≠i} (x_j − x_i)/(dt_j − dt_i)``,
+    ``β̂_0 = med_i (x_i − β̂_1·dt_i)``; then bisquare re-weighting
+    (Cleveland 1979 §3, ``6·med|e|``) with EQUAL base weights. A one-sided
+    fit EXTRAPOLATES to the epoch: a distance kernel, or a least-squares
+    start, would hand the few blunders next to the epoch the leverage.
+    NaN when fewer than two distinct epochs.
+    """
+    diff_t = dt[np.newaxis, :] - dt[:, np.newaxis]
+    diff_x = xw[np.newaxis, :] - xw[:, np.newaxis]
+    with np.errstate(divide="ignore", invalid="ignore"):
+        slopes = np.where(diff_t != 0.0, diff_x / diff_t, np.nan)
+    per_point = np.nanmedian(slopes, axis=1) if np.isfinite(slopes).any() else None
+    if per_point is None or not np.isfinite(per_point).any():
+        return float("nan")
+    slope = float(np.nanmedian(per_point))
+    beta = np.array([float(np.median(xw - slope * dt)), slope], dtype=np.float64)
+    a = np.column_stack([np.ones_like(dt), dt])
+    for _ in range(robust_iterations):
+        e = xw - a @ beta
+        s6 = 6.0 * float(np.median(np.abs(e)))
+        if s6 <= 0.0:
+            break
+        sw = np.clip(1.0 - (e / s6) ** 2, 0.0, None)  # sqrt of bisquare weight
+        beta_new, _, rank, _ = np.linalg.lstsq(
+            a * sw[:, np.newaxis], xw * sw, rcond=None
+        )
+        if rank < 2:
+            break  # keep the repeated-median line
+        beta = np.asarray(beta_new, dtype=np.float64)
+    return float(beta[0])
+
+
+def one_sided_line_predictions(
+    t: ArrayLike,
+    x: ArrayLike,
+    *,
+    half_window: float,
+    min_count: int,
+    robust_iterations: int = 2,
+) -> tuple[FloatArray, FloatArray]:
+    """Predict each epoch from a robust local line on each side of it.
+
+    Equation (per epoch i, sides ``W⁻_i = {j : t_i − h ≤ t_j, j < i}`` and
+    ``W⁺_i = {j : j > i, t_j ≤ t_i + h}``):
+        ``m⁻_i = f̂⁻_i(t_i)``,  ``m⁺_i = f̂⁺_i(t_i)``
+    with ``f̂^±_i(t) = β̂_0 + β̂_1·(t − t_i)`` the robust (repeated median
+    start × bisquare, :func:`_robust_line_at_zero`) line fitted to the side's epochs only — the epoch under test
+    never enters either fit, and a step at t_i lies wholly on one side.
+
+    Symbols → args:
+        - ``t_j`` → ``t``: epochs, shape (N,), sorted ascending [yr]
+        - ``x_j`` → ``x``: samples, shape (N,) [units of x]
+        - ``h``   → ``half_window``: one side's length [units of t]
+        - ``min_count``: epochs a side needs for a prediction (≥ 3)
+        - ``robust_iterations``: bisquare re-weightings (Cleveland 1979)
+
+    Returns:
+        ``(m⁻, m⁺)`` — each shape (N,) float64 [units of x]; NaN where the
+        side holds fewer than ``min_count`` epochs or its design is
+        rank-deficient (no verdict from that side).
+
+    Raises:
+        ValueError: If ``t`` is unsorted/non-finite, ``x`` non-finite,
+            shapes mismatch, ``half_window ≤ 0`` or ``min_count < 3``.
+
+    Reference:
+        Design spec §15; Siegel 1982, Biometrika 69(1), 242–244 (repeated
+        median); Cleveland 1979, JASA 74(368), 829–836 (bisquare step).
+
+    Numerical notes:
+        Two-pointer sweep, one robust 2-column LSQ per side per epoch —
+        O(N·w̄·(robust_iterations+1)). Centered times keep the design
+        well conditioned at any absolute ``yearf``.
+    """
+    tt = _validate_sorted_time(t)
+    xx = _validate_series("x", x)
+    if xx.shape != tt.shape:
+        raise ValueError(f"x shape {xx.shape} does not match t shape {tt.shape}")
+    if half_window <= 0.0:
+        raise ValueError(f"half_window must be > 0, got {half_window}")
+    if min_count < 3:
+        raise ValueError(f"min_count must be >= 3, got {min_count}")
+    n = int(tt.size)
+    before = np.full(n, np.nan, dtype=np.float64)
+    after = np.full(n, np.nan, dtype=np.float64)
+    lo = 0
+    hi = 0
+    for i in range(n):
+        t_i = tt[i]
+        while tt[lo] < t_i - half_window:
+            lo += 1
+        while hi < n and tt[hi] <= t_i + half_window:
+            hi += 1
+        if i - lo >= min_count:
+            before[i] = _robust_line_at_zero(
+                tt[lo:i] - t_i, xx[lo:i], robust_iterations
+            )
+        if hi - (i + 1) >= min_count:
+            after[i] = _robust_line_at_zero(
+                tt[i + 1 : hi] - t_i, xx[i + 1 : hi], robust_iterations
+            )
+    return before, after
+
+
+def rolling_difference_scale(
+    t: ArrayLike,
+    x: ArrayLike,
+    *,
+    half_window: float,
+    max_gap: float,
+    min_count: int = 10,
+) -> FloatArray:
+    """The local white-noise level from gap-aware first differences.
+
+    Equation (δ_j = x_j − x_{j−1} where ``t_j − t_{j−1} ≤ g``):
+        ``s_i = 1.4826 · med_j |δ_j − med δ| / √2``,
+        ``j : |t_j − t_i| ≤ h``
+
+    — the normalized MAD of the differences, ÷√2 because a difference of
+    two independent epochs has twice the variance. Unlike the residual MAD
+    of a fitted window, nearby blunders do not inflate it (each is two
+    differences among many), and a step or a slow transient is one
+    difference or a small bias: it is blind to the signal.
+
+    Symbols → args:
+        - ``t``, ``x``: epochs [yr] (sorted) and samples, shape (N,)
+        - ``h`` → ``half_window`` [units of t]
+        - ``g`` → ``max_gap``: neighbor spacing beyond which no
+          difference is formed [units of t]
+        - ``min_count``: differences a window needs
+
+    Returns:
+        ``s``, shape (N,) float64 [units of x]; NaN where the window holds
+        fewer than ``min_count`` differences (caller's fallback).
+
+    Raises:
+        ValueError: Via :func:`neighbor_differences`, or ``half_window ≤ 0``.
+
+    Reference:
+        Design spec §15; the difference scale of the §3.0 despike stage.
+    """
+    if half_window <= 0.0:
+        raise ValueError(f"half_window must be > 0, got {half_window}")
+    tt = _validate_sorted_time(t)
+    d_minus, _ = neighbor_differences(tt, x, max_gap=max_gap)
+    ok = np.isfinite(d_minus)
+    td = tt[ok]
+    dd = d_minus[ok]
+    lo = np.searchsorted(td, tt - half_window, side="left")
+    hi = np.searchsorted(td, tt + half_window, side="right")
+    out = np.full(tt.size, np.nan, dtype=np.float64)
+    for i in range(tt.size):
+        if hi[i] - lo[i] >= min_count:
+            out[i] = mad_scale(dd[lo[i] : hi[i]]) / math.sqrt(2.0)
+    return out
+
+
+def detect_outliers_running(
+    t: ArrayLike,
+    y: ArrayLike,
+    sigma: ArrayLike | None = None,
+    *,
+    protect_windows: Sequence[tuple[float, float]] = (),
+    min_outlier: ArrayLike | None = None,
+    params: OutlierParams | None = None,
+    names: Sequence[str] | None = None,
+) -> OutlierDetection:
+    """Prior-free outlier detection from a running window (§15).
+
+    No trajectory model, no declared steps, no events, no formal σ: per
+    component, each epoch is judged against robust local lines fitted on
+    each side of it (:func:`one_sided_line_predictions`, half-window
+    ``params.running_half_window_days``), in units of the local noise
+    level (:func:`rolling_difference_scale`, ``±running_scale_days``).
+
+    Decision, with ``d^±_i = y_i − m^±_i`` and ``τ_i = k·max(s_i, s_floor)``
+    (k = ``running_n_sigma``):
+        candidate ⇔ ``|d⁻_i| > τ_i ∧ |d⁺_i| > τ_i ∧ d⁻_i·d⁺_i > 0``
+    — it overshoots BOTH sides; an epoch between the two predictions is a
+    transition (step or dike ramp in progress), never a candidate. With
+    only one side available (series start, after a gap, the newest days)
+    there is no flag: the epoch is a candidate protected ``PROTECT_STEP``
+    and surfaced as an indeterminate :class:`SuspectedEvent` (the
+    provisional mask downstream). Protection otherwise as §3.4:
+    magnitude floor, caller protect windows, the run rule (a candidate
+    inside a same-sign excursion — either side off by > min(k, 2.25) noise
+    units —
+    longer than ``max_run_days`` is signal), and the
+    per-component abort on the two-sided candidate fraction (§3.5a).
+
+    Args:
+        t: Epochs, shape (N,), sorted ascending [yr].
+        y: Observations, shape (C, N) or (N,) [L].
+        sigma: Accepted for call parity with :func:`detect_outliers`;
+            unused — the noise level is estimated from the data (§13: the
+            formal σ is not a trustworthy quality ratio).
+        protect_windows: Intervals [yr] where nothing is flagged.
+        min_outlier: Magnitude floor(s) [L], scalar or shape (C,).
+        params: Thresholds; None = spec defaults.
+        names: Accepted for call parity; unused.
+
+    Returns:
+        :class:`OutlierDetection` shaped like ``y``: ``z`` is the smaller
+        two-sided deviation in noise units (NaN without a verdict),
+        ``scale_local`` the noise level s_i, ``scale_global`` its median,
+        ``fits`` empty and ``step_amplitudes`` None (no model).
+
+    Raises:
+        ValueError: Unsorted/non-finite ``t`` or non-finite ``y``, shape
+            mismatches, or a bad ``min_outlier``.
+
+    Reference:
+        Design spec §15 (BGÓ 2026-10-19: estimate dynamically, without
+        prior knowledge); Hampel 1974 / Pearson et al. 2016 (windowed
+        identifier); Cleveland 1979 (robust local fit).
+    """
+    del sigma, names  # call parity only — see Args
+    p = OutlierParams() if params is None else params
+    tt = _validate_sorted_time(t)
+    y2d, was_1d = _components_2d(y, "y")
+    if y2d.shape[1] != tt.size:
+        raise ValueError(f"y has {y2d.shape[1]} epochs, t has {tt.size}")
+    if not np.all(np.isfinite(y2d)):
+        raise ValueError("y must be finite (drop missing epochs first)")
+    n_comp, n = y2d.shape
+    floors = _resolve_floors(min_outlier, p, n_comp)
+    half = p.running_half_window_days / _DAYS_PER_YEAR
+    gap = p.despike_gap_days / _DAYS_PER_YEAR
+    cluster_gap = p.cluster_gap_days / _DAYS_PER_YEAR
+    max_run = p.max_run_days / _DAYS_PER_YEAR
+
+    in_window = np.zeros(n, dtype=np.bool_)
+    for a, b in protect_windows:
+        in_window |= (tt >= a) & (tt <= b)
+
+    flags = np.zeros((n_comp, n), dtype=np.bool_)
+    candidates = np.zeros((n_comp, n), dtype=np.bool_)
+    reasons = np.zeros((n_comp, n), dtype=np.uint8)
+    protected = np.zeros((n_comp, n), dtype=np.uint8)
+    z = np.full((n_comp, n), np.nan, dtype=np.float64)
+    scale_local = np.full((n_comp, n), np.nan, dtype=np.float64)
+    scale_global = np.full(n_comp, np.nan, dtype=np.float64)
+    component_abort = np.zeros(n_comp, dtype=np.bool_)
+    events: list[SuspectedEvent] = []
+
+    for c in range(n_comp):
+        x = y2d[c]
+        if n < 2 * p.running_min_count + 1:
+            continue  # too short for any two-sided verdict
+        before, after = one_sided_line_predictions(
+            tt,
+            x,
+            half_window=half,
+            min_count=p.running_min_count,
+            robust_iterations=p.window_robust_iterations,
+        )
+        s = rolling_difference_scale(
+            tt, x, half_window=p.running_scale_days / _DAYS_PER_YEAR, max_gap=gap
+        )
+        d_minus, _ = neighbor_differences(tt, x, max_gap=gap)
+        finite_d = d_minus[np.isfinite(d_minus)]
+        s_all = mad_scale(finite_d) / math.sqrt(2.0) if finite_d.size >= 2 else np.nan
+        s = np.where(np.isfinite(s), s, s_all)
+        scale_local[c] = s
+        scale_global[c] = float(np.nanmedian(s)) if np.any(np.isfinite(s)) else np.nan
+        tau = p.running_n_sigma * np.maximum(s, p.scale_floor)
+
+        d_b = x - before
+        d_a = x - after
+        has_b = np.isfinite(d_b)
+        has_a = np.isfinite(d_a)
+        with np.errstate(invalid="ignore"):
+            out_b = np.abs(d_b) > tau
+            out_a = np.abs(d_a) > tau
+            two = has_b & has_a & out_b & out_a & (d_b * d_a > 0.0)
+            one = (has_b & ~has_a & out_b) | (has_a & ~has_b & out_a)
+            smaller = np.where(np.abs(d_b) < np.abs(d_a), d_b, d_a)
+            z[c] = np.where(
+                has_b & has_a, smaller, np.where(has_b, d_b, d_a)
+            ) / np.where(s > 0.0, s, np.nan)
+        cand = two | one
+        candidates[c] = cand
+        reasons[c][cand] = REASON_LOCAL
+
+        prot = np.zeros(n, dtype=np.uint8)
+        prot[one] |= PROTECT_STEP
+        dev = np.where(has_b & has_a, np.minimum(np.abs(d_b), np.abs(d_a)), 0.0)
+        prot[two & (dev <= floors[c])] |= PROTECT_FLOOR
+        prot[cand & in_window] |= PROTECT_WINDOW
+        # Run rule on EXCURSIONS, not candidates: inside a several-day
+        # excursion the sides' robust lines partly follow it, so only some of
+        # its epochs reach k — a lone flag in a shifted plateau.  An excursion
+        # epoch is off either side by > k_e, on one sign; a candidate inside a
+        # same-sign excursion longer than max_run_days is signal.
+        # excursion level k_e = min(k, 2.25), FIXED rather than k/2: tied to
+        # k, a lower --outlier-sigma grew the runs and protected epochs that a
+        # higher k had flagged (not nested), and at k = 2 chained every epoch
+        # into one run. Fixed, flags(k) only grow as k drops.
+        k_e = min(p.running_n_sigma, RUNNING_EXCURSION_SIGMA)
+        tau_e = k_e * np.maximum(s, p.scale_floor)
+        with np.errstate(invalid="ignore"):
+            half_b = np.abs(d_b) > tau_e
+            half_a = np.abs(d_a) > tau_e
+        for sign in (1.0, -1.0):
+            side_b = has_b & half_b & (np.sign(d_b) == sign)
+            side_a = has_a & half_a & (np.sign(d_a) == sign)
+            excursion = side_b | side_a | (two & (np.sign(d_b) == sign))
+            for i0, i1 in candidate_clusters(tt, excursion, max_gap=cluster_gap):
+                inside = two[i0 : i1 + 1]
+                if tt[i1] - tt[i0] <= max_run or not inside.any():
+                    continue
+                prot[i0 : i1 + 1][inside] |= PROTECT_RUN
+                events.append(
+                    SuspectedEvent(
+                        component=c,
+                        i_start=i0,
+                        i_end=i1,
+                        t_start=float(tt[i0]),
+                        t_end=float(tt[i1]),
+                        sign=int(sign),
+                        step_evidence=float("nan"),
+                        kind="transient_run",
+                    )
+                )
+        for i0, i1 in candidate_clusters(tt, one, max_gap=cluster_gap):
+            events.append(
+                SuspectedEvent(
+                    component=c,
+                    i_start=i0,
+                    i_end=i1,
+                    t_start=float(tt[i0]),
+                    t_end=float(tt[i1]),
+                    sign=1 if float(np.nanmedian(z[c][i0 : i1 + 1])) >= 0 else -1,
+                    step_evidence=float("nan"),  # one side only: indeterminate
+                    kind="step",
+                )
+            )
+        protected[c] = prot
+        flags[c] = cand & (prot == 0)
+
+        n_two = int(np.count_nonzero(two))
+        if n_two / n > p.max_flag_fraction and n_two >= p.min_abort_candidates:
+            component_abort[c] = True
+            flags[c] = False
+
+    if p.epoch_policy == "union":
+        any_flag = flags.any(axis=0)
+        flags[:, any_flag] = True
+        flags[component_abort] = False
+
+    events.sort(key=lambda e: (e.t_start, e.component))
+
+    def shaped(a: NDArray[Any]) -> NDArray[Any]:
+        return a[0] if was_1d else a
+
+    return OutlierDetection(
+        flags=shaped(flags),
+        candidates=shaped(candidates),
+        reasons=shaped(reasons),
+        protected=shaped(protected),
+        z=shaped(z),
+        scale_global=scale_global,
+        scale_local=shaped(scale_local),
+        fits=[],
+        step_amplitudes=None,
+        suspected_events=events,
+        n_despiked=np.zeros(n_comp, dtype=np.int64),
+        n_iterations=1,
+        converged=not bool(component_abort.all()),
+        excess_flag_abort=bool(component_abort.any()),
+        params=p,
         component_abort=component_abort,
     )
