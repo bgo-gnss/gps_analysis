@@ -1413,7 +1413,7 @@ class OutlierParams:
     running_n_sigma: float = 4.5
     running_min_count: int = 8
     running_scale_days: float = 60.0
-    running_max_reach_days: float = 30.0
+    running_max_reach_days: float = 20.0
 
     def __post_init__(self) -> None:
         if self.method not in ("model", "running"):

@@ -1027,14 +1027,14 @@ pure Python loop) — acceptable at plot time; vectorize before fleet precompute
 At k = 2 every station tested aborts (> 5 % two-sided candidates): that is
 the noise, and the abort is the right answer there.
 
-**Reach across missing days (2026-10-19, `running_max_reach_days` = 30).**
+**Reach across missing days (2026-10-19, `running_max_reach_days` = 20; 30 at first, BGÓ: too long).**
 THOB 2026-09-19 (E +46.5 mm, ~29 noise units) was never flagged: three
 missing days left 7 of the 8 epochs a side needs, so the before-side gave no
 verdict and a one-sided verdict never flags. A side short of
 ``running_min_count`` epochs within h now takes the nearest
 ``running_min_count`` epochs if they lie within the reach. Reykjanes at
-4.5 σ: 591 → 711 flagged epochs (gap-adjacent blunders that had escaped),
-still 0 aborts, 10 within 3 d of an event against 27 by chance.
+4.5 σ: 591 → 711 flagged epochs at 30 d, 685 at 20 d (gap-adjacent blunders that had escaped),
+still 0 aborts; at 20 d 9 within 3 d of an event against 26 by chance.
 
 **Scope.** ``method="running"`` is the DEFAULT of ``OutlierParams`` since
 2026-10-19 (BGÓ, after the Reykjanes comparison): every cleaned view —
