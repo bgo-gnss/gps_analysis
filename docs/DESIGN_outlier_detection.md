@@ -945,6 +945,98 @@ that is robust to undeclared steps *without prior knowledge* — which is the
 property BGÓ asked for, and the reason declared steps, while still valuable,
 are not a precondition for useful detection.
 
+## 15. Addendum — prior-free running-window detection (`method="running"`, 2026-10-19)
+
+**Why.** Every model-based stage (S1–S5) judges epochs against ONE trajectory
+fitted to the whole plotted span. On a deforming station that model cannot
+follow the signal and the excess-candidate rule aborts — §14 shows the verdict
+then depends on where the plot starts. Measured 2026-10-19 on the 43 Reykjanes
+stations (plate-removed itrf2014 24 h, full series): **18 abort** at least one
+component (NYLA N/E at 19–22 % candidates; SENG, SKSH all three). Declared
+steps / events help only where someone has declared them. BGÓ: detection must
+work *without prior knowledge*, from a running window.
+
+**Method** (per component; no global fit, no steps, no events, no formal σ):
+
+1. *Two one-sided local lines.* For epoch i, robust (LOWESS: tricube ×
+   bisquare, the :func:`rolling_polyfit` core) straight lines are fitted to the
+   epochs in ``[t_i − h, t_i)`` and in ``(t_i, t_i + h]`` and each is
+   evaluated at ``t_i``: predictions ``m⁻_i``, ``m⁺_i``. A side needs
+   ``running_min_count`` epochs, else it has no verdict.
+2. *Noise level.* ``s_i = 1.4826·MAD(δ)/√2`` of the gap-aware first
+   differences δ (:func:`neighbor_differences`) within ``±running_scale_days``
+   — steady (bad neighbours do not inflate it the way a window's own residual
+   MAD is inflated) and blind to steps (a step is one difference).
+3. *Candidate* iff ``|y_i − m⁻_i| > k·s_i`` **and** ``|y_i − m⁺_i| > k·s_i``
+   **and** ``y_i`` is not between ``m⁻_i`` and ``m⁺_i``. After a step the epoch
+   agrees with the side it belongs to; on a dike ramp it lies between the
+   sides (a transition); a blunder overshoots both.
+4. *Both sides required.* With one side only (series start, after a gap, the
+   newest days) there is no flag: such an epoch next to a step always looks
+   wrong. One-sided candidates are protected (``PROTECT_STEP``) and surfaced
+   as indeterminate ``SuspectedEvent`` — near the series end that is exactly
+   the existing *provisional* mask.
+5. *Protection kept:* magnitude floor (``min_outlier``), caller protect
+   windows, run rule (a candidate cluster longer than ``max_run_days`` is
+   signal, ``PROTECT_RUN``), and the per-component abort (§3.5a,
+   ``max_flag_fraction``) — prior-free, the fraction measures noise again,
+   not window composition.
+
+**Window length** (BGÓ: short enough that the signal does not move out of the
+line, long enough for statistics). Half-window ±5–7 d leaves < 8 points a side
+(no verdict at all); ±30 d bends over the deformation (GRVM flags on dike days
+1 → 3); **±10 d** is the default.
+
+**Threshold.** k is ``running_n_sigma`` — BGÓ: 4–5 σ is the balance, extreme
+episodes should be filtered little (``--show-outliers`` still shows them).
+Default **4.5**; CLI ``--outlier-sigma``.
+
+**Measured (Reykjanes, 43 stations, full series, ±10 d).** Prototype first
+(tricube one-sided fits) — dropping one-sided verdicts moved the flags within
+3 d of a dike/eruption from 53 to 7 over 10 stations (chance 18 → 7.3). The
+implementation then replaced two prototype choices, each from a measured
+failure: the one-sided fit is **equal-weight, repeated-median start
+(Siegel 1982) + bisquare** — tricube weights or a least-squares start let the
+2–3 blunders next to the epoch drag the extrapolated line (a 4-day +15 mm
+burst predicted ABOVE itself); and the run rule clusters **same-sign
+excursions** (either side off by > ``RUNNING_EXCURSION_SIGMA`` = 2.25 noise
+units, capped at k), not candidates — inside a 5–6 day burst the sides partly
+follow it and a lone mid-burst flag survived. The excursion level is FIXED,
+not k/2: tied to k, lowering ``--outlier-sigma`` grew the runs and un-flagged
+epochs a higher k had flagged (and at k = 2 protected everything). Fixed, the
+flags are nested in k (verified NYLA/GRVM/HOFN, k = 6 → 2.5; test-pinned).
+Synthetic behaviour now: 1–3 bad days flagged, ≥ 4 days protected as signal; a
+blunder ≤ 4 d after an undeclared step is left alone, ≥ 7 d after it is caught.
+Leaf numbers:
+
+| | model (today) | 4 σ | **4.5 σ** | 5 σ |
+|---|---|---|---|---|
+| stations aborting | 18 / 43 | 0 | 0 | 0 |
+| max two-sided candidate % | > 5 | 2.27 | 1.80 | 1.70 |
+| flagged epochs | 707 (none on the 18) | 858 | 591 | 422 |
+| … within 3 d of a dike/eruption (chance) | – | 13 (31) | 8 (22) | 5 (16) |
+
+Below chance near events: the method is conservative exactly where the signal
+is extreme (BGÓ: there it should filter little; ``--show-outliers`` still
+draws the set-aside points). What remains on event days is mostly signal
+shared across stations (e.g. the Up V-minimum one day after the April 2025
+eruption at SENG, GRIV, HS02) — the §9-Q7 network check is the lever for that.
+SELF from 2005/2007/2009 (undeclared 2008 coseismic step): flag counts differ
+by ≤ 1 per component (prototype). Runtime ≈ 2.5 s per station (6–7k epochs,
+pure Python loop) — acceptable at plot time; vectorize before fleet precompute.
+At k = 2 every station tested aborts (> 5 % two-sided candidates): that is
+the noise, and the abort is the right answer there.
+
+**Scope.** ``method="running"`` is the DEFAULT of ``OutlierParams`` since
+2026-10-19 (BGÓ, after the Reykjanes comparison): every cleaned view —
+plots, ``read_gps_view(view="cleaned")`` and what reads it (velocity product,
+maps), the cleaned writer — uses it. ``method="model"`` remains selectable
+(``--outlier-method model``, per station in ``outlier_overrides.csv``).
+:func:`detect_outliers` is unchanged and still the model method: the detrend
+estimator and the gps_api precompute call it directly and use its ``fits``.
+Plot file names carry no method/σ suffix for the default (operational graphs
+keep their names while σ is tuned); ``-model`` marks the non-default.
+
 ---
 
 _Spec created 2026-07-13 (analysis lane). §10 addendum implemented 2026-07-14
