@@ -101,13 +101,19 @@ from .fitting import (
     with_steps,
 )
 from .models import FloatArray, TrajectoryParams
-from .outliers import OutlierDetection, OutlierParams, detect_outliers
+from .outliers import (
+    OutlierDetection,
+    OutlierParams,
+    detect_outliers,
+    detect_outliers_running,
+)
 
 __all__ = [
     "DATUM_PARAM_NAMES",
     "DETREND_METHOD_BORROWED",
     "DETREND_METHOD_PLAIN",
     "DETREND_METHOD_ROBUST",
+    "DETREND_METHOD_RUNNING",
     "RECORD_VERSION",
     "SUPPORTED_RECORD_VERSIONS",
     "DetrendEstimate",
@@ -160,6 +166,11 @@ records keep reading BY CONSTRUCTION rather than by argument."""
 DETREND_METHOD_ROBUST = "step_augmented_robust"
 """``detrend_method`` provenance tag (design §0.2): outlier-robust
 step-augmented fit — the outlier stage ran and defined the inlier set."""
+
+DETREND_METHOD_RUNNING = "running_window_robust"
+"""``detrend_method`` provenance tag: the outlier stage was the prior-free
+running window (:func:`gps_analysis.detect_outliers_running`, outliers
+design §15) — the default since 2026-10-19 (``OutlierParams.method``)."""
 
 DETREND_METHOD_PLAIN = "plain_wls"
 """``detrend_method`` provenance tag (design §0.2): plain WLS on all
@@ -1042,18 +1053,35 @@ def estimate_detrend(
             else np.vstack([s for s in sigma_win if s is not None])
         )
         p0_2d = None if p0 is None else np.vstack([g for g in p0_rows if g is not None])
-        detection = detect_outliers(
-            model_func,
-            t_win,
-            y_win,
-            sigma_2d,
-            step_epochs=steps_in if n_steps else None,
-            protect_windows=protect_windows,
-            min_outlier=min_outlier,
-            p0=p0_2d,
-            params=outlier_params,
-            names=names,
-        )
+        running = (
+            OutlierParams() if outlier_params is None else outlier_params
+        ).method == "running"
+        if running:
+            # prior-free running window (outliers §15, the OutlierParams
+            # default): no trajectory fit to judge against, so a deforming
+            # window no longer aborts; the steps stay in the FIT below
+            detection = detect_outliers_running(
+                t_win,
+                y_win,
+                sigma_2d,
+                protect_windows=protect_windows,
+                min_outlier=min_outlier,
+                params=outlier_params,
+                names=names,
+            )
+        else:
+            detection = detect_outliers(
+                model_func,
+                t_win,
+                y_win,
+                sigma_2d,
+                step_epochs=steps_in if n_steps else None,
+                protect_windows=protect_windows,
+                min_outlier=min_outlier,
+                p0=p0_2d,
+                params=outlier_params,
+                names=names,
+            )
         if detection.excess_flag_abort:
             outlier_abort = True
             inliers = np.ones(y_win.shape, dtype=np.bool_)
@@ -1067,7 +1095,7 @@ def estimate_detrend(
             )
         else:
             inliers = ~np.atleast_2d(detection.flags)
-            method = DETREND_METHOD_ROBUST
+            method = DETREND_METHOD_RUNNING if running else DETREND_METHOD_ROBUST
     else:
         inliers = np.ones(y_win.shape, dtype=np.bool_)
         method = DETREND_METHOD_PLAIN

@@ -34,6 +34,7 @@ from numpy.typing import NDArray
 from gps_analysis.detrend import (
     DETREND_METHOD_PLAIN,
     DETREND_METHOD_ROBUST,
+    DETREND_METHOD_RUNNING,
     RECORD_VERSION,
     RECORD_VERSION_TERMS,
     DetrendEstimate,
@@ -104,15 +105,23 @@ def _inject_spikes(
 # ---------------------------------------------------------------- recovery
 
 
-def test_recovery_white_noise_with_outliers() -> None:
-    """§7.1-1: recover truth within 4σ̂; outliers removed before the fit."""
+@pytest.mark.parametrize(
+    ("method", "tag"),
+    [("running", DETREND_METHOD_RUNNING), ("model", DETREND_METHOD_ROBUST)],
+)
+def test_recovery_white_noise_with_outliers(method: str, tag: str) -> None:
+    """§7.1-1: recover truth within 4σ̂; outliers removed before the fit —
+    with the running window (the default since 2026-10-19) and the model
+    detector alike."""
     n = 1096  # 3 yr daily
     t, y_clean, sigma = _white_series(n, seed=11)
     y, idx = _inject_spikes(y_clean, amp=10.0 * WN)
 
-    est = estimate_detrend(lineperiodic, t, y, sigma)
+    est = estimate_detrend(
+        lineperiodic, t, y, sigma, outlier_params=OutlierParams(method=method)
+    )
 
-    assert est.detrend_method == DETREND_METHOD_ROBUST
+    assert est.detrend_method == tag
     assert not est.outlier_abort
     assert est.n_epochs == n
     assert est.model == "lineperiodic"
@@ -444,7 +453,7 @@ def test_record_roundtrip_bit_exact_including_intercept() -> None:
     record = est.to_record(fitted_at="2026-07-14T12:00:00Z", refs={"source": "test"})
 
     assert record["record_version"] == RECORD_VERSION
-    assert record["detrend_method"] == DETREND_METHOD_ROBUST
+    assert record["detrend_method"] == DETREND_METHOD_RUNNING  # the default
     assert record["param_names"] == [
         "offset",
         "rate",
