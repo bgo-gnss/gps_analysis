@@ -1164,3 +1164,92 @@ def test_the_background_of_a_line_model_is_its_line() -> None:
     assert record_group_mask(rec, ("secular", "periodic")).all()
     with pytest.raises(ValueError, match="no periodic parameters"):
         record_group_mask(rec, "periodic")
+
+
+# --- per-component steps (step_mask) -------------------------------------
+
+
+def _horizontal_step_with_slow_up(
+    seed: int = 31,
+) -> tuple[NDArray[np.float64], NDArray[np.float64], NDArray[np.float64], float]:
+    """A coseismic N/E offset; Up carries no step but a slow bump after it.
+
+    The Tjörnes 2020 shape: a free Up amplitude at the epoch absorbs the
+    bump and reports a fake Up step.
+    """
+    n = 1461
+    rng = np.random.default_rng(seed)
+    t = _daily_t(n)
+    step = float(t[n // 3])
+    y = _truth(t) + rng.normal(0.0, WN, size=(3, n))
+    y[0] += heaviside_steps(t, [step], [9.0])
+    y[1] += heaviside_steps(t, [step], [-7.0])
+    y[2] += 12.0 * np.exp(-(((t - (step + 1.0)) / 0.5) ** 2))
+    return t, y, np.full((3, n), WN), step
+
+
+def test_step_mask_pins_excluded_amplitude_at_zero() -> None:
+    t, y, sigma, step = _horizontal_step_with_slow_up()
+    mask = [[True, True, False]]
+    est = estimate_detrend(
+        lineperiodic, t, y, sigma, step_epochs=[step], step_mask=mask, detect=False
+    )
+    assert est.fits[0].params[6] == pytest.approx(9.0, abs=0.5)
+    assert est.fits[1].params[6] == pytest.approx(-7.0, abs=0.5)
+    assert est.fits[2].params[6] == 0.0
+    cov = est.fits[2].covariance
+    assert np.all(cov[6, :] == 0.0) and np.all(cov[:, 6] == 0.0)
+    # the record keeps its shape and evaluates with the pinned amplitude
+    record = est.to_record()
+    assert record["step_epochs"] == [step]
+    assert len(record["components"][2]["params"]) == 7
+
+
+def test_free_up_amplitude_absorbs_the_slow_signal() -> None:
+    """Why the mask exists: unmasked, Up reports a step that is not there."""
+    t, y, sigma, step = _horizontal_step_with_slow_up()
+    est = estimate_detrend(
+        lineperiodic, t, y, sigma, step_epochs=[step], detect=False
+    )
+    assert abs(est.fits[2].params[6]) > 2.0
+
+
+def test_all_true_mask_matches_no_mask() -> None:
+    t, y, sigma, step = _horizontal_step_with_slow_up()
+    a = estimate_detrend(
+        lineperiodic, t, y, sigma, step_epochs=[step], detect=False
+    )
+    b = estimate_detrend(
+        lineperiodic, t, y, sigma, step_epochs=[step],
+        step_mask=np.ones((1, 3), dtype=bool), detect=False,
+    )  # fmt: skip
+    for fa, fb in zip(a.fits, b.fits, strict=True):
+        np.testing.assert_array_equal(fa.params, fb.params)
+
+
+def test_step_mask_follows_its_epochs_through_sorting_and_the_window() -> None:
+    """Rows are matched to epochs, not positions: unsorted input and a step
+    outside the window must not shift the mask onto another step."""
+    t, y, sigma, step = _horizontal_step_with_slow_up()
+    late = float(t[2 * t.size // 3])
+    y[2] -= 12.0 * np.exp(-(((t - (step + 1.0)) / 0.5) ** 2))  # no bump here
+    y[2] += heaviside_steps(t, [late], [15.0])
+    est = estimate_detrend(
+        lineperiodic, t, y, sigma,
+        step_epochs=[late, 1990.0, step],
+        step_mask=[[False, False, True], [True, True, True], [True, True, False]],
+        detect=False,
+    )  # fmt: skip
+    np.testing.assert_array_equal(est.step_epochs, [step, late])
+    assert est.fits[2].params[6] == 0.0
+    assert est.fits[2].params[7] == pytest.approx(15.0, abs=0.7)
+    assert est.fits[0].params[7] == 0.0 and est.fits[1].params[7] == 0.0
+
+
+def test_step_mask_shape_is_checked() -> None:
+    t, y, sigma, step = _horizontal_step_with_slow_up()
+    with pytest.raises(ValueError, match="columns"):
+        estimate_detrend(
+            lineperiodic, t, y, sigma, step_epochs=[step],
+            step_mask=[[True, False]], detect=False,
+        )  # fmt: skip
