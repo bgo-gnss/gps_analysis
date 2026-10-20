@@ -1041,8 +1041,12 @@ still 0 aborts; at 20 d 9 within 3 d of an event against 26 by chance.
 plots, ``read_gps_view(view="cleaned")`` and what reads it (velocity product,
 maps), the cleaned writer — uses it. ``method="model"`` remains selectable
 (``--outlier-method model``, per station in ``outlier_overrides.csv``).
-:func:`detect_outliers` is unchanged and still the model method: the detrend
-estimator and the gps_api precompute call it directly and use its ``fits``.
+:func:`detect_outliers` is unchanged and still the model method (gps_api's
+precompute calls it directly and uses its ``fits``). The detrend estimator
+(:func:`estimate_detrend`) follows ``OutlierParams.method`` since 2026-10-19
+(BGÓ): running by default (tag ``running_window_robust``), so a deforming
+window no longer aborts — GFUM 2011.4–2014.6 and 2015.5– now estimate; the
+steps stay in the FIT. ``method="model"`` keeps ``step_augmented_robust``.
 Plot file names carry no method/σ suffix for the default (operational graphs
 keep their names while σ is tuned); ``-model`` marks the non-default.
 
