@@ -753,6 +753,54 @@ def select_record_groups(
     return _keep_params(list(fits), record_group_mask(record, groups))
 
 
+def _fit_masked_steps(
+    model_func: ModelFunc,
+    fit_model: ModelFunc,
+    steps: FloatArray,
+    applies: NDArray[np.bool_],
+    t: FloatArray,
+    y: FloatArray,
+    *,
+    sigma: FloatArray | None,
+    p0: FloatArray | None,
+    absolute_sigma: bool,
+    name: str | None,
+) -> TrajectoryParams:
+    """One component's WLS with the steps it does not take pinned at 0.
+
+    ``fit_model`` is ``model_func`` augmented with ALL ``steps``; when every
+    step applies this is exactly ``fit_components(fit_model, ...)``. Otherwise
+    the component is fitted with only its own steps' columns and the full
+    parameter vector is rebuilt: excluded amplitudes 0, their covariance rows
+    and columns 0 (known, not estimated), so ``fit_model`` evaluates the
+    result unchanged.
+    """
+    names = None if name is None else [name]
+    if bool(np.all(applies)):
+        return fit_components(
+            fit_model, t, y, sigma=sigma, p0=p0,
+            absolute_sigma=absolute_sigma, names=names,
+        )[0]  # fmt: skip
+    own = steps[applies]
+    sub_model = with_steps(model_func, own) if own.size else model_func
+    n_base = (0 if p0 is None else p0.size - steps.size) or None
+    sub_p0 = None
+    if p0 is not None and n_base is not None:
+        sub_p0 = np.concatenate([p0[:n_base], p0[n_base:][applies]])
+    sub = fit_components(
+        sub_model, t, y, sigma=sigma, p0=sub_p0,
+        absolute_sigma=absolute_sigma, names=names,
+    )[0]  # fmt: skip
+    n_b = sub.params.size - own.size
+    idx = np.concatenate([np.arange(n_b), n_b + np.flatnonzero(applies)])
+    full_n = n_b + steps.size
+    params = np.zeros(full_n, dtype=np.float64)
+    params[idx] = sub.params
+    cov = np.zeros((full_n, full_n), dtype=np.float64)
+    cov[np.ix_(idx, idx)] = sub.covariance
+    return TrajectoryParams(params, cov, sub.component)
+
+
 def estimate_detrend(
     model: str | ModelFunc,
     t: ArrayLike,
@@ -762,6 +810,7 @@ def estimate_detrend(
     window: tuple[float | None, float | None] = (None, None),
     segments: Sequence[tuple[float | None, float | None]] | None = None,
     step_epochs: ArrayLike | None = None,
+    step_mask: ArrayLike | None = None,
     min_span_years: float = 2.0,
     min_epochs: int = 365,
     max_gap_years: float = 0.5,
@@ -847,6 +896,16 @@ def estimate_detrend(
             the same type and the opposite polarity: ``segments`` says
             *fit only here*, ``protect_windows`` says *do not FLAG here*.
         step_epochs: Known step epochs [yr]; None/empty ⇒ plain model.
+        step_mask: Which components each step applies to, shape
+            ``(K, n_components)`` bool, row k for ``step_epochs[k]``;
+            None ⇒ every step in every component. A component a step does
+            NOT apply to is fitted without that step's column and its
+            amplitude is stored as exactly 0 with zero variance -- the
+            record keeps one ``step_epochs`` list and its shape. Leaving
+            the amplitude free is NOT harmless: over a long window it
+            absorbs any slow signal straddling the epoch (Tjörnes 2020:
+            horizontal coseismic offsets, a fitted Up "step" of +11..16 mm
+            that was the regional 2021 Up high).
         min_span_years: Span gate [yr] — the SUMMED coverage of the
             segments, not their hull (identical at J = 1, and uniformly
             stricter beyond it: two 18-day nubs 17 yr apart clear a
@@ -1017,10 +1076,25 @@ def estimate_detrend(
     # Narrowing this to per-segment membership would delete exactly the offset
     # the excision was performed to expose.
     if step_epochs is not None:
-        all_steps = np.sort(np.asarray(step_epochs, dtype=np.float64).ravel())
-        steps_in = all_steps[(all_steps > t_win[0]) & (all_steps <= t_win[-1])]
+        raw_steps = np.asarray(step_epochs, dtype=np.float64).ravel()
+        if step_mask is None:
+            raw_mask = np.ones((raw_steps.size, n_components), dtype=np.bool_)
+        else:
+            raw_mask = np.asarray(step_mask, dtype=np.bool_).reshape(raw_steps.size, -1)
+            if raw_mask.shape[1] != n_components:
+                raise ValueError(
+                    f"step_mask has {raw_mask.shape[1]} columns for "
+                    f"{n_components} components"
+                )
+        order = np.argsort(raw_steps, kind="stable")
+        all_steps, all_mask = raw_steps[order], raw_mask[order]
+        inside = (all_steps > t_win[0]) & (all_steps <= t_win[-1])
+        steps_in, mask_in = all_steps[inside], all_mask[inside]
     else:
+        if step_mask is not None:
+            raise ValueError("step_mask given without step_epochs")
         steps_in = np.empty(0, dtype=np.float64)
+        mask_in = np.empty((0, n_components), dtype=np.bool_)
     # Degeneracy (MATH_STANDARDS §3): two retained steps with NO kept epoch
     # between them build identical Heaviside columns over the fitted samples --
     # 0 on every earlier epoch, 1 on every later one -- so the design matrix is
@@ -1106,15 +1180,18 @@ def estimate_detrend(
     for c in range(n_components):
         keep = inliers[c]
         ss = sigma_win[c]
-        fit = fit_components(
+        fit = _fit_masked_steps(
+            model_func,
             fit_model,
+            steps_in,
+            mask_in[:, c],
             t_win[keep],
             y_win[c][keep],
             sigma=None if ss is None else ss[keep],
             p0=guesses[c],
             absolute_sigma=absolute_sigma,
-            names=None if names is None else [names[c]],
-        )[0]
+            name=None if names is None else names[c],
+        )
         fits.append(fit)
         if bool(np.any(keep)):
             residual = y_win[c][keep] - np.asarray(
