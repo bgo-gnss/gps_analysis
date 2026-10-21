@@ -1585,6 +1585,10 @@ class OutlierDetection:
             components; healthy siblings keep theirs.
         params: Echo of the thresholds used — provenance building block
             (MATH_STANDARDS §6).
+        two_sided: Running method only (shape of ``y``): True where the
+            epoch had a line on BOTH sides, i.e. a two-sided verdict — the
+            vote of :func:`gps_analysis.network.day_scores`. None from the
+            model method.
     """
 
     flags: NDArray[np.bool_]
@@ -1607,6 +1611,7 @@ class OutlierDetection:
     component_abort: NDArray[np.bool_] = dataclasses.field(
         default_factory=lambda: np.zeros(0, dtype=np.bool_)
     )
+    two_sided: NDArray[np.bool_] | None = None
 
 
 def _resolve_floors(
@@ -2587,6 +2592,7 @@ def detect_outliers_running(
     scale_local = np.full((n_comp, n), np.nan, dtype=np.float64)
     scale_global = np.full(n_comp, np.nan, dtype=np.float64)
     component_abort = np.zeros(n_comp, dtype=np.bool_)
+    two_sided = np.zeros((n_comp, n), dtype=np.bool_)
     events: list[SuspectedEvent] = []
 
     for c in range(n_comp):
@@ -2616,6 +2622,7 @@ def detect_outliers_running(
         d_a = x - after
         has_b = np.isfinite(d_b)
         has_a = np.isfinite(d_a)
+        two_sided[c] = has_b & has_a
         with np.errstate(invalid="ignore"):
             out_b = np.abs(d_b) > tau
             out_a = np.abs(d_a) > tau
@@ -2725,4 +2732,5 @@ def detect_outliers_running(
         excess_flag_abort=bool(component_abort.any()),
         params=p,
         component_abort=component_abort,
+        two_sided=shaped(two_sided),
     )
