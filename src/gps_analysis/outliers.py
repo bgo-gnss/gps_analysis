@@ -141,6 +141,7 @@ __all__ = [
 ]
 
 _DAYS_PER_YEAR = 365.25
+
 """Julian-year day count — the ``yearf`` day↔year conversion used for the
 day-denominated thresholds of :class:`OutlierParams`."""
 
@@ -2310,6 +2311,21 @@ one-sided line by more than this (on one sign) belongs to an excursion, and a
 candidate inside an excursion longer than ``max_run_days`` is signal. Fixed —
 independent of ``running_n_sigma`` — so the flags are nested in k."""
 
+RUNNING_CORE_SIGMA = 3.0
+"""Core level of the §15 run rule [noise units]: a run whose epochs are off
+BOTH side lines by more than this (on its sign) on at least two days has a
+core — a genuine plateau or hump. A run without one is the shoulders of a
+lone blunder, off only the far-side line, whose extrapolation wanders 4–5
+noise units on coloured noise: it does not protect a dominant candidate
+(:data:`RUNNING_DOMINANT_SIGMA`). Without this a 33 mm one-day blunder rode
+a "3-day run" (HRAC E 2026-09-19, 2026-10-21). Fixed like
+:data:`RUNNING_EXCURSION_SIGMA`, so the flags stay nested in k."""
+
+RUNNING_DOMINANT_SIGMA = 6.0
+"""|z| [noise units] beyond which a candidate in a coreless run is flagged.
+Smaller candidates there stay protected: mid-plateau epochs whose side
+lines straddle the plateau edges read 4–6 units off and are signal."""
+
 
 def _robust_line_at_zero(
     dt: FloatArray, xw: FloatArray, robust_iterations: int
@@ -2513,8 +2529,9 @@ def detect_outliers_running(
     provisional mask downstream). Protection otherwise as §3.4:
     magnitude floor, caller protect windows, the run rule (a candidate
     inside a same-sign excursion — either side off by > min(k, 2.25) noise
-    units —
-    longer than ``max_run_days`` is signal), and the
+    units — longer than ``max_run_days`` is signal; a run without a core,
+    two epochs off both sides by > min(k, 3), leaves a candidate beyond
+    6 noise units flagged: the shoulders of a lone blunder), and the
     per-component abort on the two-sided candidate fraction (§3.5a).
 
     Args:
@@ -2628,15 +2645,23 @@ def detect_outliers_running(
         # into one run. Fixed, flags(k) only grow as k drops.
         k_e = min(p.running_n_sigma, RUNNING_EXCURSION_SIGMA)
         tau_e = k_e * np.maximum(s, p.scale_floor)
+        tau_c = min(p.running_n_sigma, RUNNING_CORE_SIGMA) * np.maximum(
+            s, p.scale_floor
+        )
         with np.errstate(invalid="ignore"):
             half_b = np.abs(d_b) > tau_e
             half_a = np.abs(d_a) > tau_e
+            both = has_b & has_a & (np.abs(d_b) > tau_c) & (np.abs(d_a) > tau_c)
         for sign in (1.0, -1.0):
             side_b = has_b & half_b & (np.sign(d_b) == sign)
             side_a = has_a & half_a & (np.sign(d_a) == sign)
             excursion = side_b | side_a | (two & (np.sign(d_b) == sign))
+            core = both & (np.sign(d_b) == sign) & (np.sign(d_a) == sign)
             for i0, i1 in candidate_clusters(tt, excursion, max_gap=cluster_gap):
-                inside = two[i0 : i1 + 1]
+                inside = two[i0 : i1 + 1].copy()
+                if np.count_nonzero(core[i0 : i1 + 1]) < 2:
+                    with np.errstate(invalid="ignore"):
+                        inside &= ~(np.abs(z[c][i0 : i1 + 1]) > RUNNING_DOMINANT_SIGMA)
                 if tt[i1] - tt[i0] <= max_run or not inside.any():
                     continue
                 prot[i0 : i1 + 1][inside] |= PROTECT_RUN
