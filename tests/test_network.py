@@ -93,3 +93,40 @@ def test_a_common_blunder_day_is_found_end_to_end() -> None:
     sc = np.stack([day_scores(detect_outliers_running(t, y)) for t, y in stations])
     nd = network_days(sc)
     assert np.flatnonzero(nd.decided).tolist() == [120]
+
+
+def test_midpoint_residuals_keep_only_the_fast_part() -> None:
+    """A rate and an annual term leave (almost) nothing; a one-day offset
+    stays whole, and the ends are one-sided."""
+    from gps_analysis.network import midpoint_residuals
+
+    t = 2020.0 + np.arange(400) * DAY
+    y = np.vstack([30.0 * (t - t[0]), 5.0 * np.sin(2 * np.pi * t), np.zeros(t.size)])
+    y[2, 200] += 4.0
+    r, one = midpoint_residuals(t, y)
+    assert np.nanmax(np.abs(r[:2, 20:-20])) < 0.3
+    assert abs(r[2, 200] - 4.0) < 1e-9
+    assert one[:, -1].all() and one[:, 0].all() and not one[:, 200].any()
+
+
+def test_common_mode_is_the_median_with_a_voter_floor() -> None:
+    from gps_analysis.network import common_mode
+
+    r = np.zeros((20, 3, 4))
+    r[:, 1, 2] = 3.0  # every station +3 east on day 2
+    r[0, 1, 2] = 50.0  # one station's own blunder does not move it
+    r[5:, :, 3] = np.nan  # day 3: only 5 voters
+    cm = common_mode(r)
+    assert cm.value[1, 2] == 3.0 and cm.value[0, 2] == 0.0
+    assert np.isnan(cm.value[:, 3]).all() and cm.n[0, 3] == 5
+    with pytest.raises(ValueError, match="stations, components, days"):
+        common_mode(np.zeros((3, 4)))
+
+
+def test_common_mode_marks_one_sided_days_provisional() -> None:
+    from gps_analysis.network import common_mode
+
+    r = np.zeros((20, 3, 3))
+    one = np.zeros(r.shape, dtype=bool)
+    one[:15, :, 2] = True
+    assert common_mode(r, one).provisional.tolist() == [False, False, True]
