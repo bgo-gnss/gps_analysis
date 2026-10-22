@@ -82,10 +82,11 @@ def test_a_run_of_bad_days_is_signal(days: int) -> None:
         assert any(e.kind == "transient_run" for e in det.suspected_events)
 
 
-@pytest.mark.parametrize(("after", "flagged"), [(2, False), (7, True), (12, True)])
+@pytest.mark.parametrize(("after", "flagged"), [(2, True), (7, True), (12, True)])
 def test_a_blunder_next_to_a_step(after: int, flagged: bool) -> None:
-    """Conservative by design: right after an undeclared step the sides
-    disagree, so a blunder there is left alone; a week on it is caught."""
+    """Right after an undeclared step the sides disagree and the step's
+    days make a one-sided run around the blunder; a run without a core no
+    longer shields a dominant (15 σ) blunder, so it is caught at 2 days too."""
     t, y = _series()
     y[200:] += 60.0
     y[200 + after] += 15.0
@@ -194,3 +195,36 @@ def test_reach_is_bounded() -> None:
         t, x, half_window=10 * DAY, min_count=8, max_reach=30 * DAY
     )
     assert np.isnan(before[40]) and np.isfinite(after[40])  # 41 d gap behind
+
+
+# HRAC East, 90 days to 2026-10-20, plate-fixed with the seasonal removed
+# [mm] (yearf = 2026 + (doy + 0.5)/365, as the .pos files): −42 and +33 mm
+# on doy 258/261, the data back at its level in between and after.
+HRAC_DOY = [201, *range(203, 253), *range(254, 290), 291, 292]
+HRAC_E = [
+    0.8, -2.2, 0.6, 0.1, 0.6, 0.6, 1.1, -1.2, 2.0, -0.3, 3.8, 2.2, 2.8, 2.8,
+    0.7, -0.4, -0.7, 0.5, -0.4, 0.1, 0.8, 0.2, 1.4, 1.2, 0.4, 2.0, 1.9, -0.2,
+    0.9, 0.5, -3.6, -4.9, -4.5, -3.9, -2.7, -4.4, -3.6, -2.4, -2.6, -3.1, -1.2,
+    -1.6, -2.8, -2.9, -2.9, -2.6, -2.6, -0.3, -2.3, -2.2, -2.9, -1.8, -2.2,
+    -3.2, -42.0, -3.6, -0.4, 33.5, -1.7, -2.7, -6.8, -5.6, -6.7, -2.9, -0.5,
+    -1.4, -1.1, -1.3, -4.9, -2.7, 0.7, -4.3, -3.0, -2.2, -2.2, -1.6, -2.7,
+    -2.8, 1.1, -2.1, -0.1, -5.2, -7.8, -2.4, -3.3, -3.1, -1.7, -7.5, -8.0,
+]  # fmt: skip
+
+
+def test_lone_blunders_in_a_coreless_run_are_flagged() -> None:
+    """HRAC E 2026-09-16/19: the neighbours of each blunder are off only the
+    far-side line (its extrapolation wanders on this noise), so the 3-day
+    "run" around them has no core and must not protect them."""
+    t = 2026.0 + (np.array(HRAC_DOY) + 0.5) / 365.0
+    y = np.array(HRAC_E)
+    det = detect_outliers_running(t, y, params=OutlierParams(running_n_sigma=3.5))
+    assert np.flatnonzero(det.flags).tolist() == [54, 57]
+
+
+def test_a_peaked_hump_is_signal() -> None:
+    """A hump off both sides on several days has a core: kept, peak too."""
+    t, y = _series()
+    y[200:207] += np.array([5.0, 12.0, 25.0, 30.0, 25.0, 12.0, 5.0])
+    det = detect_outliers_running(t, y)
+    assert not det.flags[198:209].any()
