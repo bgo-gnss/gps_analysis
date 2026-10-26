@@ -252,6 +252,9 @@ class LineFit:
         f_quadratic: F of a quadratic against the line (NaN below 4
             epochs; :data:`NONLINEAR_F`).
         n: Epochs used.
+        level: The line's value at ``t_mean`` (the weighted mean of y) [L].
+        sigma_level_apriori: Its σ from the data σ alone, ``1/√Σw`` [L].
+        t_mean: The weighted mean epoch t̄ [yr].
     """
 
     rate: float
@@ -259,6 +262,9 @@ class LineFit:
     chi2nu: float
     f_quadratic: float
     n: int
+    level: float = math.nan
+    sigma_level_apriori: float = math.nan
+    t_mean: float = math.nan
 
     @property
     def sigma_scaled(self) -> float:
@@ -323,7 +329,16 @@ def line_fit(t: ArrayLike, y: ArrayLike, sigma: ArrayLike) -> LineFit:
         spread = float(np.sum(w * (yy - a) ** 2))
         if chi_quad > 1e-12 * spread:
             f = (chi_line - chi_quad) / (chi_quad / (n - 3))
-    return LineFit(v, 1.0 / math.sqrt(stt), chi2nu, f, n)
+    return LineFit(
+        v,
+        1.0 / math.sqrt(stt),
+        chi2nu,
+        f,
+        n,
+        level=a,
+        sigma_level_apriori=1.0 / math.sqrt(float(np.sum(w))),
+        t_mean=tm,
+    )
 
 
 def signal_to_noise(rate: ArrayLike, sigma: ArrayLike) -> tuple[float, float]:

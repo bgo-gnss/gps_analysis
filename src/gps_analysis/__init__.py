@@ -67,6 +67,17 @@ from gps_analysis.detrend import (
     trajectory_from_record,
     weighted_datum,
 )
+from gps_analysis.displacement import (
+    EndLevel,
+    NeighbourCheck,
+    displacement_from_rate,
+    end_displacement,
+    end_level,
+    level_sigma,
+    line_value_at,
+    neighbour_check,
+    rate_from_displacement,
+)
 from gps_analysis.fitting import (
     ModelFunc,
     OutlierRejection,
@@ -221,6 +232,16 @@ from gps_analysis.velocity import (
 
 __all__ = [
     "__version__",
+    # displacement
+    "EndLevel",
+    "NeighbourCheck",
+    "displacement_from_rate",
+    "end_displacement",
+    "end_level",
+    "level_sigma",
+    "line_value_at",
+    "neighbour_check",
+    "rate_from_displacement",
     # models
     "FloatArray",
     "TrajectoryParams",

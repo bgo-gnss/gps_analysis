@@ -7,6 +7,7 @@ import gps_analysis
 EXPECTED_MODULES = [
     "baseline",
     "deformation",
+    "displacement",
     "empirical_sigma",
     "detrend",
     "fitting",
