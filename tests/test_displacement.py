@@ -176,3 +176,49 @@ def test_eight_hour_sessions_window_in_days() -> None:
     )
     assert lv8.n == 15 and lv24.n == 5
     assert abs(lv8.level - lv24.level) < 3 * math.hypot(lv8.sigma, lv24.sigma)
+
+
+def test_step_displacement_recovers_a_step() -> None:
+    from gps_analysis.displacement import step_displacement
+
+    rng = np.random.default_rng(6)
+    t = _days(120)
+    event = t[0] + 60 * DAY  # a midnight between two noon epochs
+    y = 10.0 * (t - t[0]) + np.where(t > event, 50.0, 0.0) + rng.normal(0, 1, t.size)
+    est = step_displacement(
+        t,
+        y,
+        np.ones(t.size),
+        before=(event - 30 * DAY, event),
+        after=(event, event + 30 * DAY),
+    )
+    assert abs(est.step - 50.0) < 3 * est.sigma
+    assert est.at == (event - 30 * DAY + 30 * DAY, event)
+    # the event's own day left out of both lines: same answer, wider gap
+    gap = step_displacement(
+        t,
+        y,
+        np.ones(t.size),
+        before=(event - 30 * DAY, event),
+        after=(event + DAY, event + 31 * DAY),
+    )
+    assert abs(gap.step - 50.0) < 3 * gap.sigma
+
+
+def test_step_sigma_grows_with_k_rate_and_distance() -> None:
+    from gps_analysis.displacement import step_displacement
+
+    rng = np.random.default_rng(7)
+    t = _days(80)
+    y = rng.normal(0, 1, t.size)
+    b = (t[0], t[0] + 30 * DAY)
+    a = (t[0] + 50 * DAY, t[0] + 80 * DAY)
+    near = step_displacement(t, y, np.ones(t.size), before=b, after=a)
+    k = step_displacement(t, y, np.ones(t.size), k_rate=(5.0, 5.0), before=b, after=a)
+    far = step_displacement(
+        t, y, np.ones(t.size), at=(t[0] + 40 * DAY, t[0] + 40 * DAY), before=b, after=a
+    )
+    assert k.sigma > near.sigma
+    assert far.sigma > near.sigma
+    with pytest.raises(ValueError):
+        step_displacement(t, y, np.ones(t.size), before=(2030.0, 2030.1), after=a)

@@ -70,6 +70,7 @@ from gps_analysis.detrend import (
 from gps_analysis.displacement import (
     EndLevel,
     NeighbourCheck,
+    StepEstimate,
     displacement_from_rate,
     end_displacement,
     end_level,
@@ -235,6 +236,7 @@ __all__ = [
     # displacement
     "EndLevel",
     "NeighbourCheck",
+    "StepEstimate",
     "displacement_from_rate",
     "end_displacement",
     "end_level",
@@ -242,6 +244,7 @@ __all__ = [
     "line_value_at",
     "neighbour_check",
     "rate_from_displacement",
+    "step_displacement",
     # models
     "FloatArray",
     "TrajectoryParams",

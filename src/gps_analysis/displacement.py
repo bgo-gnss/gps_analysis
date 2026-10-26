@@ -278,3 +278,65 @@ def rate_from_displacement(
     d = np.asarray(displacement, dtype=np.float64)
     s = np.asarray(sigma, dtype=np.float64)
     return d / span_years, s / span_years
+
+
+@dataclasses.dataclass(frozen=True)
+class StepEstimate:
+    """A displacement across an event from lines fitted on either side.
+
+    Attributes:
+        step: ``f_after(t_after) − f_before(t_before)`` [L].
+        sigma: ``√(σ_before(t_before)² + σ_after(t_after)²)`` [L].
+        at: (t_before, t_after), where each line is evaluated [yr].
+        before, after: The two line fits.
+    """
+
+    step: float
+    sigma: float
+    at: tuple[float, float]
+    before: LineFit
+    after: LineFit
+
+
+def step_displacement(
+    t: ArrayLike,
+    y: ArrayLike,
+    sigma: ArrayLike,
+    *,
+    before: tuple[float, float],
+    after: tuple[float, float],
+    at: tuple[float, float] | None = None,
+    k_day: float = 1.0,
+    k_rate: tuple[float, float] = (1.0, 1.0),
+) -> StepEstimate:
+    """The jump across an event: two lines, each evaluated at the event.
+
+    Equation:
+        ``Δ = f_after(t_a) − f_before(t_b)``,
+        ``σ_Δ² = σ_before(t_b)² + σ_after(t_a)²`` (:func:`line_value_at`)
+
+    Symbols → args:
+        - ``before``, ``after`` → half-open windows ``[start, end)`` on
+          either side of the event [yr]
+        - ``t_b``, ``t_a`` → ``at``; default the event's edges, the end of
+          ``before`` and the start of ``after`` (the event's own days are
+          in neither line) [yr]
+        - ``k_day`` → daily σ factor of the levels; ``k_rate`` → k(T) of
+          each window's rate [–]
+
+    The sign is AFTER − BEFORE (as
+    :func:`~gps_analysis.baseline.estimate_step_offset`); the legacy
+    ``find_line_offsets`` of gps_data_analyses reported before − after,
+    evaluated at the midpoint of the gap — pass ``at=(m, m)`` for that.
+
+    Raises:
+        ValueError: fewer than 2 epochs (or one epoch time) on a side.
+    """
+    tb, yb, sb = _window(t, y, sigma, before)
+    ta, ya, sa = _window(t, y, sigma, after)
+    fb = line_fit(tb, yb, sb)
+    fa = line_fit(ta, ya, sa)
+    t_b, t_a = at if at is not None else (before[1], after[0])
+    vb, s_b = line_value_at(fb, t_b, k_day=k_day, k_rate=k_rate[0])
+    va, s_a = line_value_at(fa, t_a, k_day=k_day, k_rate=k_rate[1])
+    return StepEstimate(va - vb, math.hypot(s_b, s_a), (t_b, t_a), fb, fa)
