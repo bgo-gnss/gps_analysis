@@ -222,3 +222,37 @@ def test_step_sigma_grows_with_k_rate_and_distance() -> None:
     assert far.sigma > near.sigma
     with pytest.raises(ValueError):
         step_displacement(t, y, np.ones(t.size), before=(2030.0, 2030.1), after=a)
+
+
+def test_gls_mean_matches_the_weighted_mean_for_diagonal_covariance() -> None:
+    from gps_analysis.displacement import gls_mean
+
+    rng = np.random.default_rng(13)
+    base = np.array([2602350.0, -1074405.0, 5704035.0])
+    pts = base + rng.normal(0, 0.003, (10, 3))
+    sig = rng.uniform(0.001, 0.004, (10, 3))
+    cov = np.zeros((10, 3, 3))
+    idx = np.arange(3)
+    cov[:, idx, idx] = sig**2
+    g = gls_mean(pts, cov)
+    w = 1 / sig**2
+    np.testing.assert_allclose(g.mean, (w * pts).sum(0) / w.sum(0), rtol=0, atol=1e-9)
+    np.testing.assert_allclose(np.sqrt(np.diag(g.cov)), 1 / np.sqrt(w.sum(0)))
+    assert g.n == 10 and 0.2 < g.chi2nu < 3.0
+
+
+def test_gls_mean_uses_the_correlations_and_one_point() -> None:
+    from gps_analysis.displacement import gls_mean
+
+    c = np.array(
+        [
+            [[1.0, 0.9, 0], [0.9, 1.0, 0], [0, 0, 1.0]],
+            [[1.0, -0.9, 0], [-0.9, 1.0, 0], [0, 0, 1.0]],
+        ]
+    )
+    g = gls_mean(np.array([[1.0, 1.0, 0.0], [1.0, -1.0, 0.0]]), c)
+    assert g.mean[1] == pytest.approx(0.0, abs=1e-12)
+    one = gls_mean(np.array([[5.0, 6.0, 7.0]]), np.eye(3)[None] * 4.0)
+    assert math.isnan(one.chi2nu) and one.mean.tolist() == [5.0, 6.0, 7.0]
+    with pytest.raises(ValueError):
+        gls_mean(np.zeros((0, 3)), np.zeros((0, 3, 3)))
