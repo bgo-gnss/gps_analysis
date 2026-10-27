@@ -340,3 +340,57 @@ def step_displacement(
     vb, s_b = line_value_at(fb, t_b, k_day=k_day, k_rate=k_rate[0])
     va, s_a = line_value_at(fa, t_a, k_day=k_day, k_rate=k_rate[1])
     return StepEstimate(va - vb, math.hypot(s_b, s_a), (t_b, t_a), fb, fa)
+
+
+@dataclasses.dataclass(frozen=True)
+class GlsMean:
+    """The generalised-least-squares mean of 3-D points.
+
+    Attributes:
+        mean: ``(3,)`` [L].
+        cov: ``(3, 3)`` formal covariance of the mean [L²].
+        chi2nu: ``Σ rᵢᵀ Cᵢ⁻¹ rᵢ / (3(n − 1))``; NaN for one point.
+        n: Points used.
+    """
+
+    mean: FloatArray
+    cov: FloatArray
+    chi2nu: float
+    n: int
+
+
+def gls_mean(points: ArrayLike, cov: ArrayLike) -> GlsMean:
+    """The mean of ``n`` points weighted by their full 3×3 covariances.
+
+    Equation:
+        ``W = Σ Cᵢ⁻¹``, ``x̂ = W⁻¹ Σ Cᵢ⁻¹ xᵢ``, ``C_x̂ = W⁻¹``,
+        ``χ²/ν = Σ (xᵢ − x̂)ᵀ Cᵢ⁻¹ (xᵢ − x̂) / (3(n − 1))``
+
+    Symbols → args:
+        - ``xᵢ`` → ``points`` ``(n, 3)`` [L]
+        - ``Cᵢ`` → ``cov`` ``(n, 3, 3)`` [L²], positive definite
+
+    The coordinates are large (ECEF metres): the points are centred on the
+    first one before weighting, so the mean keeps sub-millimetre precision.
+
+    Raises:
+        ValueError: no point, or shapes that do not agree.
+    """
+    x = np.asarray(points, dtype=np.float64)
+    c = np.asarray(cov, dtype=np.float64)
+    if x.ndim != 2 or x.shape[1] != 3 or x.shape[0] == 0:
+        raise ValueError(f"points must be (n, 3) with n ≥ 1, got {x.shape}")
+    if c.shape != (x.shape[0], 3, 3):
+        raise ValueError(f"cov must be ({x.shape[0]}, 3, 3), got {c.shape}")
+    x0 = x[0].copy()
+    d = x - x0
+    w = np.linalg.inv(c)
+    big_w = w.sum(axis=0)
+    cov_mean = np.linalg.inv(big_w)
+    mean_d = cov_mean @ np.einsum("nij,nj->i", w, d)
+    n = x.shape[0]
+    chi2nu = math.nan
+    if n > 1:
+        r = d - mean_d
+        chi2nu = float(np.einsum("ni,nij,nj->", r, w, r)) / (3 * (n - 1))
+    return GlsMean(x0 + mean_d, cov_mean, chi2nu, n)

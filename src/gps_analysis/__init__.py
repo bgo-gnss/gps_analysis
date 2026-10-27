@@ -69,11 +69,13 @@ from gps_analysis.detrend import (
 )
 from gps_analysis.displacement import (
     EndLevel,
+    GlsMean,
     NeighbourCheck,
     StepEstimate,
     displacement_from_rate,
     end_displacement,
     end_level,
+    gls_mean,
     level_sigma,
     line_value_at,
     neighbour_check,
@@ -235,11 +237,13 @@ __all__ = [
     "__version__",
     # displacement
     "EndLevel",
+    "GlsMean",
     "NeighbourCheck",
     "StepEstimate",
     "displacement_from_rate",
     "end_displacement",
     "end_level",
+    "gls_mean",
     "level_sigma",
     "line_value_at",
     "neighbour_check",
