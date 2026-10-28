@@ -179,6 +179,13 @@ from gps_analysis.staged import (
     evaluate_group_values,
     fit_held_partition,
 )
+from gps_analysis.shared_tau import (
+    SharedTauFit,
+    TransientRate,
+    model_rate,
+    profile_shared_tau,
+    transient_rate,
+)
 from gps_analysis.terms import (
     GROUP_ORDER,
     BkwDependency,
@@ -377,6 +384,12 @@ __all__ = [
     "check_transient_identifiability",
     "TransientTauFit",
     "profile_transient_tau",
+    # shared_tau (one transient tau across many series; rate on a date)
+    "SharedTauFit",
+    "TransientRate",
+    "model_rate",
+    "profile_shared_tau",
+    "transient_rate",
     # varpro (separable NLLS by variable projection)
     "VarproFit",
     "estimate_varpro",
