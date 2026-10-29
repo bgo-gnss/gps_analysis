@@ -168,6 +168,17 @@ from gps_analysis.rate_quality import (
     signal_to_noise,
     window_gates,
 )
+from gps_analysis.shared_tau import (
+    BlockScale,
+    Lag1Scale,
+    SharedTauFit,
+    TransientRate,
+    block_mean_scale,
+    lag1_scale,
+    model_rate,
+    profile_shared_tau,
+    transient_rate,
+)
 from gps_analysis.staged import (
     HeldExplicit,
     HeldFromStage,
@@ -178,13 +189,6 @@ from gps_analysis.staged import (
     estimate_staged,
     evaluate_group_values,
     fit_held_partition,
-)
-from gps_analysis.shared_tau import (
-    SharedTauFit,
-    TransientRate,
-    model_rate,
-    profile_shared_tau,
-    transient_rate,
 )
 from gps_analysis.terms import (
     GROUP_ORDER,
@@ -386,9 +390,13 @@ __all__ = [
     "profile_transient_tau",
     # shared_tau (one transient tau across many series; rate on a date)
     "SharedTauFit",
+    "BlockScale",
+    "Lag1Scale",
     "TransientRate",
     "model_rate",
     "profile_shared_tau",
+    "block_mean_scale",
+    "lag1_scale",
     "transient_rate",
     # varpro (separable NLLS by variable projection)
     "VarproFit",
