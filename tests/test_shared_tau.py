@@ -12,6 +12,7 @@ import pytest
 from gps_analysis.models import FloatArray, exp_linear_rate
 from gps_analysis.shared_tau import (
     LAG1_RHO_MAX,
+    block_mean_scale,
     lag1_scale,
     model_rate,
     profile_shared_tau,
@@ -194,3 +195,36 @@ def test_transient_rate_returns_its_residuals() -> None:
     assert float(np.mean(tr.residuals**2)) * tr.n_obs / (
         tr.n_obs - tr.model.n_params
     ) == pytest.approx(tr.chi2nu, rel=1e-9)
+
+
+def test_block_scale_white_is_one_and_ar1_matches_its_long_run_factor() -> None:
+    rng = np.random.default_rng(7)
+    t = np.arange(4000.0)
+    white = block_mean_scale(t, rng.normal(0, 1, t.size), step=1.0, n=50)
+    assert white.k == pytest.approx(1.0, abs=0.12) and white.n == 50
+    red = block_mean_scale(t, _ar1(rng, t.size, 0.6), step=1.0, n=100)
+    assert red.k == pytest.approx(2.0, rel=0.15)  # √((1+ρ)/(1−ρ)) for n ≫ 1
+
+
+def test_block_scale_sees_wander_that_one_lag_misses() -> None:
+    # white + a slow random walk: lag-1 ρ small, block means scatter widely
+    rng = np.random.default_rng(11)
+    t = np.arange(800.0)
+    r = rng.normal(0, 1, t.size) + 0.15 * np.cumsum(rng.normal(0, 1, t.size))
+    r -= np.polyval(np.polyfit(t, r, 1), t)  # a fit takes the line out
+    r /= r.std()
+    lag = lag1_scale(t, r, step=1.0)
+    blk = block_mean_scale(t, r, step=1.0)
+    assert blk.n == 100 and blk.k > 2.0 * lag.k
+
+
+def test_block_scale_gaps_default_n_and_short() -> None:
+    rng = np.random.default_rng(4)
+    t = np.arange(400.0)
+    r = rng.normal(0, 1, t.size)
+    gappy = np.delete(np.arange(400), np.arange(100, 160))
+    assert block_mean_scale(t[gappy], r[gappy], step=1.0).n == 50
+    short = block_mean_scale(t[:10], r[:10], step=1.0)
+    assert short.k == 1.0 and short.n == 0
+    with pytest.raises(ValueError):
+        block_mean_scale(t, r[:-1], step=1.0)

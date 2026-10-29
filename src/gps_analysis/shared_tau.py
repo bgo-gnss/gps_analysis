@@ -205,6 +205,93 @@ def lag1_scale(t: ArrayLike, residuals: ArrayLike, *, step: float) -> Lag1Scale:
     return Lag1Scale(rho, math.sqrt((1 + rho) / (1 - rho)), n)
 
 
+#: block means need at least this many independent blocks in the span
+BLOCK_MIN_BLOCKS = 8
+#: a block counts when this share of its days has data
+BLOCK_MIN_COVER = 0.7
+
+
+@dataclasses.dataclass(frozen=True)
+class BlockScale:
+    """Result of :func:`block_mean_scale`.
+
+    Attributes:
+        k: the σ scale ``√(n·var(r̄ₙ)/var(r))``, at least 1; 1.0 (and
+            ``n`` 0) when the series is too short to measure.
+        n: block length used [steps].
+        n_blocks: overlapping blocks the variance came from.
+    """
+
+    k: float
+    n: int
+    n_blocks: int
+
+
+def block_mean_scale(
+    t: ArrayLike, residuals: ArrayLike, *, step: float, n: int | None = None
+) -> BlockScale:
+    """How much more n-step means of the residuals scatter than independent
+    noise allows, and the σ scale that implies for a fitted rate.
+
+    Equation:
+        ``k² = n · var(r̄ₙ) / var(r)``, r̄ₙ the mean of n consecutive steps
+        (overlapping blocks, each with ≥ :data:`BLOCK_MIN_COVER` of its
+        steps). Independent noise gives k = 1; noise that wanders (flicker,
+        random walk) makes block means scatter more, k > 1. Reducing the
+        series to blocks of n steps that are nearly independent, a rate's σ
+        grows by the same k: the batch-means estimator of the error of an
+        average of correlated data (Flyvbjerg & Petersen 1989, J. Chem.
+        Phys. 91, 461), applied to the residuals of a fit.
+
+    ``n`` defaults to the span / :data:`BLOCK_MIN_BLOCKS` (at least 2): the
+    longest blocks the span still holds enough of. Wander slower than that,
+    and what the fitted curve absorbed, is not seen: k is still a lower
+    bound, but a far closer one than :func:`lag1_scale`.
+
+    Symbols → args:
+        - tᵢ → ``t`` [any unit], rᵢ → ``residuals`` (normalised)
+        - one sampling step → ``step`` [unit of t]; n → ``n`` [steps]
+
+    Returns:
+        :class:`BlockScale`.
+    """
+    tt = np.asarray(t, dtype=np.float64)
+    rr = np.asarray(residuals, dtype=np.float64)
+    if tt.shape != rr.shape or tt.ndim != 1:
+        raise ValueError("t and residuals need the same 1-D shape")
+    if not step > 0:
+        raise ValueError(f"step must be > 0, got {step}")
+    ok = np.isfinite(tt) & np.isfinite(rr)
+    tt, rr = tt[ok], rr[ok]
+    if tt.size < 2 * BLOCK_MIN_BLOCKS:
+        return BlockScale(1.0, 0, 0)
+    idx = np.rint((tt - tt.min()) / step).astype(np.int64)
+    length = int(idx.max()) + 1
+    if n is None:
+        n = max(2, length // BLOCK_MIN_BLOCKS)
+    if n < 1 or length < BLOCK_MIN_BLOCKS * n:
+        return BlockScale(1.0, 0, 0)
+    total = np.zeros(length)
+    count = np.zeros(length)
+    np.add.at(total, idx, rr)
+    np.add.at(count, idx, 1.0)
+    cs = np.concatenate([[0.0], np.cumsum(total)])
+    cc = np.concatenate([[0.0], np.cumsum(count)])
+    win_sum = cs[n:] - cs[:-n]
+    win_cnt = cc[n:] - cc[:-n]
+    keep = win_cnt >= BLOCK_MIN_COVER * n
+    if int(keep.sum()) < BLOCK_MIN_BLOCKS:
+        return BlockScale(1.0, 0, 0)
+    means = win_sum[keep] / win_cnt[keep]
+    var_r = float(np.var(rr))
+    if var_r == 0:
+        return BlockScale(1.0, n, int(keep.sum()))
+    # a mean of m < n samples has white variance var_r/m: compare with that
+    white = var_r / win_cnt[keep]
+    ratio = float(np.mean((means - np.mean(rr)) ** 2) / np.mean(white))
+    return BlockScale(max(1.0, math.sqrt(ratio)), n, int(keep.sum()))
+
+
 def _transient_index(model: TrajectoryModel, term_index: int | None) -> int:
     found = [i for i, tm in enumerate(model.terms) if tm.group == "transient"]
     if term_index is None:

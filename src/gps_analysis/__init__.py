@@ -169,9 +169,11 @@ from gps_analysis.rate_quality import (
     window_gates,
 )
 from gps_analysis.shared_tau import (
+    BlockScale,
     Lag1Scale,
     SharedTauFit,
     TransientRate,
+    block_mean_scale,
     lag1_scale,
     model_rate,
     profile_shared_tau,
@@ -388,10 +390,12 @@ __all__ = [
     "profile_transient_tau",
     # shared_tau (one transient tau across many series; rate on a date)
     "SharedTauFit",
+    "BlockScale",
     "Lag1Scale",
     "TransientRate",
     "model_rate",
     "profile_shared_tau",
+    "block_mean_scale",
     "lag1_scale",
     "transient_rate",
     # varpro (separable NLLS by variable projection)
