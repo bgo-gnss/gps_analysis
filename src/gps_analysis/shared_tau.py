@@ -122,6 +122,9 @@ class TransientRate:
         chi2nu: χ²/(N − P) of the series at τ.
         n_obs: N used (finite y).
         model: the model with τ substituted.
+        t_used: the epochs fitted (finite y), shape (N,).
+        residuals: their normalised residuals ``(y − ŷ)/σ``, shape (N,):
+            :func:`lag1_scale` measures their day-to-day correlation.
     """
 
     rate: FloatArray
@@ -132,6 +135,74 @@ class TransientRate:
     chi2nu: float
     n_obs: int
     model: TrajectoryModel
+    t_used: FloatArray = dataclasses.field(default_factory=lambda: np.zeros(0))
+    residuals: FloatArray = dataclasses.field(default_factory=lambda: np.zeros(0))
+
+
+#: largest lag-1 correlation :func:`lag1_scale` takes (k ≤ √39 ≈ 6.2)
+LAG1_RHO_MAX = 0.95
+#: fewest consecutive pairs it measures ρ from
+LAG1_MIN_PAIRS = 10
+
+
+@dataclasses.dataclass(frozen=True)
+class Lag1Scale:
+    """Result of :func:`lag1_scale`.
+
+    Attributes:
+        rho: lag-1 correlation of the residuals (clipped to
+            ``[0, LAG1_RHO_MAX]``); NaN with too few pairs.
+        k: the σ scale ``√((1 + ρ)/(1 − ρ))``; 1.0 when ρ is NaN.
+        n_pairs: consecutive pairs used.
+    """
+
+    rho: float
+    k: float
+    n_pairs: int
+
+
+def lag1_scale(t: ArrayLike, residuals: ArrayLike, *, step: float) -> Lag1Scale:
+    """How strongly one epoch's residual follows the previous one, and the
+    σ scale that implies for a rate fitted as if they were independent.
+
+    Equation:
+        ``ρ = Σ rᵢ·rᵢ₊₁ / √(Σ rᵢ² · Σ rᵢ₊₁²)`` over consecutive epochs one
+        ``step`` apart (0.5–1.5 steps), and ``k = √((1 + ρ)/(1 − ρ))``:
+        the factor an AR(1) process with lag-1 correlation ρ widens a
+        least-squares slope's white-noise σ by (the long-window limit;
+        Bayley & Hammersley 1946, the effective-N argument).
+
+    This is a lower bound for GNSS: flicker noise is correlated over far
+    longer than a day, which one lag does not see.
+
+    Symbols → args:
+        - tᵢ → ``t`` [any unit], rᵢ → ``residuals`` (normalised)
+        - one sampling step → ``step`` [unit of t]
+
+    Returns:
+        :class:`Lag1Scale`.
+    """
+    tt = np.asarray(t, dtype=np.float64)
+    rr = np.asarray(residuals, dtype=np.float64)
+    if tt.shape != rr.shape or tt.ndim != 1:
+        raise ValueError("t and residuals need the same 1-D shape")
+    if not step > 0:
+        raise ValueError(f"step must be > 0, got {step}")
+    ok = np.isfinite(tt) & np.isfinite(rr)
+    tt, rr = tt[ok], rr[ok]
+    order = np.argsort(tt)
+    tt, rr = tt[order], rr[order]
+    dt = np.diff(tt)
+    pair = (dt >= 0.5 * step) & (dt <= 1.5 * step)
+    n = int(pair.sum())
+    if n < LAG1_MIN_PAIRS:
+        return Lag1Scale(math.nan, 1.0, n)
+    a, b = rr[:-1][pair], rr[1:][pair]
+    den = math.sqrt(float(np.sum(a * a)) * float(np.sum(b * b)))
+    if den == 0:
+        return Lag1Scale(math.nan, 1.0, n)
+    rho = min(max(float(np.sum(a * b)) / den, 0.0), LAG1_RHO_MAX)
+    return Lag1Scale(rho, math.sqrt((1 + rho) / (1 - rho)), n)
 
 
 def _transient_index(model: TrajectoryModel, term_index: int | None) -> int:
@@ -379,6 +450,7 @@ def transient_rate(
     if dof <= 0:
         raise ValueError(f"{len(tt)} observations for {m.n_params} parameters")
     s2 = chisq / dof
+    resid = (yy - m.design(tt) @ params) / ss
     cov = cov * s2
     rate, sig = model_rate(m, params, cov, at)
     total = sig
@@ -400,4 +472,6 @@ def transient_rate(
         chi2nu=s2,
         n_obs=len(tt),
         model=m,
+        t_used=tt,
+        residuals=resid,
     )
