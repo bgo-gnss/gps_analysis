@@ -70,8 +70,9 @@ MONTH = 1.0 / 12.0
 SHORT_SPAN = 3.0
 LONG_GAP = 0.5
 SHORT_GAP = 2.0 / 12.0
-#: least BIC drop for a new break
-MIN_BIC_GAIN = 10.0
+#: least BIC drop for a new break (BGÓ 2026-11-15: 25; weekly medians are not
+#: white noise, and 10 split VONC 2018– at a 0.6-yr wiggle)
+MIN_BIC_GAIN = 25.0
 #: most breaks looked for
 MAX_BREAKS = 8
 
