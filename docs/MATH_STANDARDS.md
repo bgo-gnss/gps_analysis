@@ -164,6 +164,15 @@ into the estimator — so the reader can follow the flow top-down before reading
   centering*, Am. Stat. 38(2), 73–77. (the diagnosis must run on the
   **uncentered**, column-equilibrated design — centering hides every
   dependency the intercept participates in.)
+- **Schwarz 1978** — G. Schwarz, *Estimating the dimension of a model*,
+  Ann. Stat. 6(2), 461–464. (BIC = n·ln(RSS/n) + p·ln n for Gaussian
+  residuals — `breaks.rate_breaks` stopping rule.)
+- **Hinkley 1971** — D.V. Hinkley, *Inference in two-phase regression*,
+  JASA 66(336), 736–743. (continuous join of two lines; the change point as
+  an estimated parameter — `breaks` hinge model and its parameter count.)
+- **Muggeo 2003** — V.M.R. Muggeo, *Estimating regression models with
+  unknown break-points*, Stat. Med. 22, 3055–3071. (segmented regression
+  with hinge terms max(t − ψ, 0) — `breaks` design.)
 - Add domain refs (Hackl et al., Hector) as used — always with the specific
   equation/section.
 
